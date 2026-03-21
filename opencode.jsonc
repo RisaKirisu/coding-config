@@ -1,0 +1,50 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    "~/coding-config/AGENTS.md"
+  ],
+  "mcp": {
+    "context7": {
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp",
+      "headers": {
+        "CONTEXT7_API_KEY": "ctx7sk-aa5c831d-f70c-444c-a8a1-4ec996ffaea2"
+      },
+      "enabled": true
+    }
+  },
+  "plugin": [
+    "@mohak34/opencode-notifier@latest"
+  ],
+  "permission": {
+    "bash": {
+      "*": "ask",
+      "git *": "allow",
+      "git commit*": "deny",
+      "git push*": "deny",
+      "grep *": "allow"
+    },
+    "lsp": "allow"
+  },
+  "tools": {
+    "lsp": true
+  },
+  "agent": {
+    "plan": {
+      "model": "openrouter/google/gemini-3.1-pro-preview-customtools",
+      "prompt": "{file:/home/risa/coding-config/plan.txt}",
+      "permission": {
+        "edit": {
+          "*": "ask",
+          ".agents/todo-*.md": "allow",
+          ".agents/plan-*.md": "allow"
+        },
+        "lsp": "allow"
+      }
+    },
+    "build": {
+      "model": "openrouter/qwen/qwen3.5-plus-02-15"
+    }
+  },
+  "small_model": "openrouter/openai/gpt-oss-120b:exacto"
+}
