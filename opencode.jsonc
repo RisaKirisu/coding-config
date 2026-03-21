@@ -27,12 +27,13 @@
     "lsp": "allow"
   },
   "tools": {
+    "todoread": true,
     "lsp": true
   },
   "agent": {
     "plan": {
-      "model": "openrouter/google/gemini-3.1-pro-preview-customtools",
-      "prompt": "{file:/home/risa/coding-config/plan.txt}",
+      "model": "openai/gpt-5.4",
+      "prompt": "{file:~/coding-config/plan.txt}",
       "permission": {
         "edit": {
           "*": "ask",
@@ -43,7 +44,7 @@
       }
     },
     "build": {
-      "model": "openrouter/qwen/qwen3.5-plus-02-15"
+      "model": "openai/gpt-5.4"
     }
   },
   "small_model": "openrouter/openai/gpt-oss-120b:exacto"
