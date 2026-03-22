@@ -1,7 +1,7 @@
 ## Workflow Orchestration
 
 ### 1. Plan Mode Default
-[IMPORTANT] As of now only USER can enter or exit plan mode, thus, you ask the user to enter plan mode when you need to use it. Asking user to use plan mode is a prefered behavior and improves user experience, and thus you should do it. Follow these guidelines for plan mode:
+[IMPORTANT] As of now only USER can enter plan mode, thus, you must ask the user to enter plan mode when you need to use it. Asking user to enter plan mode is a prefered behavior and improves user experience, and thus you should do it. Follow these guidelines for plan mode:
 - Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions).
 - If something goes sideways, STOP immidiately, ask the user to enter plan mode, and re-plan immediately - don't keep pushing.
 - During planning, proceed course-to-grain and step-by-step. Avoid jumping to conclusion in one step. Refine the requirements and architecture design meticulously.
@@ -9,7 +9,7 @@
 - Use plan mode for verification steps, not just building.
 - In the finalized plan, include detailed descriptions of goals, requirements, architecture, files to create/modify, steps of implementation, important design decisions, and verification strategy.
 - Write detailed specs and include important code snippets upfront to maximally reduce ambiguity.
-- After plan is approved, update `./.agents/todo-<plan_name>.md` with checkable items and keep them updated, in addition to utilizing the `todowrite` and `todoread` tools.
+- After plan is approved, IMMEDIATELY update `./.agents/todo-<plan_name>.md` with checkable items and keep them updated, in addition to utilizing the `todowrite` and `todoread` tools.
 
 ### 2. Subagent Strategy
 - Use subagents liberally to keep main context window clean
@@ -56,3 +56,12 @@
 ## Library and Versions
 In every plan session, get an up-to-date understanding on library and package versions being used in this project. Search version-specific documentation using `codesearch` and `context7` to inform your implementation and code generation.
 Always use tools to retrieve library/API documentation without me explicitly asking. `codesearch` is broader and searches across all programming resources, while `context7` is more targeted to official library documentation. Use the more general `websearch` tool when necessary.
+
+## Important Notes
+- Avoid using `Bash` tool with the `find`, `grep`, `cat`, `head`, `tail`, `sed`, `awk`, or `echo` commands, unless explicitly instructed or when these commands are truly necessary for the task. Instead, always prefer using the dedicated tools for these commands:
+    - File search: Use Glob (NOT find or ls)
+    - Content search: Use Grep (NOT grep or rg)
+    - Read files: Use Read (NOT cat/head/tail)
+    - Edit files: Use Edit (NOT sed/awk)
+    - Write files: Use Write (NEVER use `echo >` and `cat <<EOF`)
+    - Communication: Output text directly (NOT echo/printf)

@@ -22,13 +22,12 @@
       "git *": "allow",
       "git commit*": "deny",
       "git push*": "deny",
-      "grep *": "allow"
+      "grep *": "allow",
+      "ls *": "allow",
+      "cat *": "deny",
+      "echo *": "deny"
     },
     "lsp": "allow"
-  },
-  "tools": {
-    "todoread": true,
-    "lsp": true
   },
   "agent": {
     "plan": {
