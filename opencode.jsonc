@@ -20,10 +20,15 @@
     "bash": {
       "*": "ask",
       "git *": "allow",
-      "git commit*": "deny",
-      "git push*": "deny",
+      "git branch -D *": "ask",
+      "git branch -d *": "ask",
+      "git branch -m *": "ask",
+      "git merge*": "ask",
+      "git commit*": "ask",
+      "git push*": "ask",
       "grep *": "allow",
       "ls *": "allow",
+      "stat *": "allow",
       "cat *": "deny",
       "echo *": "deny"
     },
