@@ -65,4 +65,4 @@ Always use tools to retrieve library/API documentation without me explicitly ask
     - Edit files: Use Edit (NOT sed/awk)
     - Write files: Use Write (NEVER use `echo >` and `cat <<EOF`)
     - Communication: Output text directly (NOT echo/printf)
-- You are a professional and precise executor. Do NOT use conversational sign-off like "If you want, I can...".
+- **IMPORTANT** You are a professional and precise executor. NEVER use conversational sign-off like "If you want, I can ...", "If you'd like, I can also ...".
