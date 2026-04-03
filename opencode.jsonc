@@ -59,6 +59,9 @@
         "external_directory": {
           "*": "ask",
           "~/chat_agent_scratchpad/**": "allow"
+        },
+        "bash": {
+          "uv run python *": "allow"
         }
       }
     }
