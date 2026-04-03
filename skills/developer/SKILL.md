@@ -1,6 +1,6 @@
 ---
 name: developer
-description: Developer guideline for OpenCode default agent and plan mode agent. OpenCode default agent and Plan mode agent MUST load this skill immediately at session start. OpenCode default agent agent and Plan mode agent MUST load this skill immediately if a compaction happened and you do not see this skill loaded in your context. Other agents are not required to load this skill on session start. 
+description: Developer guideline for OpenCode default agent and plan mode agent. OpenCode default agent and Plan mode agent MUST load this skill immediately at session start. OpenCode default agent agent and Plan mode agent MUST load this skill immediately if a compaction happened and you do not see this skill loaded in your context. **For other agents whose not default and plan mode** - Do not load this skill unless asked. 
 license: MIT
 compatibility: opencode
 metadata:

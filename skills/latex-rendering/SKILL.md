@@ -1,6 +1,6 @@
 ---
 name: latex-rendering
-description: Latex rendering instructions and examples. Load this skill before you generate any latex text to the user. 
+description: Latex rendering special handling instructions and examples. The renderer has limitation. You MUST load this skill before you generate any latex text to the user. 
 license: MIT
 compatibility: opencode
 metadata:
