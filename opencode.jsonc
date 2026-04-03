@@ -32,18 +32,12 @@
   },
   "agent": {
     "plan": {
-      "instructions": [
-        "~/coding-config/AGENTS.md"
-      ],
       "model": "openai/gpt-5.4",
       "permission": {
         "lsp": "allow"
       }
     },
     "build": {
-      "instructions": [
-        "~/coding-config/AGENTS.md"
-      ],
       "model": "openai/gpt-5.4"
     },
     "general-qa": {
