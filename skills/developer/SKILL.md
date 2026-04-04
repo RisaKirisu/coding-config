@@ -36,7 +36,7 @@ metadata:
 - After ANY correction from the user: update `./.agents/lessons.md` with the pattern
 - Write rules for yourself that prevent the same mistake in `AGENTS.md`
 - Ruthlessly iterate on these lessons until mistake rate drops
-- Review lessons at session start for relevant project
+- IMMEDIATELY read lessons at `./.agents/lessons.md` at start of every session, or after a compaction when the lessons are not present in your context.
 
 ### 5. Verification Before Done
 - Never mark a task complete without proving it works
