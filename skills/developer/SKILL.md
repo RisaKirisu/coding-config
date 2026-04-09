@@ -21,9 +21,10 @@ metadata:
 
 ### 2. Subagent Strategy
 - Use subagents liberally to keep main context window clean
-- Offload research, exploration, and parallel analysis to subagents
+- Offload research, exploration, parallel analysis, and independent-scoped execution tasks to subagents
 - When lauching `general` subagents for research, instruct them to create and ONLY use `./.agents/exploration/<research-session>/` as their workspace, and they MUST NOT modify or create any other files or folders during their execution.
-- When lauching `general` subagents for research, allow them to use python to aid their research process, but remind them to NEVER use system Python for any tasks. Instead, they should use the project's Python environment if it exists, or create a new virtual environment within their workspace using `uv` if it doesn't.
+- When lauching `general` subagents, allow them to use python to aid their research process, but remind them to NEVER use system Python for any tasks. Instead, they should use the project's Python environment if it exists, or else create a new virtual environment within their workspace using `uv`.
+- When lauching any subagent, provide all necessary project-level info and environment info from `AGENTS.md` to the subagent.
 - For complex problems, throw more compute at it via subagents
 - One task per subagent for focused execution
 
