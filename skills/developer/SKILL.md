@@ -20,12 +20,13 @@ metadata:
 - After plan is approved, IMMEDIATELY update `./.agents/todo-<plan_name>.md` with checkable items and keep them updated, in addition to utilizing the `todowrite` and `todoread` tools.
 
 ### 2. Subagent Strategy
-- Use subagents liberally to keep main context window clean
+- Use subagents liberally to keep main context window clean.
 - Offload research, exploration, parallel analysis, and independent-scoped execution tasks to subagents
-- When lauching `general` subagents for research, instruct them to create and ONLY use `./.agents/exploration/<research-session>/` as their workspace, and they MUST NOT modify or create any other files or folders during their execution.
-- When lauching `general` subagents, allow them to use python to aid their research process, but remind them to NEVER use system Python for any tasks. Instead, they should use the project's Python environment if it exists, or else create a new virtual environment within their workspace using `uv`.
-- When lauching any subagent, provide all necessary project-level info and environment info from `AGENTS.md` to the subagent.
-- For complex problems, throw more compute at it via subagents
+- Launch `explore` subagents for goal-specific research and scouting work. `explore` agents is read-only, fast, and precise. Use them liberally to explore codebases, pinpoint library documentations, perform internet research, do isolated analysis, and similar tasks.
+- For high complexity tasks that require scripting and experimentation, lauch a `general` subagents. When creating `general` agents, specify clearly defined and scoped goals and requirements. Explicitly instruct them to create and ONLY use `./.agents/exploration/<research-session>/` as their workspaces, and they MUST NOT modify or create any other files or directory during their execution.
+- When lauching `general` subagents, allow them to use Python to aid their research process, but explicitly instruct them to NEVER use system Python for any tasks. Instead, they should use the project's Python environment if it exists, or else create a new virtual environment within their workspace using `uv`.
+- When lauching any subagent, provide all necessary project-level info and environment info from `AGENTS.md` to the subagent. Subagents only know what you explicitly instruct them.
+- For complex problems, use a divide and conquer strategy: split the problem into a sequence of clearly defined sub-problems with well-defined goals that can be individually tackled. Then, launch subagents according to the complexity and dependency of the sub-problems to efficiently solve them.
 - One task per subagent for focused execution
 
 ### 3. Implementation Discipline
@@ -72,6 +73,6 @@ Always use tools to retrieve library/API documentation without me explicitly ask
     - Content search: Use Grep (NOT grep or rg)
     - Read files: Use Read (NOT cat/head/tail)
     - Edit files: Use Edit (NOT sed/awk)
-    - Write files: Use Write (NEVER use `echo >` and `cat <<EOF`)
+    - Write files: Use Write (NEVER use `echo >`, `cat <<EOF`, and similar bash commands with redirections)
     - Communication: Output text directly (NOT echo/printf)
 - **IMPORTANT** You are a professional and precise executor. NEVER use conversational sign-off like "If you want, I can ...", "If you'd like, I can also ...".
