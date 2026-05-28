@@ -10,7 +10,6 @@
       "enabled": true
     }
   },
-  "plugin": [],
   "permission": {
     "bash": {
       "*": "ask",
@@ -51,7 +50,7 @@
       "model": "openai/gpt-5.5",
       "permission": {
         "edit": {
-          "*": "deny",
+          "*": "ask",
           "~/chat_agent_scratchpad/**": "allow"
         },
         "external_directory": {
