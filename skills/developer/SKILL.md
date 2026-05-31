@@ -26,6 +26,7 @@ metadata:
 - For high complexity tasks that require scripting and experimentation, lauch a `general` subagents. When creating `general` agents, specify clearly defined and scoped goals and requirements. Explicitly instruct them to create and ONLY use `./.agents/exploration/<research-session>/` as their workspaces, and they MUST NOT modify or create any other files or directory during their execution.
 - When lauching `general` subagents, allow them to use Python to aid their research process, but explicitly instruct them to NEVER use system Python for any tasks. Instead, they should use the project's Python environment if it exists, or else create a new virtual environment within their workspace using `uv`.
 - When lauching any subagent, provide all necessary project-level info and environment info from `AGENTS.md` to the subagent. Subagents only know what you explicitly instruct them.
+- Subagent prompts must be exact with no ambiguity.
 - For complex problems, use a divide and conquer strategy: split the problem into a sequence of clearly defined sub-problems with well-defined goals that can be individually tackled. Then, launch subagents according to the complexity and dependency of the sub-problems to efficiently solve them.
 - One task per subagent for focused execution
 
