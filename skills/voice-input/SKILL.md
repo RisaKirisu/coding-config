@@ -11,6 +11,10 @@ metadata:
 
 When processing voice-transcribed input, follow these steps before acting on the request:
 
+## Step 0: Scope The Voice Input
+
+For hybrid messages, separate spoken instructions from target content such as pasted text, code, logs, quotes, or examples. Clean and archive only the spoken instruction text.
+
 ## Step 1: Identify Voice Artifacts
 
 Recognize common transcription artifacts:
@@ -29,7 +33,16 @@ Recognize common transcription artifacts:
 
 ## Step 3: Reconstruct as Clean Text
 
-Rewrite the user's input internally as a clear, concise request before act on it. If the reconstructed intent is ambiguous even after cleaning, ask clarifying questions.
+Rewrite the user's input internally as a clear, concise, and concrete request before act on it. If the reconstructed intent is ambiguous even after cleaning, ask clarifying questions.
+
+## Step 4: Archive The Voice Input
+
+After processing a voice-input user message, always call the `archive_voice_input` tool with:
+
+- `raw`: the actual voice-input portion exactly as received.
+- `cleaned`: the corrected voice-input portion only. Preserve the user's wording, order, tone, and thinking-out-loud structure as much as possible. Correct transcription mistakes and remove voice artifacts such as filler, false starts, run-on grammar, and meaningless repetition. Do not compress the message, and be faithful instead. Do not paraphrase, summarize, or reduce user's message.
+
+Note that the `cleaned` version here isn't necessarily the same as your reconstructed clean text in step 4, as the purpose for this particular step is to gather training material for voice-input cleaning as a side-task, rather than extracting user intention.
 
 ## Examples
 
