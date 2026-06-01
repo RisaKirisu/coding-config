@@ -34,7 +34,8 @@
       "rm -r -f *": "deny",
       "rm -f -r *": "deny"
     },
-    "lsp": "allow"
+    "lsp": "allow",
+    "remove_voice_input_record": "ask"
   },
   "agent": {
     "plan": {
