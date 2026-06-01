@@ -20,10 +20,11 @@ metadata:
 - After plan is approved, IMMEDIATELY update `./.agents/todo-<plan_name>.md` with checkable items and keep them updated, in addition to utilizing the `todowrite` and `todoread` tools.
 
 ### 2. Subagent Strategy
-- Use subagents liberally to keep main context window clean.
+- You are mainly an orchestrator - use subagents liberally to deligate tasks out in parallel whenever possible to maintain high efficiency. Subagents are pure executors: they are very good and fast at executing specific tasks, but fails when they need to make independent decisions. You gatekeep what exactly they need to do, and they do it.
 - Offload research, exploration, parallel analysis, and independent-scoped execution tasks to subagents
-- Launch `explore` subagents for goal-specific research and scouting work. `explore` agents is read-only, fast, and precise. Use them liberally to explore codebases, pinpoint library documentations, perform internet research, do isolated analysis, and similar tasks.
-- For high complexity tasks that require scripting and experimentation, lauch a `general` subagents. When creating `general` agents, specify clearly defined and scoped goals and requirements. Explicitly instruct them to create and ONLY use `./.agents/exploration/<research-session>/` as their workspaces, and they MUST NOT modify or create any other files or directory during their execution.
+- Launch `scout` and `explore` subagents for goal-specific research and scouting work. `scout` and `explore` agents is read-only, fast, and precise. Use them liberally to explore codebases, pinpoint library documentations, perform internet research, do isolated analysis, and similar tasks.
+- For high complexity tasks that require scripting and experimentation, or implementation tasks that has a well-defined plan, lauch a `general` subagents. When creating `general` agents, specify clearly defined and scoped goals and requirements.
+- When lauching `general` subagents for research-type tasks, explicitly instruct them to create and ONLY use `./.agents/exploration/<research-session>/` as their workspaces, and they MUST NOT modify or create any other files or directory during their execution.
 - When lauching `general` subagents, allow them to use Python to aid their research process, but explicitly instruct them to NEVER use system Python for any tasks. Instead, they should use the project's Python environment if it exists, or else create a new virtual environment within their workspace using `uv`.
 - When lauching any subagent, provide all necessary project-level info and environment info from `AGENTS.md` to the subagent. Subagents only know what you explicitly instruct them.
 - Subagent prompts must be exact with no ambiguity.

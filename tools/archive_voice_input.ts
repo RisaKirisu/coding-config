@@ -1,6 +1,8 @@
 import { tool } from "@opencode-ai/plugin"
-import { appendFile, mkdir } from "node:fs/promises"
+import { appendFile, mkdir, readFile } from "node:fs/promises"
 import path from "node:path"
+
+const file = "/home/risa/projects/voice-dictation-cleanup/data/archive_voice_input.jsonl"
 
 export default tool({
   description:
@@ -16,13 +18,20 @@ export default tool({
       .describe("Cleaned voice-input text; be faithful to the original message. Do not paraphrase or summarize."),
   },
   async execute(args) {
-    const dir = "/home/risa/projects/voice-dictation-cleanup/data"
-    await mkdir(dir, { recursive: true })
+    await mkdir(path.dirname(file), { recursive: true })
+    const index = await count(file)
     await appendFile(
-      path.join(dir, "archive_voice_input.jsonl"),
+      file,
       `${JSON.stringify({ raw: args.raw, cleaned: args.cleaned })}\n`,
       "utf8",
     )
-    return "Voice input archived successfully."
+    return `Voice input archived successfully at index ${index}.`
   },
 })
+
+async function count(file: string) {
+  return readFile(file, "utf8").then(
+    (text) => text.split("\n").filter(Boolean).length,
+    () => 0,
+  )
+}
