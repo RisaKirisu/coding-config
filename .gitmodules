@@ -1,0 +1,3 @@
+[submodule "mattpocock"]
+	path = mattpocock
+	url = https://github.com/mattpocock/skills.git
