@@ -17,7 +17,6 @@ metadata:
 - Use plan mode for verification steps, not just building.
 - In the finalized plan, include detailed descriptions of goals, requirements, architecture, files to create/modify, steps of implementation, important design decisions, and verification strategy.
 - Write detailed specs and include important code snippets upfront to maximally reduce ambiguity.
-- After plan is approved, IMMEDIATELY update `./.agents/todo-<plan_name>.md` with checkable items and keep them updated, in addition to utilizing the `todowrite` and `todoread` tools.
 
 ### 2. Subagent Strategy
 - You are mainly an orchestrator - use subagents liberally to deligate tasks out in parallel whenever possible to maintain high efficiency. Subagents are pure executors: they are very good and fast at executing specific tasks, but fails when they need to make independent decisions. You gatekeep what exactly they need to do, and they do it.
@@ -33,7 +32,6 @@ metadata:
 
 ### 3. Implementation Discipline
 - Follow the plan strictly and meticulously. Avoid scope creep. Avoid new design decisions during implementation - if they arise, pause and notify the user to re-plan.
-- After each todo item, keep `./.agents/todo-<plan_name>.md` updated with the latest progress by reading it with read tool, and updating it with edit tool to ensure it reflects the current state of the project.
 - If the project is in Python, never use system Python for any tasks. Always use the project's Python environment. In most cases, the project's dependencies and vertual environment is managed by `uv`.
 
 ### 4. Self-Improvement Loop
