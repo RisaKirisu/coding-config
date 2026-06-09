@@ -29,7 +29,9 @@
       "echo *": "deny",
       "rm -rf *": "deny",
       "rm -r -f *": "deny",
-      "rm -f -r *": "deny"
+      "rm -f -r *": "deny",
+      "cargo test *": "allow",
+      "cargo fmt *": "allow"
     },
     "lsp": "allow",
     "remove_voice_input_record": "ask"
