@@ -10,6 +10,60 @@
       "enabled": true
     }
   },
+  "provider": {
+    "ruoli": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "RuoLi",
+      "options": {
+        "baseURL": "https://ruoli.dev/v1",
+        "apiKey": "<key>"
+      },
+      "models": {
+        "gpt-5.5": {
+          "name": "GPT-5.5",
+          "limit": {
+            "context": 272000,
+            "output": 128000
+          },
+          "variants": {
+            "high": {
+              "reasoningEffort": "high",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true
+            },
+            "medium": {
+              "reasoningEffort": "medium",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true
+            }
+          }
+        },
+        "gpt-5.4": {
+          "name": "GPT-5.4",
+          "limit": {
+            "context": 272000,
+            "output": 128000
+          },
+          "variants": {
+            "high": {
+              "reasoningEffort": "high",
+              "reasoningSummary": "auto",
+              "textVerbosity": "low",
+              "forceReasoning": true
+            },
+            "medium": {
+              "reasoningEffort": "medium",
+              "reasoningSummary": "auto",
+              "textVerbosity": "low",
+              "forceReasoning": true
+            }
+          }
+        }
+      }
+    }
+  },
   "permission": {
     "bash": {
       "*": "ask",
@@ -31,7 +85,8 @@
       "rm -r -f *": "deny",
       "rm -f -r *": "deny",
       "cargo test *": "allow",
-      "cargo fmt *": "allow"
+      "cargo fmt *": "allow",
+      "cargo check *": "allow"
     },
     "lsp": "allow",
     "remove_voice_input_record": "ask"
@@ -68,15 +123,15 @@
       }
     },
     "explore": {
-      "model": "openai/gpt-5.4-mini",
-      "reasoningEffort": "high"
+      "model": "ruoli/gpt-5.4",
+      "reasoningEffort": "medium"
     },
     "scout": {
-      "model": "openai/gpt-5.4-mini",
-      "reasoningEffort": "high"
+      "model": "ruoli/gpt-5.4",
+      "reasoningEffort": "medium"
     },
     "general": {
-      "model": "openai/gpt-5.4",
+      "model": "ruoli/gpt-5.4",
       "reasoningEffort": "medium"
     }
   },
