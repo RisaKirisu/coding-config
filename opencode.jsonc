@@ -16,7 +16,7 @@
       "name": "RuoLi",
       "options": {
         "baseURL": "https://ruoli.dev/v1",
-        "apiKey": "<key>"
+        "apiKey": ""
       },
       "models": {
         "gpt-5.5": {
@@ -86,7 +86,8 @@
       "rm -f -r *": "deny",
       "cargo test *": "allow",
       "cargo fmt *": "allow",
-      "cargo check *": "allow"
+      "cargo check *": "allow",
+      "cargo clippy *": "allow"
     },
     "lsp": "allow",
     "remove_voice_input_record": "ask"
