@@ -1,6 +1,6 @@
 ---
 name: voice-input
-description: Instruction for processing voice-input text. Load this when you suspect the user is inputting by voice (filler words, repetition, run-on sentences, homophone errors) or when the user has explicitly stated they are using voice input.
+description: Instruction for processing voice-input text. Load this when the user is likely inputting by voice (filler words, repetition, run-on sentences, homophone errors).
 license: MIT
 compatibility: opencode
 metadata:
@@ -43,6 +43,8 @@ After processing a voice-input user message, always call the `archive_voice_inpu
 - `cleaned`: the corrected voice-input portion only. Preserve the user's wording, order, tone, and thinking-out-loud structure as much as possible. Correct transcription mistakes and remove voice artifacts such as filler, false starts, run-on grammar, and meaningless repetition. Do not compress the message, and be faithful instead. Do not paraphrase, summarize, or reduce user's message.
 
 Note that the `cleaned` version here isn't necessarily the same as your reconstructed clean text in step 4, as the purpose for this particular step is to gather training material for voice-input cleaning as a side-task, rather than extracting user intention.
+
+This should ALWAYS be called regardless the mode you are in to archieve the voice input.
 
 ## Examples
 
