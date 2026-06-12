@@ -1,6 +1,6 @@
 ---
 name: voice-input
-description: Instruction for processing voice-input text. Load this when the user is likely inputting by voice (filler words, repetition, run-on sentences, homophone errors).
+description: Instruction for processing voice-input text. Load this whenever the user is likely inputting by voice (filler words, repetition, run-on sentences, homophone errors).
 license: MIT
 compatibility: opencode
 metadata:
