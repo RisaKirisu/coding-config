@@ -33,6 +33,7 @@ while IFS= read -r -d '' skill_md; do
     rm -rf "$target"
   fi
 
-  ln -sfn "$src" "$target"
-  echo "linked $name -> $src"
+  relative_src="$(realpath --relative-to="$DEST" "$src")"
+  ln -sfn "$relative_src" "$target"
+  echo "linked $name -> $relative_src"
 done

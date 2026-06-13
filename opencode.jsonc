@@ -10,6 +10,14 @@
       "enabled": true
     }
   },
+  "skills": {
+    "paths": [
+      "~/coding-config/skills"
+    ]
+  },
+  "plugin": [
+    "@mohak34/opencode-notifier@latest"
+  ],
   "provider": {
     "ruoli": {
       "npm": "@ai-sdk/openai-compatible",
@@ -96,6 +104,7 @@
     "plan": {
       "model": "openai/gpt-5.5",
       "reasoningEffort": "high",
+      "prompt": "{file:~/coding-config/plan.txt}",
       "permission": {
         "lsp": "allow"
       }
