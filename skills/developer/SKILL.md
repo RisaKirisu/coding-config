@@ -9,9 +9,6 @@ metadata:
 ## Workflow Orchestration
 
 ### 1. Plan Mode Default
-[IMPORTANT] As of now only USER can enter plan mode, thus, you must ask the user to enter plan mode when you need to use it. Asking user to enter plan mode is a prefered behavior and improves user experience, and thus you should do it. Follow these guidelines for plan mode:
-- Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions).
-- If something goes sideways, STOP immidiately, ask the user to enter plan mode, and re-plan immediately - don't keep pushing.
 - During planning, proceed course-to-grain and step-by-step. Avoid jumping to conclusion in one step. Refine the requirements and architecture design meticulously.
 - During planning, use `question` tool to prompt user reponse to clarify any uncertainties and architectural decisions, rather than making assumptions.
 - Use plan mode for verification steps, not just building.
@@ -49,6 +46,10 @@ metadata:
 
 ### 6. Keep Up-to-date Documentation
 - After every finished task, read `AGENTS.md`, check for outdated information, and update it when needed.
+
+### 7. Compression Discipline.
+- When doing compression, you CANNOT compress the system prompt and user's initial direction.
+- When doing compression, you MUST write an important reminder at the end of your compression text that remind yourself to reload skills, `AGENTS.md`, plan file, and relevant project files immidiatly. You cannot proceed implementation without complete context.
 
 ## Task Management
 
