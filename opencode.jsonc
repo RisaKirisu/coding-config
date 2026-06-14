@@ -15,9 +15,6 @@
       "~/coding-config/skills"
     ]
   },
-  "plugin": [
-    "@mohak34/opencode-notifier@latest"
-  ],
   "provider": {
     "ruoli": {
       "npm": "@ai-sdk/openai-compatible",
@@ -34,6 +31,12 @@
             "output": 128000
           },
           "variants": {
+            "xhigh": {
+              "reasoningEffort": "xhigh",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true
+            },
             "high": {
               "reasoningEffort": "high",
               "reasoningSummary": "auto",
