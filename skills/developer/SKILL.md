@@ -12,8 +12,7 @@ metadata:
 - During planning, proceed course-to-grain and step-by-step. Avoid jumping to conclusion in one step. Refine the requirements and architecture design meticulously.
 - During planning, use `question` tool to prompt user reponse to clarify any uncertainties and architectural decisions, rather than making assumptions.
 - Use plan mode for verification steps, not just building.
-- In the finalized plan, include detailed descriptions of goals, requirements, architecture, files to create/modify, steps of implementation, important design decisions, and verification strategy.
-- Write detailed specs and include important code snippets upfront to maximally reduce ambiguity.
+- Write detailed specs to maximally reduce ambiguity.
 - After exiting plan mode, compress exploration context during planning. However, reload skills, `agents.md` specified contexts, and the plan file itself immediatly after compression before starting the implementation.
 
 ### 2. Subagent Strategy
