@@ -148,5 +148,8 @@
       "reasoningEffort": "medium"
     }
   },
-  "small_model": "openrouter/openai/gpt-oss-120b:exacto"
+  "small_model": "openrouter/openai/gpt-oss-120b:exacto",
+  "plugin": [
+    "@tarquinen/opencode-dcp@latest"
+  ]
 }
