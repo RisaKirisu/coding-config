@@ -73,6 +73,99 @@
           }
         }
       }
+    },
+    "krill": {
+      "npm": "@ai-sdk/openai",
+      "name": "Krill",
+      "options": {
+        "baseURL": "https://api.krill-ai.com/codex/v1",
+        "apiKey": "{file:~/coding-config/.api-keys/krill}",
+        "setCacheKey": true
+      },
+      "models": {
+        "gpt-5.5": {
+          "name": "gpt-5.5",
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          },
+          "variants": {
+            "xhigh": {
+              "reasoningEffort": "xhigh",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true
+            },
+            "high": {
+              "reasoningEffort": "high",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true
+            },
+            "medium": {
+              "reasoningEffort": "medium",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true
+            },
+            "none": {
+              "reasoningEffort": "none",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium"
+            }
+          }
+        },
+        "gpt-5.4": {
+          "name": "gpt-5.4",
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          },
+          "variants": {
+            "xhigh": {
+              "reasoningEffort": "xhigh",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true
+            },
+            "high": {
+              "reasoningEffort": "high",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true
+            },
+            "medium": {
+              "reasoningEffort": "medium",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true
+            },
+            "none": {
+              "reasoningEffort": "none",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium"
+            }
+          }
+        }
+      }
     }
   },
   "permission": {
@@ -136,19 +229,19 @@
       }
     },
     "explore": {
-      "model": "ruoli/gpt-5.4",
+      "model": "krill/gpt-5.4",
       "reasoningEffort": "medium"
     },
     "scout": {
-      "model": "ruoli/gpt-5.4",
+      "model": "krill/gpt-5.4",
       "reasoningEffort": "medium"
     },
     "general": {
-      "model": "ruoli/gpt-5.4",
+      "model": "krill/gpt-5.4",
       "reasoningEffort": "medium"
     }
   },
-  "small_model": "openrouter/openai/gpt-oss-120b:exacto",
+  "small_model": "krill/gpt-5.4",
   "plugin": [
     "@tarquinen/opencode-dcp@latest"
   ]
