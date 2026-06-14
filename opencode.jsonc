@@ -16,71 +16,44 @@
     ]
   },
   "provider": {
-    "ruoli": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "RuoLi",
+    "krill-claude": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "Krill",
       "options": {
-        "baseURL": "https://ruoli.dev/v1",
-        "apiKey": "{file:~/coding-config/.api-keys/ruoli}"
+        "baseURL": "https://api.krill-ai.com/v1",
+        "apiKey": "{file:~/coding-config/.api-keys/krill-claude}"
       },
       "models": {
-        "gpt-5.5": {
-          "name": "GPT-5.5",
-          "limit": {
-            "context": 272000,
-            "output": 128000
+        "claude-opus-4-8": {
+          "name": "claude-opus-4-8",
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
           },
-          "variants": {
-            "xhigh": {
-              "reasoningEffort": "xhigh",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium",
-              "forceReasoning": true
-            },
-            "high": {
-              "reasoningEffort": "high",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium",
-              "forceReasoning": true
-            },
-            "medium": {
-              "reasoningEffort": "medium",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium",
-              "forceReasoning": true
-            }
-          }
-        },
-        "gpt-5.4": {
-          "name": "GPT-5.4",
           "limit": {
-            "context": 272000,
-            "output": 128000
+            "context": 1000000,
+            "output": 65536
           },
-          "variants": {
-            "high": {
-              "reasoningEffort": "high",
-              "reasoningSummary": "auto",
-              "textVerbosity": "low",
-              "forceReasoning": true
+          "options": {
+            "thinking": {
+              "type": "enabled"
             },
-            "medium": {
-              "reasoningEffort": "medium",
-              "reasoningSummary": "auto",
-              "textVerbosity": "low",
-              "forceReasoning": true
-            }
+            "budgetTokens": 8192
           }
         }
       }
     },
-    "krill": {
+    "krill-codex": {
       "npm": "@ai-sdk/openai",
       "name": "Krill",
       "options": {
         "baseURL": "https://api.krill-ai.com/codex/v1",
         "apiKey": "{file:~/coding-config/.api-keys/krill}",
-        "setCacheKey": true
       },
       "models": {
         "gpt-5.5": {
@@ -229,20 +202,21 @@
       }
     },
     "explore": {
-      "model": "krill/gpt-5.4",
+      "model": "krill-codex/gpt-5.4",
       "reasoningEffort": "medium"
     },
     "scout": {
-      "model": "krill/gpt-5.4",
+      "model": "krill-codex/gpt-5.4",
       "reasoningEffort": "medium"
     },
     "general": {
-      "model": "krill/gpt-5.4",
+      "model": "krill-codex/gpt-5.4",
       "reasoningEffort": "medium"
     }
   },
-  "small_model": "krill/gpt-5.4",
+  "small_model": "krill-codex/gpt-5.4",
   "plugin": [
-    "@tarquinen/opencode-dcp@latest"
+    "@tarquinen/opencode-dcp@latest",
+    "@ljw1004/opencode-trace"
   ]
 }

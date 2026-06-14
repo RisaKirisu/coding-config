@@ -14,7 +14,7 @@ metadata:
 - Use plan mode for verification steps, not just building.
 - In the finalized plan, include detailed descriptions of goals, requirements, architecture, files to create/modify, steps of implementation, important design decisions, and verification strategy.
 - Write detailed specs and include important code snippets upfront to maximally reduce ambiguity.
-- After exiting plan mode, compress exploration context during planning. However, reload skills, `agents.md` specified contexts, and the plan file itself immediatly after compression before starting the implementation.
+- After exiting plan mode or a planning session, before starting implementation, compress exploration context during planning. However, reload skills, `agents.md` specified contexts, and the plan file itself immediatly after compression before starting the implementation.
 
 ### 2. Subagent Strategy
 - You are mainly an orchestrator - use subagents liberally to deligate tasks out in parallel whenever possible to maintain high efficiency. Subagents are pure executors: they are very good and fast at executing specific tasks, but fails when they need to make independent decisions. You gatekeep what exactly they need to do, and they do it.
