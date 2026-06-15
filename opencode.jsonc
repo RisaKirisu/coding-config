@@ -21,7 +21,8 @@
       "name": "Krill",
       "options": {
         "baseURL": "https://api.krill-ai.com/v1",
-        "apiKey": "{file:~/coding-config/.api-keys/krill-claude}"
+        "apiKey": "{file:~/coding-config/.api-keys/krill-claude}",
+        "setCacheKey": true
       },
       "models": {
         "claude-opus-4-8": {
@@ -54,6 +55,7 @@
       "options": {
         "baseURL": "https://api.krill-ai.com/codex/v1",
         "apiKey": "{file:~/coding-config/.api-keys/krill}",
+        "setCacheKey": true
       },
       "models": {
         "gpt-5.5": {
