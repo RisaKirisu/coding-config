@@ -21,8 +21,7 @@
       "name": "Krill",
       "options": {
         "baseURL": "https://api.krill-ai.com/v1",
-        "apiKey": "{file:~/coding-config/.api-keys/krill-claude}",
-        "setCacheKey": true
+        "apiKey": "{file:~/coding-config/.api-keys/krill-claude}"
       },
       "models": {
         "claude-opus-4-8": {
@@ -42,9 +41,9 @@
           },
           "options": {
             "thinking": {
-              "type": "enabled"
-            },
-            "budgetTokens": 8192
+              "type": "enabled",
+              "budgetTokens": 8192
+            }
           }
         }
       }
@@ -148,12 +147,12 @@
       "*": "ask",
       "printf *": "allow",
       "bc *": "allow",
+      "date *": "allow",
       "git *": "allow",
       "git branch -D *": "ask",
       "git branch -d *": "ask",
       "git branch -m *": "ask",
       "git merge*": "ask",
-      "git commit*": "ask",
       "git push*": "ask",
       "grep *": "allow",
       "ls *": "allow",
