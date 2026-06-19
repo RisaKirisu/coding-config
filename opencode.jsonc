@@ -165,8 +165,13 @@
       "cargo test *": "allow",
       "cargo fmt *": "allow",
       "cargo check *": "allow",
-      "cargo clippy *": "allow"
+      "cargo clippy *": "allow",
+      "rg *": "allow"
     },
+    "external_directory": {
+      "~/chat_agent_scratchpad/**": "allow",
+      "~/.cargo/**": "allow"
+    }
     "lsp": "allow",
     "remove_voice_input_record": "ask"
   },
