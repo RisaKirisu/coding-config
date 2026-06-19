@@ -170,7 +170,8 @@
     },
     "external_directory": {
       "~/chat_agent_scratchpad/**": "allow",
-      "~/.cargo/**": "allow"
+      "~/.cargo/**": "allow",
+      "/tmp/**": "allow"
     },
     "lsp": "allow",
     "remove_voice_input_record": "ask"
