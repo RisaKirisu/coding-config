@@ -171,7 +171,7 @@
     "external_directory": {
       "~/chat_agent_scratchpad/**": "allow",
       "~/.cargo/**": "allow"
-    }
+    },
     "lsp": "allow",
     "remove_voice_input_record": "ask"
   },
@@ -216,8 +216,8 @@
       "reasoningEffort": "medium"
     },
     "general": {
-      "model": "krill-codex/gpt-5.4",
-      "reasoningEffort": "medium"
+      "model": "krill-codex/gpt-5.5",
+      "reasoningEffort": "high"
     }
   },
   "small_model": "krill-codex/gpt-5.4",
