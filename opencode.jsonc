@@ -224,6 +224,6 @@
   "small_model": "krill-codex/gpt-5.4",
   "plugin": [
     "@tarquinen/opencode-dcp@latest",
-    "./.opencode/plugins/ponytail.mjs"
+    "/home/risa/coding-config/ponytail/.opencode/plugins/ponytail.mjs"
   ]
 }

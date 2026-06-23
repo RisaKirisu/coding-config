@@ -6,10 +6,10 @@ description: Implement defined ready-for-agent issues autonomously in a loop. Lo
 ## Impl issues autonomously in a loop
 Issue impl loop:
 0. If a compression just happened, rebuild context, including this skill, other loaded skills, and issue ticket. 
-1. Load TDD skill, issue ticket, and plan for actions
+1. Load TDD, ponytail[full], issue ticket, and plan for actions
 2. Implement issue.
 3. Compress implementation session.
-4. Load review skill and perform code review.
+4. Load review skill and ponytail-review, and perform code review.
 5. Determine the findings worth fixing. These are findings about logic fault or missed requirements. Sometimes review surfaces invalid/unimportant findings.
 6. Plan and Implement review finding fixes.
 7. Compress.
