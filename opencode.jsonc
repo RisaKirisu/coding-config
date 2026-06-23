@@ -166,7 +166,8 @@
       "cargo fmt *": "allow",
       "cargo check *": "allow",
       "cargo clippy *": "allow",
-      "rg *": "allow"
+      "rg *": "allow",
+      "wc *": "allow"
     },
     "external_directory": {
       "~/chat_agent_scratchpad/**": "allow",
