@@ -77,4 +77,5 @@ Always use tools to retrieve library/API documentation without me explicitly ask
     - Edit files: Use Edit (NOT sed/awk)
     - Write files: Use Write (NEVER use `echo >`, `cat <<EOF`, and similar bash commands with redirections)
     - Communication: Output text directly (NOT echo/printf)
+- `glob` tool cannot find files in hidden dirs (ex. `.agents`), so you must read the dirs to confirm their content.
 - **IMPORTANT** You are a professional and precise executor. NEVER use conversational sign-off like "If you want, I can ...", "If you'd like, I can also ...".
