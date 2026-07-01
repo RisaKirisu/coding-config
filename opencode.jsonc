@@ -5,7 +5,7 @@
       "type": "remote",
       "url": "https://mcp.context7.com/mcp",
       "headers": {
-        "CONTEXT7_API_KEY": "ctx7sk-aa5c831d-f70c-444c-a8a1-4ec996ffaea2"
+        "CONTEXT7_API_KEY": "{file:~/coding-config/.api-keys/context7}"
       },
       "enabled": true
     }
@@ -15,25 +15,70 @@
       "~/coding-config/skills"
     ]
   },
-  "plugin": [
-    "@mohak34/opencode-notifier@latest"
-  ],
   "provider": {
-    "ruoli": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "RuoLi",
+    "krill-claude": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "Krill",
       "options": {
-        "baseURL": "https://ruoli.dev/v1",
-        "apiKey": ""
+        "baseURL": "https://api.krill-ai.com/v1",
+        "apiKey": "{file:~/coding-config/.api-keys/krill-claude}"
+      },
+      "models": {
+        "claude-opus-4-8": {
+          "name": "claude-opus-4-8",
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          },
+          "options": {
+            "thinking": {
+              "type": "enabled",
+              "budgetTokens": 8192
+            }
+          }
+        }
+      }
+    },
+    "krill-codex": {
+      "npm": "@ai-sdk/openai",
+      "name": "Krill",
+      "options": {
+        "baseURL": "https://api.krill-ai.com/codex/v1",
+        "apiKey": "{file:~/coding-config/.api-keys/krill}",
+        "setCacheKey": true
       },
       "models": {
         "gpt-5.5": {
-          "name": "GPT-5.5",
+          "name": "gpt-5.5",
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
           "limit": {
             "context": 272000,
             "output": 128000
           },
           "variants": {
+            "xhigh": {
+              "reasoningEffort": "xhigh",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true
+            },
             "high": {
               "reasoningEffort": "high",
               "reasoningSummary": "auto",
@@ -45,27 +90,52 @@
               "reasoningSummary": "auto",
               "textVerbosity": "medium",
               "forceReasoning": true
+            },
+            "none": {
+              "reasoningEffort": "none",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium"
             }
           }
         },
         "gpt-5.4": {
-          "name": "GPT-5.4",
+          "name": "gpt-5.4",
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
           "limit": {
-            "context": 272000,
-            "output": 128000
+            "context": 1000000,
+            "output": 65536
           },
           "variants": {
+            "xhigh": {
+              "reasoningEffort": "xhigh",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true
+            },
             "high": {
               "reasoningEffort": "high",
               "reasoningSummary": "auto",
-              "textVerbosity": "low",
+              "textVerbosity": "medium",
               "forceReasoning": true
             },
             "medium": {
               "reasoningEffort": "medium",
               "reasoningSummary": "auto",
-              "textVerbosity": "low",
+              "textVerbosity": "medium",
               "forceReasoning": true
+            },
+            "none": {
+              "reasoningEffort": "none",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium"
             }
           }
         }
@@ -77,12 +147,12 @@
       "*": "ask",
       "printf *": "allow",
       "bc *": "allow",
+      "date *": "allow",
       "git *": "allow",
       "git branch -D *": "ask",
       "git branch -d *": "ask",
       "git branch -m *": "ask",
       "git merge*": "ask",
-      "git commit*": "ask",
       "git push*": "ask",
       "grep *": "allow",
       "ls *": "allow",
@@ -95,7 +165,14 @@
       "cargo test *": "allow",
       "cargo fmt *": "allow",
       "cargo check *": "allow",
-      "cargo clippy *": "allow"
+      "cargo clippy *": "allow",
+      "rg *": "allow",
+      "wc *": "allow"
+    },
+    "external_directory": {
+      "~/chat_agent_scratchpad/**": "allow",
+      "~/.cargo/**": "allow",
+      "/tmp/**": "allow"
     },
     "lsp": "allow",
     "remove_voice_input_record": "ask"
@@ -133,17 +210,20 @@
       }
     },
     "explore": {
-      "model": "ruoli/gpt-5.4",
+      "model": "krill-codex/gpt-5.4",
       "reasoningEffort": "medium"
     },
     "scout": {
-      "model": "ruoli/gpt-5.4",
+      "model": "krill-codex/gpt-5.4",
       "reasoningEffort": "medium"
     },
     "general": {
-      "model": "ruoli/gpt-5.4",
-      "reasoningEffort": "medium"
+      "model": "krill-codex/gpt-5.5",
+      "reasoningEffort": "high"
     }
   },
-  "small_model": "openrouter/openai/gpt-oss-120b:exacto"
+  "small_model": "krill-codex/gpt-5.4",
+  "plugin": [
+    "@tarquinen/opencode-dcp@latest"
+  ]
 }
