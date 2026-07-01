@@ -16,38 +16,6 @@
     ]
   },
   "provider": {
-    "krill-claude": {
-      "npm": "@ai-sdk/anthropic",
-      "name": "Krill",
-      "options": {
-        "baseURL": "https://api.krill-ai.com/v1",
-        "apiKey": "{file:~/coding-config/.api-keys/krill-claude}"
-      },
-      "models": {
-        "claude-opus-4-8": {
-          "name": "claude-opus-4-8",
-          "modalities": {
-            "input": [
-              "text",
-              "image"
-            ],
-            "output": [
-              "text"
-            ]
-          },
-          "limit": {
-            "context": 1000000,
-            "output": 65536
-          },
-          "options": {
-            "thinking": {
-              "type": "enabled",
-              "budgetTokens": 8192
-            }
-          }
-        }
-      }
-    },
     "krill-codex": {
       "npm": "@ai-sdk/openai",
       "name": "Krill",
