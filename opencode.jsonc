@@ -16,6 +16,127 @@
     ]
   },
   "provider": {
+    "openai": {
+      "models": {
+        "gpt-5.6-sol": {
+          "variants": {
+            "xhigh": {
+              "reasoningEffort": "xhigh",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true,
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            },
+            "high": {
+              "reasoningEffort": "high",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true,
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            },
+            "medium": {
+              "reasoningEffort": "medium",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true,
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            },
+            "none": {
+              "reasoningEffort": "none",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            }
+          }
+        },
+        "gpt-5.6-terra": {
+          "variants": {
+            "xhigh": {
+              "reasoningEffort": "xhigh",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true,
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            },
+            "high": {
+              "reasoningEffort": "high",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true,
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            },
+            "medium": {
+              "reasoningEffort": "medium",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true,
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            },
+            "none": {
+              "reasoningEffort": "none",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            }
+          }
+        },
+        "gpt-5.6-luna": {
+          "variants": {
+            "xhigh": {
+              "reasoningEffort": "xhigh",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true,
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            },
+            "high": {
+              "reasoningEffort": "high",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true,
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            },
+            "medium": {
+              "reasoningEffort": "medium",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true,
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            },
+            "none": {
+              "reasoningEffort": "none",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            }
+          }
+        }
+      }
+    },
     "krill-codex": {
       "npm": "@ai-sdk/openai",
       "name": "Krill",
@@ -25,49 +146,8 @@
         "setCacheKey": true
       },
       "models": {
-        "gpt-5.5": {
-          "name": "gpt-5.5",
-          "modalities": {
-            "input": [
-              "text",
-              "image"
-            ],
-            "output": [
-              "text"
-            ]
-          },
-          "limit": {
-            "context": 272000,
-            "output": 128000
-          },
-          "variants": {
-            "xhigh": {
-              "reasoningEffort": "xhigh",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium",
-              "forceReasoning": true
-            },
-            "high": {
-              "reasoningEffort": "high",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium",
-              "forceReasoning": true
-            },
-            "medium": {
-              "reasoningEffort": "medium",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium",
-              "forceReasoning": true
-            },
-            "none": {
-              "reasoningEffort": "none",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium"
-            }
-          }
-        },
-        "gpt-5.4": {
-          "name": "gpt-5.4",
+        "gpt-5.6-sol": {
+          "name": "GPT 5.6 Sol",
           "modalities": {
             "input": [
               "text",
@@ -79,31 +159,149 @@
           },
           "limit": {
             "context": 1000000,
-            "output": 65536
+            "output": 128000
           },
           "variants": {
             "xhigh": {
               "reasoningEffort": "xhigh",
               "reasoningSummary": "auto",
               "textVerbosity": "medium",
-              "forceReasoning": true
+              "forceReasoning": true,
+              "include": [
+                "reasoning.encrypted_content"
+              ]
             },
             "high": {
               "reasoningEffort": "high",
               "reasoningSummary": "auto",
               "textVerbosity": "medium",
-              "forceReasoning": true
+              "forceReasoning": true,
+              "include": [
+                "reasoning.encrypted_content"
+              ]
             },
             "medium": {
               "reasoningEffort": "medium",
               "reasoningSummary": "auto",
               "textVerbosity": "medium",
-              "forceReasoning": true
+              "forceReasoning": true,
+              "include": [
+                "reasoning.encrypted_content"
+              ]
             },
             "none": {
               "reasoningEffort": "none",
               "reasoningSummary": "auto",
-              "textVerbosity": "medium"
+              "textVerbosity": "medium",
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            }
+          }
+        },
+        "gpt-5.6-terra": {
+          "name": "GPT 5.6 Terra",
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1000000,
+            "output": 128000
+          },
+          "variants": {
+            "xhigh": {
+              "reasoningEffort": "xhigh",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true,
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            },
+            "high": {
+              "reasoningEffort": "high",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true,
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            },
+            "medium": {
+              "reasoningEffort": "medium",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true,
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            },
+            "none": {
+              "reasoningEffort": "none",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            }
+          }
+        },
+        "gpt-5.6-luna": {
+          "name": "GPT 5.6 Luna",
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1000000,
+            "output": 128000
+          },
+          "variants": {
+            "xhigh": {
+              "reasoningEffort": "xhigh",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true,
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            },
+            "high": {
+              "reasoningEffort": "high",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true,
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            },
+            "medium": {
+              "reasoningEffort": "medium",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "forceReasoning": true,
+              "include": [
+                "reasoning.encrypted_content"
+              ]
+            },
+            "none": {
+              "reasoningEffort": "none",
+              "reasoningSummary": "auto",
+              "textVerbosity": "medium",
+              "include": [
+                "reasoning.encrypted_content"
+              ]
             }
           }
         }
@@ -147,22 +345,23 @@
   },
   "agent": {
     "plan": {
-      "model": "openai/gpt-5.5",
-      "reasoningEffort": "high",
+      "model": "openai/gpt-5.6-sol",
+      "reasoningEffort": "xhigh",
       "prompt": "{file:~/coding-config/plan.txt}",
       "permission": {
         "lsp": "allow"
       }
     },
     "build": {
-      "model": "openai/gpt-5.5",
+      "model": "openai/gpt-5.6-sol",
       "reasoningEffort": "high"
     },
     "general-qa": {
       "mode": "primary",
       "description": "Answer general question and perform conversation",
       "prompt": "{file:~/coding-config/general-qa.md}",
-      "model": "openai/gpt-5.5",
+      "model": "openai/gpt-5.6-sol",
+      "reasoningEffort": "high",
       "permission": {
         "edit": {
           "*": "ask",
@@ -178,19 +377,19 @@
       }
     },
     "explore": {
-      "model": "krill-codex/gpt-5.4",
+      "model": "krill-codex/gpt-5.6-terra",
       "reasoningEffort": "medium"
     },
     "scout": {
-      "model": "krill-codex/gpt-5.4",
+      "model": "krill-codex/gpt-5.6-terra",
       "reasoningEffort": "medium"
     },
     "general": {
-      "model": "krill-codex/gpt-5.5",
+      "model": "krill-codex/gpt-5.6-sol",
       "reasoningEffort": "high"
     }
   },
-  "small_model": "krill-codex/gpt-5.4",
+  "small_model": "krill-codex/gpt-5.6-luna",
   "plugin": [
     "@tarquinen/opencode-dcp@latest"
   ]
