@@ -308,6 +308,7 @@
       }
     }
   },
+  "lsp": true,
   "permission": {
     "bash": {
       "*": "ask",
