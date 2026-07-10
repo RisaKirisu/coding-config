@@ -158,7 +158,7 @@
             ]
           },
           "limit": {
-            "context": 353000,
+            "context": 400000,
             "output": 128000
           },
           "variants": {
@@ -211,7 +211,7 @@
             ]
           },
           "limit": {
-            "context": 353000,
+            "context": 400000,
             "output": 128000
           },
           "variants": {
@@ -264,7 +264,7 @@
             ]
           },
           "limit": {
-            "context": 353000,
+            "context": 400000,
             "output": 128000
           },
           "variants": {
