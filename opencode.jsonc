@@ -378,11 +378,11 @@
       }
     },
     "explore": {
-      "model": "krill-codex/gpt-5.6-terra",
+      "model": "krill-codex/gpt-5.6-sol",
       "reasoningEffort": "medium"
     },
     "scout": {
-      "model": "krill-codex/gpt-5.6-terra",
+      "model": "krill-codex/gpt-5.6-sol",
       "reasoningEffort": "medium"
     },
     "general": {
