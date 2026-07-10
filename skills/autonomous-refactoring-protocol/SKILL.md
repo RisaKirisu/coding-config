@@ -16,7 +16,8 @@ Refactor loop:
 6. For each issue, stop after all refactor issues are completed:
     1. Plan and impl the refactor issue.
     2. Compress, load skill review and ponytail-review, and perform single review pass to ensure public behavior stay unchanged and refactor goal is met. Fix any logic defect.
-    3. Mark the issue as complete, compress and start the next issue.
+    3. Mark the issue as complete, git add + git commit current work with commit msg describing work. Commit msg start with `oc: `
+    4. Compress and start the next issue.
 
 7. Compress the session into concise summary -- if previous summaries exist, compress them as well.
 8. Repeat from step 1.
