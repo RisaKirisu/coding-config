@@ -335,7 +335,8 @@
       "cargo clippy *": "allow",
       "rg *": "allow",
       "wc *": "allow",
-      "ps *": "allow"
+      "ps *": "allow",
+      "pgrep *": "allow"
     },
     "external_directory": {
       "~/chat_agent_scratchpad/**": "allow",
