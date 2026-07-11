@@ -158,7 +158,7 @@
             ]
           },
           "limit": {
-            "context": 400000,
+            "context": 353000,
             "output": 128000
           },
           "variants": {
@@ -211,7 +211,7 @@
             ]
           },
           "limit": {
-            "context": 400000,
+            "context": 353000,
             "output": 128000
           },
           "variants": {
@@ -264,7 +264,7 @@
             ]
           },
           "limit": {
-            "context": 400000,
+            "context": 353000,
             "output": 128000
           },
           "variants": {
@@ -334,7 +334,8 @@
       "cargo check *": "allow",
       "cargo clippy *": "allow",
       "rg *": "allow",
-      "wc *": "allow"
+      "wc *": "allow",
+      "ps *": "allow"
     },
     "external_directory": {
       "~/chat_agent_scratchpad/**": "allow",
