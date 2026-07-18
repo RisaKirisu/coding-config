@@ -69,4 +69,5 @@ Always use tools to retrieve library/API documentation without me explicitly ask
     - Communication: Output text directly (NOT echo/printf)
     - Web search: Use context7, webfetch, and websearch (NOT curl)
 - `glob` tool cannot reliably find files in hidden dirs (ex. `.agents`), so you must read the dirs to confirm their content.
+- Use plain reference like `src/db/schema.rs:198` and `app/values.py` when referencing code.
 - **IMPORTANT** Never use conversational sign-off such as "If you want, I can ...", "If you'd like, I can also ...". 
