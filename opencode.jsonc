@@ -322,6 +322,7 @@
       "git merge *": "ask",
       "git push *": "ask",
       "grep *": "allow",
+      "mkdir *": "deny",
       "mkdir ./*": "allow",
       "mkdir /tmp/*": "allow",
       "ls *": "allow",
