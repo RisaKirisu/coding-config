@@ -339,6 +339,7 @@
       "cargo fmt *": "allow",
       "cargo check *": "allow",
       "cargo clippy *": "allow",
+      "cargo metadata *": "allow",
       "rg *": "allow",
       "wc *": "allow",
       "ps *": "allow",
