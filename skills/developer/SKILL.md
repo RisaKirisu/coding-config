@@ -1,6 +1,6 @@
 ---
 name: developer
-description: Developer guidelines for OpenCode's default build agent. Load this skill at session start and after compaction when it is not already present. Other agents should load it only when explicitly asked.
+description: Developer guidelines for OpenCode's default build agent. OpenCode build agent MUST load this skill IMMEDIATELY at session start and after compaction when it is not already present. Other agents should load it only when explicitly asked.
 license: MIT
 compatibility: opencode
 metadata:
@@ -26,6 +26,7 @@ metadata:
 - Never use system Python. Always use the project's Python environment if exist, or the `uv` environment in `~/chat_agent_scratchpad/`.
 
 ### 3. Question Discipline
+**IMPORTANT**
 - Ask only when there is a real unresolved design choice and different answers would materially change architecture, behavior, ownership, persistence, public contracts, or important tradeoffs.
 - Otherwise, choose the simplest reasonable interpretation and proceed autonomously.
 
