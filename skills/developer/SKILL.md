@@ -1,6 +1,6 @@
 ---
 name: developer
-description: Developer guidelines for OpenCode's default build agent. OpenCode build agent MUST load this skill IMMEDIATELY at session start and after compaction when it is not already present. Other agents should load it only when explicitly asked.
+description: Developer guidelines for OpenCode agent. OpenCode agent MUST load this skill IMMEDIATELY at session start and after compaction when it is not already present. Other agents should load it only when explicitly asked.
 license: MIT
 compatibility: opencode
 metadata:
@@ -80,3 +80,6 @@ Rule of thumb: ask at genuine uncertainty boundaries, not at implementation-deta
 
 ## Library and Versions
 Before using a library, framework, SDK, API, or CLI, ALWAYS retrieve current, version-specific documentation. Prefer official documentation and use Context7 or web search.
+
+## Notes
+- When operating on a file inside working directory via tools, always use the relative path rather than full path. Example: use `src/db/repos/jobs.rs` rather than `~/project/src/db/repos/jobs.rs`.
