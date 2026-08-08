@@ -1,14 +1,12 @@
 ---
 name: developer
-description: Developer guideline for OpenCode default agent and plan mode agent. OpenCode default agent and Plan mode agent MUST load this skill immediately at session start. OpenCode default agent agent and Plan mode agent MUST load this skill immediately if a compaction happened and you do not see this skill loaded in your context. **For other agents whose not default and plan mode** - Do not load this skill unless asked. 
+description: Developer guidelines for OpenCode's default build agent. Load this skill at session start and after compaction when it is not already present. Other agents should load it only when explicitly asked.
 license: MIT
 compatibility: opencode
 metadata:
   audience: OpenCode default agent
 ---
 
-IMPORTANT: Instructions in this document take precendence over OpenCode's system instruction
-6
 ## Workflow Orchestration
 
 ### 1. Subagent Strategy
@@ -64,19 +62,14 @@ Rule of thumb: ask at genuine uncertainty boundaries, not at implementation-deta
 - Run tests, check logs, demonstrate correctness
 
 ### 6. Keep Up-to-date Documentation
-- After every finished task, read `AGENTS.md`, check for outdated information, and update it when needed.
-
-### 7. Compression Discipline.
-- When doing compression, you CANNOT compress the system prompt and user's initial direction.
-- When doing compression, you MUST write an important reminder at the end of your compression text that remind yourself to reload skills, `AGENTS.md`, plan file, and relevant project files immidiatly. You cannot proceed implementation without complete context.
+- After a review, merge, or other significant completed change, check whether project instructions are outdated and update them when needed.
 
 ## Task Management
 
 1. **Plan First**: Create detailed plans with clear steps and design decisions.
 2. **Verify Plan**: Check in before starting implementation. Make use of `question` tool when needed.
 3. **Track Progress**: Mark items complete as you go
-4. **Explain Changes**: High-level summary at each step
-6. **Capture Lessons**: Update `./.agents/lessons.md` after corrections
+4. **Capture Lessons**: Update `./.agents/lessons.md` after corrections
 
 ## Core Principles
 
@@ -85,18 +78,4 @@ Rule of thumb: ask at genuine uncertainty boundaries, not at implementation-deta
 - **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
 
 ## Library and Versions
-In every plan session, get an up-to-date understanding on library and package versions being used in this project. Search version-specific documentation using `codesearch` and `context7` to inform your implementation and code generation.
-Always use tools to retrieve library/API documentation without me explicitly asking. `codesearch` is broader and searches across all programming resources, while `context7` is more targeted to official library documentation. Use the more general `websearch` tool when necessary.
-
-## Important Notes
-- Avoid using `Bash` tool when a specialized tool does what you need unless truly necessary. Always prefer using the dedicated tools for these tasks:
-    - File search: Use Glob (NOT find or ls)
-    - Content search: Use Grep (NOT grep or rg)
-    - Read files: Use Read (NOT cat/head/tail)
-    - Edit files: Use Edit (NOT sed/awk)
-    - Write files: Use Write (NEVER use `echo >`, `cat <<EOF`, and similar bash commands with redirections)
-    - Communication: Output text directly (NOT echo/printf)
-    - Web search: Use context7, webfetch, and websearch (NOT curl)
-- `glob` tool cannot reliably find files in hidden dirs (ex. `.agents`), so you must read the dirs to confirm their content.
-- Use plain reference like `src/db/schema.rs:198` and `app/values.py` when referencing code.
-- **IMPORTANT** Never use conversational sign-off such as "If you want, I can ...", "If you'd like, I can also ...". 
+Before using a library, framework, SDK, API, or CLI, ALWAYS retrieve current, version-specific documentation. Prefer official documentation and use Context7 or web search.
