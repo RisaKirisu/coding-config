@@ -6,6 +6,9 @@ compatibility: opencode
 metadata:
   audience: OpenCode default agent
 ---
+
+IMPORTANT: Instructions in this document take precendence over OpenCode's system instruction
+6
 ## Workflow Orchestration
 
 ### 1. Subagent Strategy
@@ -21,23 +24,49 @@ metadata:
 - One task per subagent for focused execution
 
 ### 2. Implementation Discipline
-- Avoid scope creep. Avoid new design decisions during implementation - if they arise, pause and ask user using the `question` tool even during autonomous mode.
+- Avoid scope creep. Avoid new design decisions during implementation - if a real unresolved design choice arises, pause and ask the user using the `question` tool even during autonomous mode.
 - Never use system Python. Always use the project's Python environment if exist, or the `uv` environment in `~/chat_agent_scratchpad/`.
 
-### 3. Self-Improvement Loop
+### 3. Question Discipline
+- Ask only when there is a real unresolved design choice and different answers would materially change architecture, behavior, ownership, persistence, public contracts, or important tradeoffs.
+- Otherwise, choose the simplest reasonable interpretation and proceed autonomously.
+
+Before asking:
+
+- Check whether the user has already decided it explicitly or implicitly.
+- Ask whether multiple plausible answers would materially change the system.
+- Distinguish design decisions from routine implementation details.
+- Do not invent complexity or edge cases without a concrete reason.
+- Do not ask questions merely to appear thorough.
+
+Good questions:
+
+- Should retries be owned by this workflow or by the shared orchestration layer?
+- Should updates be persisted incrementally or committed atomically at the end?
+- Is this API replacing existing state or adding to it?
+
+Bad questions:
+
+- Should an ID described as group-local be unique within that group?
+- Which arbitrary tie-breaker should be used when either choice has no meaningful effect?
+- Should a field named `last_message_id` contain the last message ID?
+
+Rule of thumb: ask at genuine uncertainty boundaries, not at implementation-detail boundaries.
+
+### 4. Self-Improvement Loop
 - After correction from the user: update `./.agents/lessons.md` with the pattern
 - The pattern should not be defensive and overly specific. Learn the bigger lesson, not only the scene.
 - Read lessons at `./.agents/lessons.md` at start of every session, or after a compaction when the lessons are not present in your context.
 
-### 4. Verification Before Done
+### 5. Verification Before Done
 - Never mark a task complete without proving it works
 - Ask yourself: "Would a staff engineer approve this?"
 - Run tests, check logs, demonstrate correctness
 
-### 5. Keep Up-to-date Documentation
+### 6. Keep Up-to-date Documentation
 - After every finished task, read `AGENTS.md`, check for outdated information, and update it when needed.
 
-### 6. Compression Discipline.
+### 7. Compression Discipline.
 - When doing compression, you CANNOT compress the system prompt and user's initial direction.
 - When doing compression, you MUST write an important reminder at the end of your compression text that remind yourself to reload skills, `AGENTS.md`, plan file, and relevant project files immidiatly. You cannot proceed implementation without complete context.
 
