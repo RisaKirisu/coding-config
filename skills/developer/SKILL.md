@@ -1,6 +1,6 @@
 ---
 name: developer
-description: Developer guidelines for OpenCode agent. OpenCode agent MUST load this skill IMMEDIATELY at session start and after compaction when it is not already present. Other agents should load it only when explicitly asked.
+description: Developer guidelines for OpenCode agent. OpenCode agent MUST load this skill IMMEDIATELY at session start and after compaction when it is not already present. Other agents should load it only when explicitly asked. YOU MUST LOAD THIS IMMEDIATELY AT EARLIEST POSSIBLE CHANCE IF YOU ARE OPENCODE AGENT.
 license: MIT
 compatibility: opencode
 metadata:
@@ -78,8 +78,18 @@ Rule of thumb: ask at genuine uncertainty boundaries, not at implementation-deta
 - **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
 - **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
 
+## Communication Discipline
+
+- Lead with the conclusion.
+- Use concise, information-dense language.
+- Include only details that help the user decide, act, or verify.
+- Avoid repetition, unnecessary caveats, meta-commentary, and walls of text.
+- Expand only when the task's complexity or the user's request requires it.
+- Load caveman skill.
+
 ## Library and Versions
 Before using a library, framework, SDK, API, or CLI, ALWAYS retrieve current, version-specific documentation. Prefer official documentation and use Context7 or web search.
 
 ## Notes
-- When operating on a file inside working directory via tools, always use the relative path rather than full path. Example: use `src/db/repos/jobs.rs` rather than `~/project/src/db/repos/jobs.rs`.
+- When operating on a file inside working directory via tools, always use the relative path rather than full path. Example: use `src/db/repos/jobs.rs` rather than `~/project/src/db/repos/jobs.rs`
+- You are ONLY allowed to access your work directory, `~/chat_agent_scratchpad/`, `~/.cargo/`, and `/tmp/`. You MUSTN't attempt to perform operation on any other directory unless user requested you to do so.
