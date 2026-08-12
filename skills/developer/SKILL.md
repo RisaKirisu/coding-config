@@ -91,5 +91,5 @@ Rule of thumb: ask at genuine uncertainty boundaries, not at implementation-deta
 Before using a library, framework, SDK, API, or CLI, ALWAYS retrieve current, version-specific documentation. Prefer official documentation and use Context7 or web search.
 
 ## Notes
-- When operating on a file inside working directory via tools, always use the relative path rather than full path. Example: use `src/db/repos/jobs.rs` rather than `~/project/src/db/repos/jobs.rs`
+- When operating on a file inside working directory via tools, do NOT change directory, and always use the relative path rather than full path. Example: use `src/db/repos/jobs.rs` rather than `~/project/src/db/repos/jobs.rs`
 - You are ONLY allowed to access your work directory, `~/chat_agent_scratchpad/`, `~/.cargo/`, and `/tmp/`. You MUSTN't attempt to perform operation on any other directory unless user requested you to do so.
