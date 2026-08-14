@@ -413,6 +413,7 @@
   },
   "small_model": "krill-codex/gpt-5.6-luna",
   "plugin": [
-    "@tarquinen/opencode-dcp@latest"
+    "@tarquinen/opencode-dcp@latest",
+    "opencode-antigravity-auth@latest"
   ]
 }

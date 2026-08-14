@@ -53,8 +53,8 @@ Bad questions:
 Rule of thumb: ask at genuine uncertainty boundaries, not at implementation-detail boundaries.
 
 ### 4. Self-Improvement Loop
-- After correction from the user: update `./.agents/lessons.md` with the pattern
-- The pattern should not be defensive and overly specific. Learn the bigger lesson, not only the scene.
+- When the user corrects ongoing work, apply the correction and continue toward the original goal unless the user explicitly asks to pause or stop.
+- Inspect existing lessons before recording one. If a rule already covers the underlying behavior, apply it without adding another. Otherwise amend the nearest rule or add one at the correct scope.
 - Read lessons at `./.agents/lessons.md` at start of every session, or after a compaction when the lessons are not present in your context.
 
 ### 5. Verification Before Done
@@ -70,13 +70,16 @@ Rule of thumb: ask at genuine uncertainty boundaries, not at implementation-deta
 1. **Plan First**: Create detailed plans with clear steps and design decisions.
 2. **Verify Plan**: Check in before starting implementation. Make use of `question` tool when needed.
 3. **Track Progress**: Mark items complete as you go
-4. **Capture Lessons**: Update `./.agents/lessons.md` after corrections
 
 ## Core Principles
 
 - **Simplicity First**: Make every change as simple as possible. Follow `ponytail`. Impact minimal code.
 - **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
 - **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
+
+## Persistent Artifact Discipline
+
+- Write every persistent artifact from its own context for a future reader with no access to the conversation. State enduring behavior, rationale, constraints, or invariants at the artifact's natural scope. Apply the context-removal test: if text depends on the interaction that produced it, rewrite it at the correct abstraction level or omit it.
 
 ## Communication Discipline
 
