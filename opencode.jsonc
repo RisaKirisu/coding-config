@@ -311,7 +311,7 @@
   "lsp": true,
   "permission": {
     "bash": {
-      "*": "ask",
+      "*": "deny",
       "printf *": "allow",
       "bc *": "allow",
       "date *": "allow",
@@ -352,6 +352,9 @@
       "which *": "allow",
       "whereis *": "allow",
       "type *": "allow",
+      "dotenv": "allow",
+      "dotenv *": "allow",
+      "export *": "allow",
       "env": "allow",
       "env *": "allow",
       "printenv *": "allow",
@@ -475,17 +478,8 @@
       "yarn npm tag add *": "deny",
       "yarn npm tag remove *": "deny",
       "bun publish *": "deny",
-      "python *": "allow",
-      "python3 *": "allow",
-      "pip *": "allow",
-      "pip3 *": "allow",
+      "pip3 *": "deny",
       "uv *": "allow",
-      "poetry *": "allow",
-      "pipx *": "allow",
-      "pytest *": "allow",
-      "ruff *": "allow",
-      "mypy *": "allow",
-      "pyright *": "allow",
       "black *": "allow",
       "isort *": "allow",
       "coverage *": "allow",
@@ -504,6 +498,9 @@
       "rm -f -r *": "deny",
       "rm --recursive --force *": "deny",
       "rm --force --recursive *": "deny",
+      "rm /tmp/*": "allow",
+      "rm -f /tmp/*": "allow",
+      "rm -rf /tmp/*": "allow",
       "sudo *": "deny",
       "su *": "deny",
       "shutdown *": "deny",
@@ -531,6 +528,7 @@
       "*&>*": "deny"
     },
     "external_directory": {
+      "/*": "deny",
       "~/chat_agent_scratchpad/**": "allow",
       "~/.cargo/**": "allow",
       "/tmp/**": "allow",
@@ -590,6 +588,6 @@
     "@tarquinen/opencode-dcp@latest",
     "opencode-antigravity-auth@latest",
     "@ljw1004/opencode-trace",
-    "file:///home/risa/projects/workspace/dsh-anchored-standard/opencode-plugin/index.mjs"
+    "{env:HOME}/coding-config/deepseek-minimal-bootstrap/index.mjs"
   ]
 }
