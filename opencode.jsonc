@@ -312,6 +312,7 @@
   "permission": {
     "bash": {
       "*": "deny",
+      "str_replace_editor": "allow",
       "printf *": "allow",
       "bc *": "allow",
       "date *": "allow",
@@ -368,8 +369,8 @@
       "mkdir *": "deny",
       "mkdir ./*": "allow",
       "mkdir /tmp/*": "allow",
-      "cat *": "deny",
-      "echo *": "deny",
+      "cat *": "allow",
+      "echo *": "allow",
       "git status *": "allow",
       "git diff *": "allow",
       "git log *": "allow",
@@ -525,7 +526,11 @@
       "* 2>> *": "deny",
       "*2>>*": "deny",
       "* &> *": "deny",
-      "*&>*": "deny"
+      "*&>*": "deny",
+      "grep * 2>/dev/null": "allow",
+      "cat * 2>/dev/null": "allow",
+      "sed * 2>/dev/null": "allow",
+      "ls * 2>/dev/null": "allow"
     },
     "external_directory": {
       "/*": "deny",
@@ -580,7 +585,7 @@
     },
     "general": {
       "model": "openai/gpt-5.6-sol",
-      "reasoningEffort": "high"
+      "reasoningEffort": "medium"
     }
   },
   "small_model": "openai/gpt-5.6-luna",
