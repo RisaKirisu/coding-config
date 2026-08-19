@@ -17,7 +17,7 @@ NAME="dev-${PROJECT_NAME}-${PROJECT_HASH}"
 
 IMAGE="$DEVVM_HOME/rust-dev-opencode-$ARCH.tar"
 SMOLFILE="$DEVVM_HOME/smolvm.toml"
-OPENCODE="$DEVVM_HOME/opencode"
+OPENCODE_CFG="$DEVVM_HOME/opencode"
 
 exists() {
     smolvm machine status --name "$NAME" >/dev/null 2>&1
@@ -31,7 +31,7 @@ create() {
             -s "$SMOLFILE" \
             --image "$IMAGE" \
             -v "$PROJECT_DIR:/workspace" \
-            -v "$OPENCODE:/root/.config/opencode"
+            -v "$OPENCODE_CFG:/root/.config/opencode"
     fi
 }
 
