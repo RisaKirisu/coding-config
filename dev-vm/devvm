@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEVVM_HOME="${DEVVM_HOME:-$HOME/coding-config/dev-vm}"
+
+ARCH="$(uname -m)"
+case "$ARCH" in
+    x86_64)  ARCH=amd64 ;;
+    aarch64) ARCH=arm64 ;;
+    *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
+esac
+
+PROJECT_DIR="$(realpath "$PWD")"
+PROJECT_NAME="$(printf '%s' "$(basename "$PROJECT_DIR")"| tr -cs 'A-Za-z0-9_.-' '-')"
+PROJECT_HASH="$(printf '%s' "$PROJECT_DIR" | sha256sum | cut -c1-8)"
+NAME="dev-${PROJECT_NAME}-${PROJECT_HASH}"
+
+IMAGE="$DEVVM_HOME/rust-dev-opencode-$ARCH.tar"
+SMOLFILE="$DEVVM_HOME/smolvm.toml"
+OPENCODE="$DEVVM_HOME/opencode"
+
+exists() {
+    smolvm machine status --name "$NAME" >/dev/null 2>&1
+}
+
+create() {
+    if ! exists; then
+        echo "Creating $NAME"
+        smolvm machine create \
+            --name "$NAME" \
+            -s "$SMOLFILE" \
+            --image "$IMAGE" \
+            -v "$PROJECT_DIR:/workspace" \
+            -v "$OPENCODE:/root/.config/opencode"
+    fi
+}
+
+case "${1:-shell}" in
+    start)
+        create
+        smolvm machine start --name "$NAME"
+        ;;
+
+    shell)
+        create
+        smolvm machine shell --name "$NAME"
+        ;;
+
+    exec)
+        shift
+        create
+        smolvm machine exec --stream --name "$NAME" -- "$@"
+        ;;
+
+    stop)
+        smolvm machine stop --name "$NAME"
+        ;;
+
+    status)
+        smolvm machine status --name "$NAME"
+        ;;
+
+    rm|delete)
+        smolvm machine stop --name "$NAME" 2>/dev/null || true
+        smolvm machine delete --name "$NAME" -f
+        ;;
+
+    name)
+        echo "$NAME"
+        ;;
+
+    *)
+        echo "Usage: devvm {start|shell|exec|stop|status|rm|name}"
+        exit 1
+        ;;
+esac
