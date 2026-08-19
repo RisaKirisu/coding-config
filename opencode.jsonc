@@ -211,6 +211,17 @@
               "budgetTokens": 8192
             }
           },
+          "variants": {
+            "low": {
+              "effort": "low"
+            },
+            "high": {
+              "effort": "high"
+            },
+            "max": {
+              "effort": "max"
+            }
+          },
           "limit": {
             "context": 1000000,
             "output": 65536
@@ -226,6 +237,8 @@
       "str_replace_editor": "allow",
       "printf *": "allow",
       "bc *": "allow",
+      "cp *": "allow",
+      "mv *": "allow",
       "date *": "allow",
       "grep *": "allow",
       "egrep *": "allow",
