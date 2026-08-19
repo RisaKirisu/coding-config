@@ -31,7 +31,8 @@ create() {
             -s "$SMOLFILE" \
             --image "$IMAGE" \
             -v "$PROJECT_DIR:/workspace" \
-            -v "$OPENCODE_CFG:/root/.config/opencode"
+            -v "$OPENCODE_CFG:/root/.config/opencode" \
+            -v "$HOME/projects/voice-dictation-cleanup/data:/voice-dictation-cleanup/data"
     fi
 }
 
