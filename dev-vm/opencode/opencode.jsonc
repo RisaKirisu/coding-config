@@ -5,7 +5,7 @@
             "type": "remote",
             "url": "https://mcp.context7.com/mcp",
             "headers": {
-                "CONTEXT7_API_KEY": "{file:~/coding-config/.api-keys/context7}"
+                "CONTEXT7_API_KEY": "{file:.api-keys/context7}"
             },
             "enabled": true
         }
@@ -16,7 +16,7 @@
             "name": "Krill",
             "options": {
                 "baseURL": "https://api.krill-ai.com/codex/v1",
-                "apiKey": "{file:~/coding-config/.api-keys/krill}",
+                "apiKey": "{file:.api-keys/krill}",
                 "setCacheKey": true
             },
             "models": {
@@ -187,14 +187,6 @@
         "*": "allow"
     },
     "agent": {
-        "plan": {
-            "model": "openai/gpt-5.6-sol",
-            "reasoningEffort": "xhigh",
-            "prompt": "{file:~/coding-config/plan.txt}",
-            "permission": {
-                "lsp": "allow"
-            }
-        },
         "build": {
             "model": "openai/gpt-5.6-sol",
             "reasoningEffort": "high"

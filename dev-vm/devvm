@@ -44,7 +44,8 @@ case "${1:-shell}" in
 
     shell)
         create
-        smolvm machine shell --name "$NAME"
+        smolvm machine start --name "$NAME" >/dev/null 2>&1 || true
+        smolvm machine exec -it --name "$NAME" -- /bin/bash
         ;;
 
     exec)

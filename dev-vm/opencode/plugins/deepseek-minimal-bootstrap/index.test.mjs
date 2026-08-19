@@ -350,6 +350,8 @@ test('two durable tool calls restore the full catalog', async () => {
   const request = await harness.send()
 
   assert.deepEqual(request.body.tools.map((entry) => entry.function.name), ['bash', 'read', 'glob', 'edit'])
+  assert.equal(request.body.tools[0].function.description, MINIMAL_TOOLS[0].function.description)
+  assert.deepEqual(request.body.tools[0].function.parameters, { type: 'object' })
   assert.deepEqual(request.body.messages, [
     { role: 'system', content: MINIMAL_SYSTEM_PROMPT },
     { role: 'user', content: 'Inspect this repository.' },

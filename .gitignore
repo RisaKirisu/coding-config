@@ -1,2 +1,3 @@
 .api-keys/
 dev-vm/**/*.tar
+node_modules

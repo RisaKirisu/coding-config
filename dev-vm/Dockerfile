@@ -114,7 +114,7 @@ RUN python -m pip install --no-cache-dir --upgrade \
     requests
 
 # Install OpenCode
-RUN curl -fsSL https://opencode.ai/install | bash
+RUN npm install -g opencode-ai
 ENV OPENCODE_EXPERIMENTAL_WEBSOCKETS=true \
     OPENCODE_ENABLE_EXA=1 \
     OPENCODE_EXPERIMENTAL_LSP_TOOL=1 \

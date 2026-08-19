@@ -41,8 +41,9 @@ For each eligible OpenCode session:
 3. Two durable tool calls, or a completed assistant message, restore the
    session catalog. A single durable tool call keeps the two-tool catalog for
    the rest of the turn.
-4. Every request keeps the exact Minimal system prompt, and catalog-restored
-   requests expose OpenCode's full tool catalog.
+4. Every request keeps the exact Minimal system prompt. Catalog-restored
+   requests expose OpenCode's full tool catalog, but `bash` keeps the Minimal
+   description while retaining OpenCode's implementation and JSON Schema.
 5. On the first user message after a promotion signal — one durable tool call
    or a completed assistant reply — the plugin persists one synthetic
    text part into that message containing the OpenCode context the Minimal
