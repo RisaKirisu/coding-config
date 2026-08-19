@@ -1,4 +1,4 @@
-cpus = 32
+cpus = 16
 memory = 16384
 net = true
 workdir = "/workspace"
