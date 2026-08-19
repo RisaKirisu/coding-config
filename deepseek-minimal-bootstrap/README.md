@@ -48,7 +48,7 @@ For each eligible OpenCode session:
    text part into that message containing the OpenCode context the Minimal
    transform strips — environment, project and global instructions, MCP server
    instructions, skill catalog, structured-output prompt, and that message's
-   `user.system` — followed by the dedicated-tool reminder. The part is written
+   `user.system` — followed by the compression reminder. The part is written
    once to stored history; later requests rewrite only the system prompt and
    tool catalog, so the DeepSeek prompt-cache prefix stays stable.
 6. The context is snapshotted from OpenCode's own
@@ -144,10 +144,11 @@ the `models` entries in `deepseek-minimal-bootstrap.json`.
 
 Tested against OpenCode `1.18.18`.
 
-The transform targets OpenAI-compatible Chat Completions request bodies. The
-current built-in DeepSeek provider uses `@ai-sdk/openai-compatible`, so it is
-the primary supported path. OpenAI Responses and Anthropic Messages use
-different request bodies and are not rewritten by this plugin. When
+The transform detects the provider protocol from its AI SDK package and falls
+back to request-body shape detection. OpenAI-compatible Chat Completions use
+the existing Minimal transform. Anthropic Messages keep top-level `system`,
+flat `tools`, and Anthropic `tool_choice` while applying the same catalog
+gating. OpenAI Responses and unknown request shapes pass through unchanged. When
 `OPENCODE_EXPERIMENTAL_NATIVE_LLM` is enabled, the plugin disables itself and
 logs a warning because that runtime bypasses provider fetch wrappers; use
 OpenCode's default AI SDK runtime for this experiment.

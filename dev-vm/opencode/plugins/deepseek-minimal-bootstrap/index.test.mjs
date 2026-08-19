@@ -9,6 +9,7 @@ import {
   buildPromotedContext,
   createAnchoredFetch,
   createPromotionResolver,
+  detectRequestProtocol,
   extractStaticSystemContext,
   INJECTION_METADATA_KEY,
   INJECTION_METADATA_VALUE,
@@ -18,6 +19,7 @@ import {
   STRUCTURED_OUTPUT_SYSTEM_PROMPT,
   TARGET_MODEL_ID,
   TARGET_MODEL_IDS,
+  transformRequestBody,
   COMPRESSION_REMINDER,
 } from './internal.mjs'
 
@@ -45,6 +47,44 @@ function requestBody() {
     stream: true,
   }
 }
+
+function anthropicRequestBody() {
+  return {
+    model: TARGET_MODEL_ID,
+    max_tokens: 1024,
+    system: 'OpenCode system prompt',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'Inspect this repository.' }] }],
+    tools: [
+      { name: 'bash', description: 'bash tool', input_schema: { type: 'object' } },
+      { name: 'str_replace_editor', description: 'editor tool', input_schema: { type: 'object' } },
+    ],
+    tool_choice: { type: 'auto' },
+    stream: true,
+  }
+}
+
+test('Anthropic Messages requests keep top-level system and flat tools', () => {
+  assert.equal(detectRequestProtocol(anthropicRequestBody()), 'anthropic')
+  const transformed = transformRequestBody(anthropicRequestBody(), false, () => {}, 'anthropic')
+
+  assert.equal(transformed.system, MINIMAL_SYSTEM_PROMPT)
+  assert.deepEqual(transformed.messages, anthropicRequestBody().messages)
+  assert.deepEqual(transformed.tools.map(({ name }) => name), ['bash', 'str_replace_editor'])
+  assert.equal(transformed.tools[0].function, undefined)
+  assert.deepEqual(transformed.tool_choice, { type: 'auto' })
+})
+
+test('Anthropic full catalog removes str_replace_editor without changing tool protocol', () => {
+  const transformed = transformRequestBody(anthropicRequestBody(), true, () => {}, 'anthropic')
+
+  assert.deepEqual(transformed.tools.map(({ name }) => name), ['bash'])
+  assert.equal(transformed.tools[0].input_schema.type, 'object')
+  assert.equal(transformed.tools[0].function, undefined)
+})
+
+test('Responses-shaped requests are detected for passthrough', () => {
+  assert.equal(detectRequestProtocol({ model: TARGET_MODEL_ID, input: 'Inspect this repository.' }), 'responses')
+})
 
 function inProgressAssistant(parts = []) {
   return {
@@ -583,6 +623,42 @@ test('configured providers declaring the target model are wrapped', async () => 
 
   assert.deepEqual(JSON.parse(forwarded.body).tools, MINIMAL_TOOLS)
   assert.ok(config.provider.deepseek)
+})
+
+test('Anthropic providers select the Anthropic request transform from provider metadata', async () => {
+  let forwarded
+  const upstreamFetch = async (input, init) => {
+    forwarded = { input, init }
+    return new Response('{}', { status: 200 })
+  }
+  const hooks = await AnchoredStandardPlugin({
+    client: { session: { messages: async () => ({ data: [] }) } },
+  })
+  const config = {
+    provider: {
+      'krill-china': {
+        npm: '@ai-sdk/anthropic',
+        models: { [TARGET_MODEL_ID]: {} },
+        options: { fetch: upstreamFetch },
+      },
+    },
+  }
+  await hooks.config(config)
+  const output = { headers: {} }
+  await hooks['chat.headers'](
+    { sessionID: 'custom-session', agent: 'build', model: { id: TARGET_MODEL_ID, providerID: 'krill-china' } },
+    output,
+  )
+  await config.provider['krill-china'].options.fetch('https://krill.example/messages', {
+    headers: output.headers,
+    body: JSON.stringify(anthropicRequestBody()),
+  })
+
+  const body = JSON.parse(forwarded.init.body)
+  assert.equal(forwarded.input, 'https://krill.example/messages')
+  assert.equal(body.system, MINIMAL_SYSTEM_PROMPT)
+  assert.deepEqual(body.tools.map(({ name }) => name), ['bash', 'str_replace_editor'])
+  assert.equal(body.tools[0].function, undefined)
 })
 
 test('a forced removed tool choice resets to auto during bootstrap', async () => {

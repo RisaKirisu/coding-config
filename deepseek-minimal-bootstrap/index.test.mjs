@@ -7,8 +7,10 @@ import test from 'node:test'
 import AnchoredStandardPlugin from './index.mjs'
 import {
   buildPromotedContext,
+  COMPRESSION_REMINDER,
   createAnchoredFetch,
   createPromotionResolver,
+  detectRequestProtocol,
   extractStaticSystemContext,
   INJECTION_METADATA_KEY,
   INJECTION_METADATA_VALUE,
@@ -18,7 +20,7 @@ import {
   STRUCTURED_OUTPUT_SYSTEM_PROMPT,
   TARGET_MODEL_ID,
   TARGET_MODEL_IDS,
-  TOOL_USE_REMINDER,
+  transformRequestBody,
 } from './internal.mjs'
 
 const MINIMAL_TOOLS = JSON.parse(
@@ -46,6 +48,44 @@ function requestBody() {
   }
 }
 
+function anthropicRequestBody() {
+  return {
+    model: TARGET_MODEL_ID,
+    max_tokens: 1024,
+    system: 'OpenCode system prompt',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'Inspect this repository.' }] }],
+    tools: [
+      { name: 'bash', description: 'bash tool', input_schema: { type: 'object' } },
+      { name: 'str_replace_editor', description: 'editor tool', input_schema: { type: 'object' } },
+    ],
+    tool_choice: { type: 'auto' },
+    stream: true,
+  }
+}
+
+test('Anthropic Messages requests keep top-level system and flat tools', () => {
+  assert.equal(detectRequestProtocol(anthropicRequestBody()), 'anthropic')
+  const transformed = transformRequestBody(anthropicRequestBody(), false, () => {}, 'anthropic')
+
+  assert.equal(transformed.system, MINIMAL_SYSTEM_PROMPT)
+  assert.deepEqual(transformed.messages, anthropicRequestBody().messages)
+  assert.deepEqual(transformed.tools.map(({ name }) => name), ['bash', 'str_replace_editor'])
+  assert.equal(transformed.tools[0].function, undefined)
+  assert.deepEqual(transformed.tool_choice, { type: 'auto' })
+})
+
+test('Anthropic full catalog removes str_replace_editor without changing tool protocol', () => {
+  const transformed = transformRequestBody(anthropicRequestBody(), true, () => {}, 'anthropic')
+
+  assert.deepEqual(transformed.tools.map(({ name }) => name), ['bash'])
+  assert.equal(transformed.tools[0].input_schema.type, 'object')
+  assert.equal(transformed.tools[0].function, undefined)
+})
+
+test('Responses-shaped requests are detected for passthrough', () => {
+  assert.equal(detectRequestProtocol({ model: TARGET_MODEL_ID, input: 'Inspect this repository.' }), 'responses')
+})
+
 function inProgressAssistant(parts = []) {
   return {
     info: { role: 'assistant', time: { created: 1 } },
@@ -68,7 +108,7 @@ function injectedUser() {
       sessionID: 'session-1',
       messageID: 'msg-0',
       type: 'text',
-      text: `${TOOL_USE_REMINDER}\n\nInspect this repository.`,
+      text: `${COMPRESSION_REMINDER}\n\nInspect this repository.`,
       synthetic: true,
       metadata: { [INJECTION_METADATA_KEY]: INJECTION_METADATA_VALUE },
     }],
@@ -337,7 +377,7 @@ test('a single durable tool call keeps the bootstrap catalog and leaves user con
     { role: 'system', content: MINIMAL_SYSTEM_PROMPT },
     { role: 'user', content: 'Inspect this repository.' },
   ])
-  assert.equal(JSON.stringify(request.body).includes(TOOL_USE_REMINDER), false)
+  assert.equal(JSON.stringify(request.body).includes(COMPRESSION_REMINDER), false)
 })
 
 test('two durable tool calls restore the full catalog', async () => {
@@ -366,7 +406,7 @@ test('prompt-section injection still happens after the first durable tool call',
   const output = await harness.chatMessage({ parts: [original] })
 
   assert.equal(output.parts.length, 2)
-  assert.ok(output.parts[0].text.endsWith(TOOL_USE_REMINDER))
+  assert.ok(output.parts[0].text.endsWith(COMPRESSION_REMINDER))
   assert.deepEqual(output.parts[1], original)
 })
 
@@ -483,7 +523,7 @@ test('DeepSeek V4 Flash receives the same persisted prompt-section injection', a
 
   assert.equal(output.parts.length, 2)
   assert.ok(output.parts[0].text.includes('<available_skills>'))
-  assert.ok(output.parts[0].text.endsWith(TOOL_USE_REMINDER))
+  assert.ok(output.parts[0].text.endsWith(COMPRESSION_REMINDER))
   assert.deepEqual(output.parts[1], original)
 })
 
@@ -583,6 +623,42 @@ test('configured providers declaring the target model are wrapped', async () => 
   assert.ok(config.provider.deepseek)
 })
 
+test('Anthropic providers select the Anthropic request transform from provider metadata', async () => {
+  let forwarded
+  const upstreamFetch = async (input, init) => {
+    forwarded = { input, init }
+    return new Response('{}', { status: 200 })
+  }
+  const hooks = await AnchoredStandardPlugin({
+    client: { session: { messages: async () => ({ data: [] }) } },
+  })
+  const config = {
+    provider: {
+      'krill-china': {
+        npm: '@ai-sdk/anthropic',
+        models: { [TARGET_MODEL_ID]: {} },
+        options: { fetch: upstreamFetch },
+      },
+    },
+  }
+  await hooks.config(config)
+  const output = { headers: {} }
+  await hooks['chat.headers'](
+    { sessionID: 'custom-session', agent: 'build', model: { id: TARGET_MODEL_ID, providerID: 'krill-china' } },
+    output,
+  )
+  await config.provider['krill-china'].options.fetch('https://krill.example/messages', {
+    headers: output.headers,
+    body: JSON.stringify(anthropicRequestBody()),
+  })
+
+  const body = JSON.parse(forwarded.init.body)
+  assert.equal(forwarded.input, 'https://krill.example/messages')
+  assert.equal(body.system, MINIMAL_SYSTEM_PROMPT)
+  assert.deepEqual(body.tools.map(({ name }) => name), ['bash', 'str_replace_editor'])
+  assert.equal(body.tools[0].function, undefined)
+})
+
 test('a forced removed tool choice resets to auto during bootstrap', async () => {
   const harness = await setup({ messages: [inProgressAssistant()] })
   const body = requestBody()
@@ -669,13 +745,13 @@ test('promoted context keeps OpenCode section order and puts the reminder last',
   const env = text.indexOf('<env>')
   const structured = text.indexOf(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
   const userSystem = text.indexOf('Be strict about tests.')
-  const reminder = text.indexOf(TOOL_USE_REMINDER)
+  const reminder = text.indexOf(COMPRESSION_REMINDER)
 
   assert.ok(env !== -1 && structured !== -1 && userSystem !== -1 && reminder !== -1)
   assert.ok(env < structured, 'environment must precede the structured-output prompt')
   assert.ok(structured < userSystem, 'structured-output prompt must precede user.system')
-  assert.ok(userSystem < reminder, 'user.system must precede the tool-use reminder')
-  assert.ok(text.endsWith(TOOL_USE_REMINDER))
+  assert.ok(userSystem < reminder, 'user.system must precede the compression reminder')
+  assert.ok(text.endsWith(COMPRESSION_REMINDER))
 })
 
 test('chat.message persists captured context and reminder once on the first promoted user message', async () => {
@@ -698,7 +774,7 @@ test('chat.message persists captured context and reminder once on the first prom
   assert.ok(injected.text.includes('Instructions from: /workspace/AGENTS.md'))
   assert.ok(injected.text.includes('<mcp_instructions>'))
   assert.ok(injected.text.includes('<available_skills>'))
-  assert.ok(injected.text.endsWith(TOOL_USE_REMINDER))
+  assert.ok(injected.text.endsWith(COMPRESSION_REMINDER))
   assert.deepEqual(output.parts[1], original)
 })
 
@@ -734,7 +810,7 @@ test('chat.message falls back to environment and instructions when no system was
   assert.ok(injected.text.includes('<env>'))
   assert.ok(injected.text.includes('Working directory: /workspace/project'))
   assert.ok(injected.text.includes('Be strict about tests.'))
-  assert.ok(injected.text.endsWith(TOOL_USE_REMINDER))
+  assert.ok(injected.text.endsWith(COMPRESSION_REMINDER))
   assert.equal(injected.text.includes('<mcp_instructions>'), false)
   assert.equal(injected.text.includes('<available_skills>'), false)
   assert.deepEqual(output.parts[1], original)

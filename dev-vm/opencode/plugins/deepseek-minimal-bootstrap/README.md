@@ -145,10 +145,11 @@ the `models` entries in `deepseek-minimal-bootstrap.json`.
 
 Tested against OpenCode `1.18.18`.
 
-The transform targets OpenAI-compatible Chat Completions request bodies. The
-current built-in DeepSeek provider uses `@ai-sdk/openai-compatible`, so it is
-the primary supported path. OpenAI Responses and Anthropic Messages use
-different request bodies and are not rewritten by this plugin. When
+The transform detects the provider protocol from its AI SDK package and falls
+back to request-body shape detection. OpenAI-compatible Chat Completions use
+the existing Minimal transform. Anthropic Messages keep top-level `system`,
+flat `tools`, and Anthropic `tool_choice` while applying the same catalog
+gating. OpenAI Responses and unknown request shapes pass through unchanged. When
 `OPENCODE_EXPERIMENTAL_NATIVE_LLM` is enabled, the plugin disables itself and
 logs a warning because that runtime bypasses provider fetch wrappers; use
 OpenCode's default AI SDK runtime for this experiment.

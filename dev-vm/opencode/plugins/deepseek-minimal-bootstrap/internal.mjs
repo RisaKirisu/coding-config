@@ -370,13 +370,117 @@ export async function buildFallbackContext({
   return sections.join('\n\n')
 }
 
-export function transformRequestBody(body, fullCatalog, warn = () => {}) {
+const MINIMAL_ANTHROPIC_TOOL_DEFINITIONS = MINIMAL_TOOL_DEFINITIONS.map(({ function: definition }) => ({
+  name: definition.name,
+  description: definition.description,
+  input_schema: definition.parameters,
+}))
+
+function providerProtocol(providerID, provider) {
+  const npm = typeof provider?.npm === 'string' ? provider.npm : ''
+  if (npm === '@ai-sdk/anthropic' || npm.startsWith('@ai-sdk/anthropic@')) return 'anthropic'
+  if (
+    npm === '@ai-sdk/openai'
+    || npm.startsWith('@ai-sdk/openai@')
+    || npm === '@ai-sdk/openai-compatible'
+    || npm.startsWith('@ai-sdk/openai-compatible@')
+  ) return 'openai'
+  if (providerID === 'deepseek') return 'openai'
+  return undefined
+}
+
+function toAnthropicTool(tool) {
+  if (tool?.input_schema !== undefined) return tool
+  const definition = tool?.function
+  if (!definition?.name) return tool
+  return {
+    name: definition.name,
+    description: definition.description,
+    input_schema: definition.parameters ?? { type: 'object' },
+  }
+}
+
+export function detectRequestProtocol(body, hintedProtocol) {
+  if (hintedProtocol === 'anthropic' || hintedProtocol === 'openai' || hintedProtocol === 'responses') {
+    return hintedProtocol
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return undefined
+  if (body.input !== undefined || body.instructions !== undefined) return 'responses'
+  if (
+    body.system !== undefined
+    || (Array.isArray(body.tools) && body.tools.some((tool) => tool?.input_schema !== undefined))
+    || ['any', 'none', 'tool'].includes(body.tool_choice?.type)
+    || (Array.isArray(body.messages) && body.messages.some((message) =>
+      Array.isArray(message?.content)
+      && message.content.some((part) => part?.type === 'tool_use' || part?.type === 'tool_result'),
+    ))
+  ) return 'anthropic'
+  if (
+    Array.isArray(body.messages)
+    && (
+      (Array.isArray(body.tools) && body.tools.some((tool) => tool?.function !== undefined))
+      || typeof body.tool_choice === 'string'
+      || body.tool_choice?.function !== undefined
+    )
+  ) return 'openai'
+  return undefined
+}
+
+function transformAnthropicRequestBody(body, fullCatalog, warn) {
+  const conversation = body.messages.filter(
+    message => message?.role !== 'system' && message?.role !== 'developer',
+  )
+  const transformed = {
+    ...body,
+    system: MINIMAL_SYSTEM_PROMPT,
+    messages: conversation,
+  }
+
+  if (fullCatalog) {
+    if (Array.isArray(body.tools)) {
+      transformed.tools = body.tools
+        .filter(tool => toolName(tool) !== 'str_replace_editor')
+        .map((tool) => {
+          const normalized = toAnthropicTool(tool)
+          return toolName(tool) === 'bash'
+            ? { ...normalized, description: MINIMAL_BASH_DESCRIPTION }
+            : normalized
+        })
+      if (toolChoiceName(body.tool_choice) === 'str_replace_editor') {
+        transformed.tool_choice = { type: 'auto' }
+      }
+    }
+    return transformed
+  }
+  if (!Array.isArray(body.tools)) {
+    warn('missing-tools', 'bootstrap request had no Anthropic-compatible tools array; exposing the original catalog')
+    return transformed
+  }
+
+  const available = new Set(body.tools.map(toolName))
+  const missing = [...BOOTSTRAP_TOOLS].filter((name) => !available.has(name))
+  if (missing.length > 0) {
+    warn('missing-bootstrap-tools', `bootstrap disabled because required tools are missing: ${missing.join(', ')}`)
+    return transformed
+  }
+
+  transformed.tools = structuredClone(MINIMAL_ANTHROPIC_TOOL_DEFINITIONS)
+  if (toolChoiceName(body.tool_choice) && !BOOTSTRAP_TOOLS.has(toolChoiceName(body.tool_choice))) {
+    transformed.tool_choice = { type: 'auto' }
+  }
+  return transformed
+}
+
+export function transformRequestBody(body, fullCatalog, warn = () => {}, protocol = 'openai') {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     throw new TypeError('request body must be a JSON object')
   }
   if (!Array.isArray(body.messages)) {
-    throw new TypeError('request body must contain an OpenAI-compatible messages array')
+    throw new TypeError('request body must contain a messages array')
   }
+
+  if (protocol === 'anthropic') return transformAnthropicRequestBody(body, fullCatalog, warn)
+  if (protocol !== 'openai') return body
 
   const conversation = body.messages.filter(
     message => message?.role !== 'system' && message?.role !== 'developer',
@@ -499,7 +603,7 @@ export function createSessionInspector(client, directory, warn = () => {}) {
   return { inspect, markInjected }
 }
 
-export function createAnchoredFetch(nextFetch, isCatalogRestored, warn = () => {}) {
+export function createAnchoredFetch(nextFetch, isCatalogRestored, warn = () => {}, protocolHint) {
   const anchoredFetch = async (input, init = {}) => {
     const request = input instanceof Request ? input : undefined
     const headers = new Headers(init.headers ?? request?.headers)
@@ -543,7 +647,9 @@ export function createAnchoredFetch(nextFetch, isCatalogRestored, warn = () => {
     }
 
     try {
-      return forward(JSON.stringify(transformRequestBody(body, fullCatalog, warn)))
+      const protocol = detectRequestProtocol(body, protocolHint)
+      if (!protocol || protocol === 'responses') return forward(bodyText)
+      return forward(JSON.stringify(transformRequestBody(body, fullCatalog, warn, protocol)))
     } catch (error) {
       warn('transform-failed', `request transform failed; forwarding the original body: ${errorMessage(error)}`)
       return forward(bodyText)
@@ -611,7 +717,12 @@ export async function AnchoredStandardPlugin({ client, directory, project, workt
         const nextFetch = typeof providerOptions.fetch === 'function'
           ? providerOptions.fetch
           : globalThis.fetch.bind(globalThis)
-        providerOptions.fetch = createAnchoredFetch(nextFetch, isCatalogRestored, warn)
+        providerOptions.fetch = createAnchoredFetch(
+          nextFetch,
+          isCatalogRestored,
+          warn,
+          providerProtocol(providerID, provider),
+        )
         wrappedProviders.add(providerID)
       }
     },
