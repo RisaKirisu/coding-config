@@ -492,7 +492,11 @@ export function transformRequestBody(body, fullCatalog, warn = () => {}, protoco
 
   if (fullCatalog) {
     if (Array.isArray(body.tools)) {
-      transformed.tools = body.tools.filter(tool => toolName(tool) !== 'str_replace_editor')
+      transformed.tools = body.tools
+        .filter(tool => toolName(tool) !== 'str_replace_editor')
+        .map(tool => toolName(tool) === 'bash'
+          ? { ...tool, function: { ...tool.function, description: MINIMAL_BASH_DESCRIPTION } }
+          : tool)
       if (toolChoiceName(body.tool_choice) === 'str_replace_editor') transformed.tool_choice = 'auto'
     }
     return transformed
