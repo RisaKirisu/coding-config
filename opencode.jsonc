@@ -16,133 +16,12 @@
     ]
   },
   "provider": {
-    "openai": {
-      "models": {
-        "gpt-5.6-sol": {
-          "variants": {
-            "xhigh": {
-              "reasoningEffort": "xhigh",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium",
-              "forceReasoning": true,
-              "include": [
-                "reasoning.encrypted_content"
-              ]
-            },
-            "high": {
-              "reasoningEffort": "high",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium",
-              "forceReasoning": true,
-              "include": [
-                "reasoning.encrypted_content"
-              ]
-            },
-            "medium": {
-              "reasoningEffort": "medium",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium",
-              "forceReasoning": true,
-              "include": [
-                "reasoning.encrypted_content"
-              ]
-            },
-            "none": {
-              "reasoningEffort": "none",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium",
-              "include": [
-                "reasoning.encrypted_content"
-              ]
-            }
-          }
-        },
-        "gpt-5.6-terra": {
-          "variants": {
-            "xhigh": {
-              "reasoningEffort": "xhigh",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium",
-              "forceReasoning": true,
-              "include": [
-                "reasoning.encrypted_content"
-              ]
-            },
-            "high": {
-              "reasoningEffort": "high",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium",
-              "forceReasoning": true,
-              "include": [
-                "reasoning.encrypted_content"
-              ]
-            },
-            "medium": {
-              "reasoningEffort": "medium",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium",
-              "forceReasoning": true,
-              "include": [
-                "reasoning.encrypted_content"
-              ]
-            },
-            "none": {
-              "reasoningEffort": "none",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium",
-              "include": [
-                "reasoning.encrypted_content"
-              ]
-            }
-          }
-        },
-        "gpt-5.6-luna": {
-          "variants": {
-            "xhigh": {
-              "reasoningEffort": "xhigh",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium",
-              "forceReasoning": true,
-              "include": [
-                "reasoning.encrypted_content"
-              ]
-            },
-            "high": {
-              "reasoningEffort": "high",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium",
-              "forceReasoning": true,
-              "include": [
-                "reasoning.encrypted_content"
-              ]
-            },
-            "medium": {
-              "reasoningEffort": "medium",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium",
-              "forceReasoning": true,
-              "include": [
-                "reasoning.encrypted_content"
-              ]
-            },
-            "none": {
-              "reasoningEffort": "none",
-              "reasoningSummary": "auto",
-              "textVerbosity": "medium",
-              "include": [
-                "reasoning.encrypted_content"
-              ]
-            }
-          }
-        }
-      }
-    },
     "krill-codex": {
       "npm": "@ai-sdk/openai",
       "name": "Krill",
       "options": {
-        "baseURL": "https://api.krill-ai.com/codex/v1",
-        "apiKey": "{file:~/coding-config/.api-keys/krill}",
+        "baseURL": "https://api.krill-ai.net/codex/v1",
+        "apiKey": "{file:~/coding-config/.api-keys/krill-codex}",
         "setCacheKey": true
       },
       "models": {
@@ -303,6 +182,38 @@
                 "reasoning.encrypted_content"
               ]
             }
+          }
+        }
+      }
+    },
+    "krill-china": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "Krill",
+      "options": {
+        "baseURL": "https://api.krill-ai.net/coding/v1",
+        "apiKey": "{file:~/coding-config/.api-keys/krill-china}"
+      },
+      "models": {
+        "deepseek-v4-pro-0813": {
+          "name": "deepseek-v4-pro-0813",
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "options": {
+            "thinking": {
+              "type": "enabled",
+              "budgetTokens": 8192
+            }
+          },
+          "limit": {
+            "context": 1000000,
+            "output": 65536
           }
         }
       }
