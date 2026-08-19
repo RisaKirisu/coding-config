@@ -202,8 +202,7 @@
                     },
                     "options": {
                         "thinking": {
-                            "type": "enabled",
-                            "budgetTokens": 8192
+                        "type": "adaptive"
                         }
                     },
                     "variants": {
