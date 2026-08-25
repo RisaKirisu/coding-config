@@ -2,7 +2,7 @@ import { tool } from "@opencode-ai/plugin"
 import { appendFile, mkdir, readFile } from "node:fs/promises"
 import path from "node:path"
 
-const file = "/voice-dictation-cleanup/data/archive_voice_input.jsonl"
+const file = "/root/voice-dictation-cleanup/data/archive_voice_input.jsonl"
 
 export default tool({
   description:

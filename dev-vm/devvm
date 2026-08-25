@@ -21,7 +21,7 @@ NAME="dev-${PROJECT_NAME}-${PROJECT_HASH}"
 
 IMAGE="$DEVVM_HOME/rust-dev-opencode-$ARCH.tar"
 SMOLFILE="$DEVVM_HOME/smolvm.toml"
-OPENCODE_CFG="$DEVVM_HOME/opencode"
+DEVVM_ROOT="$DEVVM_HOME/root"
 
 ensure_ingress() {
     if [[ ! -x "$FRPS_BIN" ]]; then
@@ -62,20 +62,50 @@ create() {
              --image "$IMAGE" \
              -e "DEVVM_PROJECT_HOST=$PROJECT_HOST" \
              -v "$PROJECT_DIR:/workspace" \
-             -v "$OPENCODE_CFG:/root/.config/opencode" \
-             -v "$HOME/projects/voice-dictation-cleanup/data:/voice-dictation-cleanup/data"
+             -v "$DEVVM_ROOT:/devvm-root"
     fi
+}
+
+link_root() {
+    smolvm machine exec --name "$NAME" -- /bin/bash -c '
+        set -euo pipefail
+        shopt -s dotglob nullglob
+
+        install -d /root/.config
+        for source in /devvm-root/.config/*; do
+            target="/root/.config/${source##*/}"
+            rm -rf -- "$target"
+            ln -s "$source" "$target"
+        done
+
+        for source in /devvm-root/*; do
+            [[ "${source##*/}" == ".config" ]] && continue
+            target="/root/${source##*/}"
+            rm -rf -- "$target"
+            ln -s "$source" "$target"
+        done
+    '
+}
+
+start_ingress() {
+    smolvm machine exec --name "$NAME" -- /usr/local/bin/devvm-ingress
+}
+
+start() {
+    smolvm machine start --name "$NAME"
+    start_ingress
+    link_root
 }
 
 case "${1:-shell}" in
     start)
         create
-        smolvm machine start --name "$NAME"
+        start
         ;;
 
     shell)
         create
-        smolvm machine start --name "$NAME"
+        start
         echo "HTTP: http://<port>.$PROJECT_HOST.devvm.localhost"
         smolvm machine exec -it --name "$NAME" -- /bin/bash
         ;;
@@ -83,6 +113,7 @@ case "${1:-shell}" in
     exec)
         shift
         create
+        start
         smolvm machine exec --stream --name "$NAME" -- "$@"
         ;;
 

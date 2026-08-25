@@ -109,6 +109,9 @@ RUN curl -L --proto '=https' --tlsv1.2 -sSf \
     https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
     | bash
 
+# ---------------------------------------------------------------------------
+# Dev port access
+# ---------------------------------------------------------------------------
 # HTTP ingress for development servers. frpc provides the host tunnel and
 # Caddy forwards each <port>.<project>.devvm.localhost request to localhost:<port>.
 RUN set -eux; \
@@ -152,6 +155,29 @@ set -euo pipefail
 : "${DEVVM_PROJECT_HOST:?DEVVM_PROJECT_HOST is not set}"
 install -d -m 0700 /run/devvm
 
+process_running() {
+    local process="$1"
+    local pid_file="$2"
+    local pid
+
+    [[ -r "$pid_file" ]] || return 1
+    read -r pid < "$pid_file"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    [[ "$(<"/proc/$pid/comm")" == "$process" ]]
+}
+
+adopt_running_process() {
+    local process="$1"
+    local pid_file="$2"
+    local pid
+
+    process_running "$process" "$pid_file" && return
+    pid="$(pgrep -xo "$process" || true)"
+    [[ -n "$pid" ]] || return 1
+    printf '%s\n' "$pid" > "$pid_file"
+}
+
 cat > /run/devvm/frpc.toml <<CONFIG
 serverAddr = "100.96.0.1"
 serverPort = 7000
@@ -164,8 +190,18 @@ localPort = 10080
 customDomains = ["*.$DEVVM_PROJECT_HOST.devvm.localhost"]
 CONFIG
 
-caddy start --config /etc/devvm/Caddyfile --adapter caddyfile >/tmp/devvm-caddy.log 2>&1
-nohup frpc -c /run/devvm/frpc.toml >/tmp/devvm-frpc.log 2>&1 &
+if ! adopt_running_process caddy /run/devvm/caddy.pid; then
+    caddy start \
+        --config /etc/devvm/Caddyfile \
+        --adapter caddyfile \
+        --pidfile /run/devvm/caddy.pid \
+        >/tmp/devvm-caddy.log 2>&1
+fi
+
+if ! adopt_running_process frpc /run/devvm/frpc.pid; then
+    nohup frpc -c /run/devvm/frpc.toml >/tmp/devvm-frpc.log 2>&1 &
+    printf '%s\n' "$!" > /run/devvm/frpc.pid
+fi
 SCRIPT
 
 chmod 0755 /usr/local/bin/devvm-ingress

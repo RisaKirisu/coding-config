@@ -2,7 +2,6 @@ cpus = 16
 memory = 8192
 net = true
 workdir = "/workspace"
-init = ["/usr/local/bin/devvm-ingress"]
 
 [auth]
 ssh_agent = false

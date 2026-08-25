@@ -7,7 +7,8 @@ Per-project dev VMs for OpenCode coding agents, managed by smolvm.
 - Python 3.14, Node 24, Rust (stable + clippy/rustfmt/rust-analyzer), `gh`, cargo-binstall
 - OpenCode pre-installed with experimental LSP/scout/plan features enabled
 - 16 CPUs / 8 GB RAM and networking
-- Automatic HTTP access to development servers through FRP
+- Automatic HTTP access to development servers through FRP; Caddy and FRPC are
+  checked and started after every VM boot
 
 ## Files
 
@@ -18,7 +19,8 @@ Per-project dev VMs for OpenCode coding agents, managed by smolvm.
 | `devvm` | CLI wrapper around smolvm |
 | `setup-devvm.sh` | Install smolvm, build image, link `devvm` |
 | `smolvm.toml` | VM resources/auth |
-| `opencode/` | OpenCode config (providers, agents, DCP) |
+| `root/` | Host-managed agent config and data mounted at `/devvm-root` |
+| `root/.config/opencode/` | OpenCode config (providers, agents, DCP) |
 
 ## Setup
 
@@ -26,7 +28,17 @@ Per-project dev VMs for OpenCode coding agents, managed by smolvm.
 ./setup-devvm.sh
 ```
 
-Requires Docker. One VM per project (named by path), mounting the project at `/workspace`.
+Requires Docker. One VM per project (named by path), with two host mounts:
+
+- The project at `/workspace`.
+- `root/` at `/devvm-root`. After each start, `devvm` links every entry into
+  `/root`, replacing an existing entry with the same name. Children of
+  `root/.config/` are linked individually into `/root/.config/`, so unmanaged
+  config remains available. Adding another config or agent directory does not
+  require rebuilding the image.
+
+Keeping the shared files under one root keeps the aggregate virtio device count
+within libkrun's x86_64 limit when using the virtio-net backend.
 
 ## Usage
 

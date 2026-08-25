@@ -1,7 +1,7 @@
 import { tool } from "@opencode-ai/plugin"
 import { readFile, writeFile } from "node:fs/promises"
 
-const file = "/voice-dictation-cleanup/data/archive_voice_input.jsonl"
+const file = "/root/voice-dictation-cleanup/data/archive_voice_input.jsonl"
 
 export default tool({
   description: "Remove an archived voice input JSONL record by zero-based index.",
