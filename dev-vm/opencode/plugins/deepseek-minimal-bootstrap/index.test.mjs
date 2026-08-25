@@ -140,6 +140,7 @@ const FULL_SYSTEM = [
   '    <location>/workspace/.opencode/skill/web/SKILL.md</location>',
   '  </skill>',
   '</available_skills>',
+  ['read', 'grep', 'glob', 'plan_exit'].map((name) => `<${name} instructions>`).join('\n'),
 ].join('\n')
 
 async function setup({ messages = [], provider = {}, options, agent = 'build', modelID = TARGET_MODEL_ID } = {}) {
@@ -334,7 +335,7 @@ test('target models load from a simple JSON config with a models field', async (
     process.env.DEEPSEEK_MINIMAL_BOOTSTRAP_CONFIG = configPath
     assert.deepEqual(await loadTargetModelIDs(), ['deepseek-v4-flash', 'custom-deepseek'])
 
-    await rm(configPath)
+    await writeFile(configPath, '{ invalid json')
     process.env.DEEPSEEK_MINIMAL_BOOTSTRAP_CONFIG = configPath
     assert.deepEqual(await loadTargetModelIDs(), [...TARGET_MODEL_IDS])
   } finally {
@@ -380,7 +381,7 @@ test('a single durable tool call keeps the bootstrap catalog and leaves user con
   assert.equal(JSON.stringify(request.body).includes(COMPRESSION_REMINDER), false)
 })
 
-test('two durable tool calls restore the full catalog', async () => {
+test('two durable tool calls restore the filtered full catalog', async () => {
   const harness = await setup({
     messages: [inProgressAssistant([
       { type: 'tool', tool: 'read', state: { status: 'pending' } },
@@ -389,7 +390,7 @@ test('two durable tool calls restore the full catalog', async () => {
   })
   const request = await harness.send()
 
-  assert.deepEqual(request.body.tools.map((entry) => entry.function.name), ['bash', 'read', 'glob', 'edit'])
+  assert.deepEqual(request.body.tools.map((entry) => entry.function.name), ['bash', 'edit'])
   assert.equal(request.body.tools[0].function.description, MINIMAL_TOOLS[0].function.description)
   assert.deepEqual(request.body.tools[0].function.parameters, { type: 'object' })
   assert.deepEqual(request.body.messages, [
@@ -418,7 +419,7 @@ test('a completed text-only assistant reply also promotes without rewriting user
   })
   const request = await harness.send()
 
-  assert.equal(request.body.tools.length, 4)
+  assert.equal(request.body.tools.length, 2)
   assert.deepEqual(request.body.messages, [
     { role: 'system', content: MINIMAL_SYSTEM_PROMPT },
     { role: 'user', content: 'Inspect this repository.' },
@@ -510,7 +511,7 @@ test('DeepSeek V4 Flash uses the Minimal bootstrap and restores the catalog like
     ]),
   ])
   const restored = await harness.send(body)
-  assert.deepEqual(restored.body.tools.map((entry) => entry.function.name), ['bash', 'read', 'glob', 'edit'])
+  assert.deepEqual(restored.body.tools.map((entry) => entry.function.name), ['bash', 'edit'])
 })
 
 test('DeepSeek V4 Flash receives the same persisted prompt-section injection', async () => {
@@ -582,14 +583,14 @@ test('missing bootstrap tools fail open to the original catalog', async () => {
   assert.equal(request.body.messages[0].content, MINIMAL_SYSTEM_PROMPT)
 })
 
-test('history failures fail open to full tools and stay promoted', async () => {
+test('history failures fail open to filtered full tools and stay promoted', async () => {
   const harness = await setup({ messages: new Error('storage unavailable') })
 
   const first = await harness.send()
   const second = await harness.send()
 
-  assert.equal(first.body.tools.length, 4)
-  assert.equal(second.body.tools.length, 4)
+  assert.equal(first.body.tools.length, 2)
+  assert.equal(second.body.tools.length, 2)
   assert.equal(harness.historyReads(), 1)
 })
 
@@ -664,7 +665,7 @@ test('Anthropic providers select the Anthropic request transform from provider m
 test('a forced removed tool choice resets to auto during bootstrap', async () => {
   const harness = await setup({ messages: [inProgressAssistant()] })
   const body = requestBody()
-  body.tool_choice = { type: 'function', function: { name: 'edit' } }
+  body.tool_choice = { type: 'function', function: { name: 'grep' } }
   const request = await harness.send(body)
 
   assert.equal(request.body.tool_choice, 'auto')
@@ -778,6 +779,63 @@ test('chat.message persists captured context and reminder once on the first prom
   assert.ok(injected.text.includes('<available_skills>'))
   assert.ok(injected.text.endsWith(COMPRESSION_REMINDER))
   assert.deepEqual(output.parts[1], original)
+})
+
+test('catalog restoration removes read, glob, grep, and plan_exit', async () => {
+  const harness = await setup({
+    messages: [inProgressAssistant([
+      { type: 'tool', tool: 'read', state: { status: 'pending' } },
+      { type: 'tool', tool: 'glob', state: { status: 'pending' } },
+    ])],
+  })
+  const body = requestBody()
+  body.tools = [
+    tool('bash'),
+    tool('read'),
+    tool('glob'),
+    tool('grep'),
+    tool('plan_exit'),
+    tool('edit'),
+  ]
+  const request = await harness.send(body)
+
+  assert.deepEqual(request.body.tools.map((entry) => entry.function.name), ['bash', 'edit'])
+  assert.equal(request.body.tools[0].function.description, MINIMAL_TOOLS[0].function.description)
+  assert.deepEqual(request.body.messages, [
+    { role: 'system', content: MINIMAL_SYSTEM_PROMPT },
+    { role: 'user', content: 'Inspect this repository.' },
+  ])
+})
+
+test('Anthropic full-catalog restoration removes read, glob, grep, and plan_exit', async () => {
+  const transformed = transformRequestBody({
+    ...anthropicRequestBody(),
+    tools: [
+      { name: 'bash', description: 'bash tool', input_schema: { type: 'object' } },
+      { name: 'read', description: 'read tool', input_schema: { type: 'object' } },
+      { name: 'glob', description: 'glob tool', input_schema: { type: 'object' } },
+      { name: 'grep', description: 'grep tool', input_schema: { type: 'object' } },
+      { name: 'plan_exit', description: 'plan_exit tool', input_schema: { type: 'object' } },
+      { name: 'edit', description: 'edit tool', input_schema: { type: 'object' } },
+    ],
+  }, true, () => {}, 'anthropic')
+
+  assert.deepEqual(transformed.tools.map(({ name }) => name), ['bash', 'edit'])
+  assert.equal(transformed.tools[0].description, MINIMAL_TOOLS[0].function.description)
+})
+
+test('forced removed tool choices reset to auto during catalog restoration', async () => {
+  const harness = await setup({
+    messages: [inProgressAssistant([
+      { type: 'tool', tool: 'read', state: { status: 'pending' } },
+      { type: 'tool', tool: 'glob', state: { status: 'pending' } },
+    ])],
+  })
+  const body = requestBody()
+  body.tool_choice = { type: 'function', function: { name: 'plan_exit' } }
+  const request = await harness.send(body)
+
+  assert.equal(request.body.tool_choice, 'auto')
 })
 
 test('bootstrap user messages are never annotated with context or reminder', async () => {

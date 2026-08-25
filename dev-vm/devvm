@@ -2,6 +2,7 @@
 set -euo pipefail
 
 DEVVM_HOME="${DEVVM_HOME:-$HOME/coding-config/dev-vm}"
+FRPS_BIN="$HOME/.local/bin/frps"
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -11,28 +12,58 @@ case "$ARCH" in
 esac
 
 PROJECT_DIR="$(realpath "$PWD")"
-PROJECT_NAME="$(printf '%s' "$(basename "$PROJECT_DIR")"| tr -cs 'A-Za-z0-9_.-' '-')"
+PROJECT_NAME="$(printf '%s' "$(basename "$PROJECT_DIR")" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-')"
+PROJECT_NAME="${PROJECT_NAME#-}"
+PROJECT_NAME="${PROJECT_NAME%-}"
 PROJECT_HASH="$(printf '%s' "$PROJECT_DIR" | sha256sum | cut -c1-8)"
+PROJECT_HOST="${PROJECT_NAME}-${PROJECT_HASH}"
 NAME="dev-${PROJECT_NAME}-${PROJECT_HASH}"
 
 IMAGE="$DEVVM_HOME/rust-dev-opencode-$ARCH.tar"
 SMOLFILE="$DEVVM_HOME/smolvm.toml"
 OPENCODE_CFG="$DEVVM_HOME/opencode"
 
+ensure_ingress() {
+    if [[ ! -x "$FRPS_BIN" ]]; then
+        echo "devvm HTTP ingress is not installed; run $DEVVM_HOME/setup-devvm.sh" >&2
+        exit 1
+    fi
+
+    local command="$FRPS_BIN --bind-addr 127.0.0.1 --bind-port 7000 --vhost-http-port 80"
+    if pgrep -u "$(id -u)" -f "^$command$" >/dev/null; then
+        return
+    fi
+
+    nohup "$FRPS_BIN" \
+        --bind-addr 127.0.0.1 \
+        --bind-port 7000 \
+        --vhost-http-port 80 \
+        >/dev/null 2>&1 &
+    local pid=$!
+    sleep 0.2
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "Failed to start devvm HTTP ingress" >&2
+        exit 1
+    fi
+}
+
 exists() {
     smolvm machine status --name "$NAME" >/dev/null 2>&1
 }
 
 create() {
+    ensure_ingress
     if ! exists; then
         echo "Creating $NAME"
         smolvm machine create \
-            --name "$NAME" \
-            -s "$SMOLFILE" \
-            --image "$IMAGE" \
-            -v "$PROJECT_DIR:/workspace" \
-            -v "$OPENCODE_CFG:/root/.config/opencode" \
-            -v "$HOME/projects/voice-dictation-cleanup/data:/voice-dictation-cleanup/data"
+             --name "$NAME" \
+             -s "$SMOLFILE" \
+             --net-backend virtio-net \
+             --image "$IMAGE" \
+             -e "DEVVM_PROJECT_HOST=$PROJECT_HOST" \
+             -v "$PROJECT_DIR:/workspace" \
+             -v "$OPENCODE_CFG:/root/.config/opencode" \
+             -v "$HOME/projects/voice-dictation-cleanup/data:/voice-dictation-cleanup/data"
     fi
 }
 
@@ -44,7 +75,8 @@ case "${1:-shell}" in
 
     shell)
         create
-        smolvm machine start --name "$NAME" >/dev/null 2>&1 || true
+        smolvm machine start --name "$NAME"
+        echo "HTTP: http://<port>.$PROJECT_HOST.devvm.localhost"
         smolvm machine exec -it --name "$NAME" -- /bin/bash
         ;;
 

@@ -32,6 +32,7 @@ const MARKER_HEADER = 'x-dsh-anchored-standard'
 const SESSION_HEADER = 'x-dsh-anchored-session'
 const ENVIRONMENT_MARKER = 'You are powered by the model named'
 const BOOTSTRAP_TOOLS = new Set(['bash', 'str_replace_editor'])
+const RESTORED_TOOL_EXCLUSIONS = new Set(['str_replace_editor', 'read', 'glob', 'grep', 'plan_exit'])
 const UTILITY_AGENTS = new Set(['compaction', 'summary', 'title'])
 const WRAPPED_FETCH = Symbol('anchored-standard-fetch')
 
@@ -439,14 +440,14 @@ function transformAnthropicRequestBody(body, fullCatalog, warn) {
   if (fullCatalog) {
     if (Array.isArray(body.tools)) {
       transformed.tools = body.tools
-        .filter(tool => toolName(tool) !== 'str_replace_editor')
+        .filter(tool => !RESTORED_TOOL_EXCLUSIONS.has(toolName(tool)))
         .map((tool) => {
           const normalized = toAnthropicTool(tool)
           return toolName(tool) === 'bash'
             ? { ...normalized, description: MINIMAL_BASH_DESCRIPTION }
             : normalized
         })
-      if (toolChoiceName(body.tool_choice) === 'str_replace_editor') {
+      if (toolChoiceName(body.tool_choice) && RESTORED_TOOL_EXCLUSIONS.has(toolChoiceName(body.tool_choice))) {
         transformed.tool_choice = { type: 'auto' }
       }
     }
@@ -493,11 +494,11 @@ export function transformRequestBody(body, fullCatalog, warn = () => {}, protoco
   if (fullCatalog) {
     if (Array.isArray(body.tools)) {
       transformed.tools = body.tools
-        .filter(tool => toolName(tool) !== 'str_replace_editor')
+        .filter(tool => !RESTORED_TOOL_EXCLUSIONS.has(toolName(tool)))
         .map(tool => toolName(tool) === 'bash'
           ? { ...tool, function: { ...tool.function, description: MINIMAL_BASH_DESCRIPTION } }
           : tool)
-      if (toolChoiceName(body.tool_choice) === 'str_replace_editor') transformed.tool_choice = 'auto'
+      if (toolChoiceName(body.tool_choice) && RESTORED_TOOL_EXCLUSIONS.has(toolChoiceName(body.tool_choice))) transformed.tool_choice = 'auto'
     }
     return transformed
   }

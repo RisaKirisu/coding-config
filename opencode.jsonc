@@ -232,7 +232,7 @@
   "lsp": true,
   "permission": {
     "bash": {
-      "*": "deny",
+      "*": "ask",
       "str_replace_editor": "allow",
       "printf *": "allow",
       "bc *": "allow",
