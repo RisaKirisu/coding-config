@@ -9,10 +9,8 @@ if [[ "$(realpath "$PWD")" != "$(realpath "$DEVVM_HOME")" ]]; then
     cd "$DEVVM_HOME"
 fi
 
-if ! command -v smolvm >/dev/null 2>&1; then
-    echo "Installing smolvm..."
-    curl -sSL https://smolmachines.com/install.sh | bash
-fi
+echo "Installing smolvm..."
+curl -sSL https://smolmachines.com/install.sh | bash
 
 case "$(uname -m)" in
     x86_64)  FRP_ARCH=amd64 ;;
