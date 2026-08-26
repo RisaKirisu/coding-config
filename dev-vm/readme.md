@@ -1,16 +1,14 @@
 # dev-vm
 
-Per-project dev VMs for OpenCode coding agents, managed by smolvm.
+Per-project dev VMs for OpenCode coding agents, managed by [Smolvm](https://github.com/smol-machines/smolvm).
 
 ## Image
 
-- Python 3.14, Node 24, Rust (stable + clippy/rustfmt/rust-analyzer), `gh`, cargo-binstall
+- Python 3.14, Node 24 + pnpm + NVM, Rust (stable + clippy/rustfmt/rust-analyzer), `gh`, cargo-binstall
 - OpenCode pre-installed with experimental LSP/scout/plan features enabled
 - 16 CPUs / 8 GB RAM and networking
-- Automatic HTTP access to development servers through FRP; Caddy and FRPC are
-  checked and started after every VM boot
-- DeepSeek Harness patched to treat `*.localhost` as loopback, gated by hashes
-  of the upstream bundles
+- Automatic HTTP access to development servers through FRP; Caddy and FRPC are checked and started after every VM boot
+- DeepSeek Harness patched to treat `*.localhost` as loopback, gated by hashes of the upstream bundles
 
 ## Files
 
@@ -32,19 +30,12 @@ Per-project dev VMs for OpenCode coding agents, managed by smolvm.
 ./setup-devvm.sh
 ```
 
-Requires Docker or Podman. Docker is preferred when both are installed. One VM
-per project (named by path), with two host mounts:
+Requires Docker or Podman. Docker is preferred when both are installed. One VM per project (named by path), with two host mounts:
 
 - The project at `/workspace`.
-- `root/` at `/devvm-root`. After each start, `devvm` links every entry into
-  `/root`, replacing an existing entry with the same name. Children of
-  `root/.config/` are linked individually into `/root/.config/`, so unmanaged
-  config remains available. Adding another config or agent directory does not
-  require rebuilding the image. In particular, `root/.dsh/` is linked to
-  `/root/.dsh` in every VM.
+- `root/` at `/devvm-root`. After each start, `devvm` links every entry into `/root`, replacing an existing entry with the same name. Children of `root/.config/` are linked individually into `/root/.config/`, so unmanaged config remains available. Adding another config or agent directory does not require rebuilding the image. In particular, `root/.dsh/` is linked to `/root/.dsh` in every VM.
 
-Keeping the shared files under one root keeps the aggregate virtio device count
-within libkrun's x86_64 limit when using the virtio-net backend.
+**Known Issue**: under x86_64 libkrun's virtio device count limit, at most 2 fs locations can be mounted. Any more will result in smolvm machine start error. Keeping the shared files under one root keeps the aggregate virtio device count when using the virtio-net backend.
 
 ## Usage
 
@@ -56,12 +47,10 @@ devvm rm             # delete VM
 devvm name           # print machine name
 ```
 
-Web servers are available immediately at a project-specific localhost name. A
-server listening on port 3000 in the VM is available at:
+Web servers are available immediately at a project-specific localhost name. A server listening on port 3000 in the VM is available at:
 
 ```text
 http://3000.<project-name>-<project-hash>.devvm.localhost
 ```
 
-For example, `http://3000.my-project-5f32a810.devvm.localhost`. No port mapping
-or VM restart is required. The server may listen on `127.0.0.1` inside the VM.
+For example, `http://3000.my-project-5f32a810.devvm.localhost`. No port mapping or VM restart is required. The server may listen on `127.0.0.1` inside the VM.

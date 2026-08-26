@@ -2,11 +2,13 @@
 FROM python:3.14-slim-trixie
 
 ARG NODE_VERSION=24.19.0
+ARG NVM_VERSION=0.40.6
 ARG FRP_VERSION=0.71.0
 ARG CADDY_VERSION=2.11.4
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_HOME=/root/.cargo \
+    NVM_DIR=/root/.nvm \
     RUSTUP_HOME=/root/.rustup \
     PATH=/root/.cargo/bin:/usr/local/bin:/root/.local/bin:$PATH \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -79,6 +81,14 @@ RUN set -eux; \
     node --version; \
     npm --version
 
+RUN npm install --global pnpm && pnpm --version
+
+RUN curl -fsSLo /tmp/install-nvm.sh \
+        "https://raw.githubusercontent.com/nvm-sh/nvm/v${NVM_VERSION}/install.sh" \
+    && PROFILE=/root/.bashrc bash /tmp/install-nvm.sh \
+    && rm /tmp/install-nvm.sh \
+    && bash -c '. "$NVM_DIR/nvm.sh" && nvm --version'
+
 # ---------------------------------------------------------------------------
 # GitHub CLI
 # Official GitHub apt repository.
@@ -132,8 +142,9 @@ RUN set -eux; \
 COPY scripts/Caddyfile /etc/devvm/Caddyfile
 COPY scripts/frpc.toml /etc/devvm/frpc.toml
 COPY --chmod=0755 scripts/devvm-ingress /usr/local/bin/devvm-ingress
-
-# Python development tooling.
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
 RUN python -m pip install --no-cache-dir --upgrade \
     pip \
     setuptools \
@@ -142,7 +153,11 @@ RUN python -m pip install --no-cache-dir --upgrade \
 # Install uv for other python versions
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
+# ---------------------------------------------------------------------------
+# Coding Agents
+# ---------------------------------------------------------------------------
 # Install Deepseek Harness
+# Extra heap space needed for dsh installation
 ENV NODE_OPTIONS='--max-old-space-size=8192'
 RUN npm install -g @deepseek-ai/dsh@latest
 # Patch to allow dsh web to be accessed by host
