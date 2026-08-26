@@ -1,4 +1,5 @@
 .api-keys/
 dev-vm/**/*.tar
+dev-vm/smolvm.toml
 dev-vm/root/.dsh/*
 node_modules

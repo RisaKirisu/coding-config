@@ -6,16 +6,20 @@ FRPS_BIN="$HOME/.local/bin/frps"
 
 ARCH="$(uname -m)"
 case "$ARCH" in
-    x86_64)  ARCH=amd64 ;;
-    aarch64) ARCH=arm64 ;;
+    x86_64)        ARCH=amd64 ;;
+    aarch64|arm64) ARCH=arm64 ;;
     *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
 esac
+
+INGRESS_PORT=17007
+HTTP_PORT=8102
 
 PROJECT_DIR="$(realpath "$PWD")"
 PROJECT_NAME="$(printf '%s' "$(basename "$PROJECT_DIR")" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-')"
 PROJECT_NAME="${PROJECT_NAME#-}"
 PROJECT_NAME="${PROJECT_NAME%-}"
-PROJECT_HASH="$(printf '%s' "$PROJECT_DIR" | sha256sum | cut -c1-8)"
+if command -v sha256sum >/dev/null 2>&1; then sha256() { sha256sum; }; else sha256() { shasum -a 256; }; fi
+PROJECT_HASH="$(printf '%s' "$PROJECT_DIR" | sha256 | cut -c1-8)"
 PROJECT_HOST="${PROJECT_NAME}-${PROJECT_HASH}"
 NAME="dev-${PROJECT_NAME}-${PROJECT_HASH}"
 
@@ -29,15 +33,15 @@ ensure_ingress() {
         exit 1
     fi
 
-    local command="$FRPS_BIN --bind-addr 127.0.0.1 --bind-port 7000 --vhost-http-port 80"
+    local command="$FRPS_BIN --bind-addr 127.0.0.1 --bind-port $INGRESS_PORT --vhost-http-port $HTTP_PORT"
     if pgrep -u "$(id -u)" -f "^$command$" >/dev/null; then
         return
     fi
 
     nohup "$FRPS_BIN" \
         --bind-addr 127.0.0.1 \
-        --bind-port 7000 \
-        --vhost-http-port 80 \
+        --bind-port "$INGRESS_PORT" \
+        --vhost-http-port "$HTTP_PORT" \
         >/dev/null 2>&1 &
     local pid=$!
     sleep 0.2
@@ -106,7 +110,7 @@ case "${1:-shell}" in
     shell)
         create
         start
-        echo "HTTP: http://<port>.$PROJECT_HOST.devvm.localhost"
+        echo "HTTP: http://<port>.$PROJECT_HOST.devvm.localhost:$HTTP_PORT"
         smolvm machine exec -it --name "$NAME" -- /bin/bash
         ;;
 
