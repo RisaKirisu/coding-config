@@ -30,7 +30,7 @@ Per-project dev VMs for OpenCode coding agents, managed by [Smolvm](https://gith
 ./setup-devvm.sh
 ```
 
-Requires Docker or Podman. Docker is preferred when both are installed. On macOS the builder VM needs at least 8 GB RAM (the DeepSeek Harness install asks Node for an 8 GB heap), e.g. `podman machine set --memory 8192 --cpus 6`. One VM per project (named by path), with two host mounts:
+Requires Docker or Podman. Docker is preferred when both are installed. On macOS also install `e2fsprogs` (`brew install e2fsprogs`) for `mkfs.ext4`; `setup-devvm.sh` aborts without it. On macOS the builder VM needs at least 8 GB RAM (the DeepSeek Harness install asks Node for an 8 GB heap), e.g. `podman machine set --memory 8192 --cpus 6`. One VM per project (named by path), with two host mounts:
 
 - The project at `/workspace`.
 - `root/` at `/devvm-root`. After each start, `devvm` links every entry into `/root`, replacing an existing entry with the same name. Children of `root/.config/` are linked individually into `/root/.config/`, so unmanaged config remains available. Adding another config or agent directory does not require rebuilding the image. In particular, `root/.dsh/` is linked to `/root/.dsh` in every VM.

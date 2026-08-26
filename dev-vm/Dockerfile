@@ -148,7 +148,7 @@ COPY --chmod=0755 scripts/devvm-ingress /usr/local/bin/devvm-ingress
 RUN python -m pip install --no-cache-dir --upgrade \
     pip \
     setuptools \
-    wheel 
+    wheel
 
 # Install uv for other python versions
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh

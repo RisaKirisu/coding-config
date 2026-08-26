@@ -14,7 +14,14 @@ curl -sSL https://smolmachines.com/install.sh | bash
 
 case "$(uname -s)" in
     Linux)  FRP_OS=linux ;;
-    Darwin) FRP_OS=darwin ;;
+    Darwin)
+        FRP_OS=darwin
+        if ! command -v mkfs.ext4 >/dev/null 2>&1 \
+            && [[ ! -x "$(brew --prefix 2>/dev/null)/opt/e2fsprogs/sbin/mkfs.ext4" ]]; then
+            echo "mkfs.ext4 not found. Install it with: brew install e2fsprogs" >&2
+            exit 1
+        fi
+        ;;
     *) echo "Unsupported OS: $(uname -s)" >&2; exit 1 ;;
 esac
 
