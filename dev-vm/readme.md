@@ -9,6 +9,8 @@ Per-project dev VMs for OpenCode coding agents, managed by smolvm.
 - 16 CPUs / 8 GB RAM and networking
 - Automatic HTTP access to development servers through FRP; Caddy and FRPC are
   checked and started after every VM boot
+- DeepSeek Harness patched to treat `*.localhost` as loopback, gated by hashes
+  of the upstream bundles
 
 ## Files
 
@@ -19,8 +21,10 @@ Per-project dev VMs for OpenCode coding agents, managed by smolvm.
 | `devvm` | CLI wrapper around smolvm |
 | `setup-devvm.sh` | Install smolvm, build image, link `devvm` |
 | `smolvm.toml` | VM resources/auth |
+| `scripts/` | Caddy/FRPC config and VM ingress launcher |
 | `root/` | Host-managed agent config and data mounted at `/devvm-root` |
 | `root/.config/opencode/` | OpenCode config (providers, agents, DCP) |
+| `root/.dsh/` | Shared DeepSeek Harness plugins and data |
 
 ## Setup
 
@@ -28,14 +32,16 @@ Per-project dev VMs for OpenCode coding agents, managed by smolvm.
 ./setup-devvm.sh
 ```
 
-Requires Docker. One VM per project (named by path), with two host mounts:
+Requires Docker or Podman. Docker is preferred when both are installed. One VM
+per project (named by path), with two host mounts:
 
 - The project at `/workspace`.
 - `root/` at `/devvm-root`. After each start, `devvm` links every entry into
   `/root`, replacing an existing entry with the same name. Children of
   `root/.config/` are linked individually into `/root/.config/`, so unmanaged
   config remains available. Adding another config or agent directory does not
-  require rebuilding the image.
+  require rebuilding the image. In particular, `root/.dsh/` is linked to
+  `/root/.dsh` in every VM.
 
 Keeping the shared files under one root keeps the aggregate virtio device count
 within libkrun's x86_64 limit when using the virtio-net backend.

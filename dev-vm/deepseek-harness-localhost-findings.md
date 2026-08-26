@@ -10,9 +10,8 @@ http://3080.<project>.devvm.localhost
 
 Related upstream discussion: <https://github.com/deepseek-ai/deepseek-harness/discussions/894>
 
-The live test machine was `dev-xiaobright-modeltest-3f4561e7`. Changes described
-below were applied only to that machine. They are not integrated into `devvm`
-startup.
+The live test machine was `dev-xiaobright-modeltest-3f4561e7`. The resulting
+patch is applied during the `devvm` image build.
 
 ## Findings
 
@@ -120,10 +119,16 @@ The live machine stores it at:
 /usr/local/share/devvm-patches/deepseek-harness-localhost-subdomains.patch
 ```
 
-## Patch script
+## Build integration
 
-The live machine has this idempotent script at
-`/usr/local/bin/patch-dsh-localhost-subdomains`:
+`Dockerfile` applies the patch immediately after installing DSH. It verifies
+the SHA-256 hash of each target bundle first, then applies
+`patches/deepseek-harness-localhost-subdomains.patch`. These checks depend on
+target content, not the DSH package version, so a package update with unchanged
+bundles still receives the patch. A changed or partially patched bundle fails
+the image build for review instead of receiving a stale patch.
+
+The original live-machine script was:
 
 ```bash
 #!/usr/bin/env bash
@@ -152,18 +157,8 @@ grep -Fq "$marker" "$server_target"
 echo "Applied DeepSeek Harness localhost-subdomain patch"
 ```
 
-Run it after installing or updating DSH and before launching `dsh web`:
-
-```bash
-patch-dsh-localhost-subdomains
-```
-
-Restart a running DSH process after patching. The server bundle is loaded into
-the Node process and does not update in place.
-
-The script is intentionally version-sensitive. It exits rather than modifying
-unknown or partially patched source. Recheck the upstream bundle and regenerate
-the patch when DSH changes these files.
+The image build replaces this runtime step. Recheck the upstream bundles,
+regenerate the patch, and update expected hashes when either target changes.
 
 ## Caddy alternative
 
@@ -193,12 +188,9 @@ original Host and Origin.
 
 ## Continuing the work
 
-1. Move the patch and script into an image or mounted devvm-owned location.
-2. Run the script after DSH installation on every machine start, but before DSH
-   launches. No startup integration has been implemented yet.
-3. Add upstream tests covering `localhost`, subdomains such as `app.localhost`,
+1. Add upstream tests covering `localhost`, subdomains such as `app.localhost`,
    `[::1]`, `127/8`, and non-localhost lookalikes such as `notlocalhost`.
-4. Remove the built-bundle patch once upstream classifies `.localhost`
+2. Remove the built-bundle patch once upstream classifies `.localhost`
    subdomains consistently in both browser and server source.
 
 For devvm ingress, the browser authority is the hostname without a scheme or

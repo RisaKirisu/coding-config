@@ -129,83 +129,9 @@ RUN set -eux; \
     install -m 0755 "$tmpdir/caddy" /usr/local/bin/caddy; \
     rm -rf "$tmpdir"
 
-RUN <<'EOF'
-set -eu
-install -d /etc/devvm
-
-cat > /etc/devvm/Caddyfile <<'CADDY'
-{
-	admin off
-	auto_https off
-}
-
-:10080 {
-	route {
-		@devvm header_regexp devvm Host ^([0-9]{1,5})\.[a-z0-9-]+\.devvm\.localhost$
-		reverse_proxy @devvm 127.0.0.1:{re.devvm.1}
-		respond "Invalid devvm hostname" 400
-	}
-}
-CADDY
-
-cat > /usr/local/bin/devvm-ingress <<'SCRIPT'
-#!/usr/bin/env bash
-set -euo pipefail
-
-: "${DEVVM_PROJECT_HOST:?DEVVM_PROJECT_HOST is not set}"
-install -d -m 0700 /run/devvm
-
-process_running() {
-    local process="$1"
-    local pid_file="$2"
-    local pid
-
-    [[ -r "$pid_file" ]] || return 1
-    read -r pid < "$pid_file"
-    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-    kill -0 "$pid" 2>/dev/null || return 1
-    [[ "$(<"/proc/$pid/comm")" == "$process" ]]
-}
-
-adopt_running_process() {
-    local process="$1"
-    local pid_file="$2"
-    local pid
-
-    process_running "$process" "$pid_file" && return
-    pid="$(pgrep -xo "$process" || true)"
-    [[ -n "$pid" ]] || return 1
-    printf '%s\n' "$pid" > "$pid_file"
-}
-
-cat > /run/devvm/frpc.toml <<CONFIG
-serverAddr = "100.96.0.1"
-serverPort = 7000
-
-[[proxies]]
-name = "$DEVVM_PROJECT_HOST"
-type = "http"
-localIP = "127.0.0.1"
-localPort = 10080
-customDomains = ["*.$DEVVM_PROJECT_HOST.devvm.localhost"]
-CONFIG
-
-if ! adopt_running_process caddy /run/devvm/caddy.pid; then
-    caddy start \
-        --config /etc/devvm/Caddyfile \
-        --adapter caddyfile \
-        --pidfile /run/devvm/caddy.pid \
-        >/tmp/devvm-caddy.log 2>&1
-fi
-
-if ! adopt_running_process frpc /run/devvm/frpc.pid; then
-    nohup frpc -c /run/devvm/frpc.toml >/tmp/devvm-frpc.log 2>&1 &
-    printf '%s\n' "$!" > /run/devvm/frpc.pid
-fi
-SCRIPT
-
-chmod 0755 /usr/local/bin/devvm-ingress
-EOF
+COPY scripts/Caddyfile /etc/devvm/Caddyfile
+COPY scripts/frpc.toml /etc/devvm/frpc.toml
+COPY --chmod=0755 scripts/devvm-ingress /usr/local/bin/devvm-ingress
 
 # Python development tooling.
 RUN python -m pip install --no-cache-dir --upgrade \
@@ -219,6 +145,18 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 # Install Deepseek Harness
 ENV NODE_OPTIONS='--max-old-space-size=8192'
 RUN npm install -g @deepseek-ai/dsh@latest
+# Patch to allow dsh web to be accessed by host
+COPY patches/deepseek-harness-localhost-subdomains.patch /tmp/deepseek-harness-localhost-subdomains.patch
+RUN set -eux; \
+    package_dir=/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-connection; \
+    client_target="$package_dir/lib/client.js"; \
+    server_target="$package_dir/lib/index.js"; \
+    printf '%s  %s\n' '0735d9af8a012d1edb19a02c4cef50903a783cdb28eac8b62fe9141625592845' "$client_target" | sha256sum --check -; \
+    printf '%s  %s\n' '450888f220a348190f3043986737ed2ea04a39f11e67e2d16abb26c2f96f8815' "$server_target" | sha256sum --check -; \
+    patch --batch --forward --strip=1 --directory="$package_dir" < /tmp/deepseek-harness-localhost-subdomains.patch; \
+    grep -Fq 'hostname.endsWith(".localhost")' "$client_target"; \
+    grep -Fq 'hostname.endsWith(".localhost")' "$server_target"; \
+    rm /tmp/deepseek-harness-localhost-subdomains.patch
 
 # Install OpenCode
 RUN npm install -g opencode-ai

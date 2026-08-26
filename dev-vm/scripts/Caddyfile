@@ -1,0 +1,12 @@
+{
+	admin off
+	auto_https off
+}
+
+:10080 {
+	route {
+		@devvm header_regexp devvm Host ^([0-9]{1,5})\.[a-z0-9-]+\.devvm\.localhost$
+		reverse_proxy @devvm 127.0.0.1:{re.devvm.1}
+		respond "Invalid devvm hostname" 400
+	}
+}

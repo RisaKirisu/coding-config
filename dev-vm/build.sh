@@ -2,6 +2,15 @@
 
 set -euo pipefail
 
+if command -v docker >/dev/null 2>&1; then
+  CONTAINER_RUNTIME=docker
+elif command -v podman >/dev/null 2>&1; then
+  CONTAINER_RUNTIME=podman
+else
+  echo "Docker or Podman is required to build the machine image" >&2
+  exit 1
+fi
+
 ARCH=$(uname -m)
 
 case "$ARCH" in
@@ -10,5 +19,5 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-docker build -t rust-dev-smolvm-opencode-$ARCH .
-docker save rust-dev-smolvm-opencode-$ARCH -o rust-dev-opencode-$ARCH.tar
+"$CONTAINER_RUNTIME" build -t rust-dev-smolvm-opencode-$ARCH .
+"$CONTAINER_RUNTIME" save -o rust-dev-opencode-$ARCH.tar rust-dev-smolvm-opencode-$ARCH

@@ -1,3 +1,4 @@
 .api-keys/
 dev-vm/**/*.tar
+dev-vm/root/.dsh/*
 node_modules

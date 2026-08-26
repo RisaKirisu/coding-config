@@ -1,0 +1,9 @@
+serverAddr = "100.96.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "{{ .Envs.DEVVM_PROJECT_HOST }}"
+type = "http"
+localIP = "127.0.0.1"
+localPort = 10080
+customDomains = ["*.{{ .Envs.DEVVM_PROJECT_HOST }}.devvm.localhost"]
