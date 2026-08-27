@@ -75,6 +75,13 @@ link_root() {
         set -euo pipefail
         shopt -s dotglob nullglob
 
+        # A macOS host shares /devvm-root over a virtiofs server that hands back
+        # a read-only fd for a file published with link()+unlink() (write EBADF,
+        # ftruncate EINVAL). That is exactly how dsh writes a session log, so
+        # its session state cannot live on the mount there. Linux hosts are fine.
+        split_dsh=""
+        [[ "$1" == "Darwin" ]] && split_dsh=1
+
         install -d /root/.config
         for source in /devvm-root/.config/*; do
             target="/root/.config/${source##*/}"
@@ -82,13 +89,27 @@ link_root() {
             ln -s "$source" "$target"
         done
 
+        if [[ -n "$split_dsh" ]]; then
+            if [[ -L /root/.dsh ]]; then rm -f /root/.dsh; fi
+            install -d -m 700 /root/.dsh /root/.dsh/sessions /root/.dsh/storages
+            for source in /devvm-root/.dsh/*; do
+                name="${source##*/}"
+                [[ "$name" == "sessions" || "$name" == "storages" ]] && continue
+                target="/root/.dsh/$name"
+                rm -rf -- "$target"
+                ln -s "$source" "$target"
+            done
+        fi
+
         for source in /devvm-root/*; do
-            [[ "${source##*/}" == ".config" ]] && continue
-            target="/root/${source##*/}"
+            name="${source##*/}"
+            [[ "$name" == ".config" ]] && continue
+            [[ -n "$split_dsh" && "$name" == ".dsh" ]] && continue
+            target="/root/$name"
             rm -rf -- "$target"
             ln -s "$source" "$target"
         done
-    '
+    ' link-root "$(uname -s)"
 }
 
 start_ingress() {
