@@ -181,6 +181,9 @@ ENV OPENCODE_EXPERIMENTAL_WEBSOCKETS=true \
     OPENCODE_EXPERIMENTAL_SCOUT=1 \
     OPENCODE_EXPERIMENTAL_PLAN_MODE=1
 
+# Silence git safe.directory warning
+RUN git config --global --add safe.directory "/workspace/*"
+
 WORKDIR /workspace
 
 CMD ["/bin/bash"]
