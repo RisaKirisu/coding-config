@@ -2,6 +2,7 @@
 *.tar
 smolvm.toml
 root/.pnpm-store/
+tmp/
 
 # api keys
 .api-keys
