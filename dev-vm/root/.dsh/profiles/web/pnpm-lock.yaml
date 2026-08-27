@@ -1,0 +1,25 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: false
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      '@hytime/dsh-thinking-effort':
+        specifier: github:hytime/dsh-thinking-effort
+        version: https://codeload.github.com/hytime/dsh-thinking-effort/tar.gz/38f541073e7193d940a9ab5295cf8eb1e5ad5d6d
+
+packages:
+
+  '@hytime/dsh-thinking-effort@https://codeload.github.com/hytime/dsh-thinking-effort/tar.gz/38f541073e7193d940a9ab5295cf8eb1e5ad5d6d':
+    resolution: {gitHosted: true, integrity: sha512-Qwi8YyeTmhCXPcOnpj4W4rC0qqYGb/fH9uuI64LZPZcsOpya4yvv3HStUQDl9y64r/I+CerA39fWrBlM3FNJYg==, tarball: https://codeload.github.com/hytime/dsh-thinking-effort/tar.gz/38f541073e7193d940a9ab5295cf8eb1e5ad5d6d}
+    version: 0.1.8
+    peerDependencies:
+      '@deepseek-ai/cordis': ^4.0.1
+
+snapshots:
+
+  '@hytime/dsh-thinking-effort@https://codeload.github.com/hytime/dsh-thinking-effort/tar.gz/38f541073e7193d940a9ab5295cf8eb1e5ad5d6d': {}

@@ -1,0 +1,119 @@
+ui-onboarding:
+  welcomeNoticeVersion: 2026-08-13.1
+agent-default-model:
+  provider: krill-codex
+  model: gpt-5.6-sol
+  reasoningEffort: high
+llm-pi-ai:
+  providers:
+    krill-codex:
+      displayName: Krill
+      apiKeyEnv: KRILL_CODEX_API_KEY
+      api: openai-responses
+      baseURL: https://api.krill-ai.net/codex/v1
+      models:
+        - id: gpt-5.6-sol
+          contextWindow: 1000000
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            off: null
+            low: low
+            medium: medium
+            high: high
+            xhigh: xhigh
+            max: max
+          compat:
+            chatTemplateKwargs: {}
+        - id: gpt-5.6-terra
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            off: null
+            low: low
+            medium: medium
+            high: high
+            xhigh: xhigh
+            max: max
+          compat:
+            chatTemplateKwargs: {}
+          contextWindow: 1000000
+      modelOverrides: {}
+      compat:
+        chatTemplateKwargs: {}
+      defaultContextWindow: 262144
+      defaultMaxTokens: 32768
+      defaultInput:
+        - text
+      headers: {}
+      thinkingBudgets: {}
+      streamIdleTimeoutMs: 300000
+      maxRequestImageBytes: 20971520
+      requestImagePixelBudget: 4194304
+      requestImageMaxBytes: 1048576
+    krill-china:
+      displayName: Krill
+      apiKeyEnv: KRILL_CHINA_API_KEY
+      api: openai-responses
+      baseURL: https://api.krill-ai.net/coding/v1
+      models:
+        - id: deepseek-v4-flash-0731
+          contextWindow: 1000000
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            off: null
+            high: high
+            max: max
+          compat:
+            chatTemplateKwargs: {}
+        - id: deepseek-v4-pro-0813
+          input: []
+          reasoningEfforts:
+            off: null
+            high: high
+            max: max
+          compat:
+            chatTemplateKwargs: {}
+          contextWindow: 1000000
+        - id: qwen3.8-max
+          input: []
+          reasoningEfforts:
+            off: null
+            high: high
+            max: max
+          compat:
+            chatTemplateKwargs: {}
+        - id: kimi-k3
+          input: []
+          reasoningEfforts:
+            off: null
+            high: high
+            max: max
+          compat:
+            chatTemplateKwargs: {}
+      modelOverrides: {}
+      compat:
+        chatTemplateKwargs: {}
+      defaultContextWindow: 262144
+      defaultMaxTokens: 32768
+      defaultInput:
+        - text
+      headers: {}
+      thinkingBudgets: {}
+      streamIdleTimeoutMs: 300000
+      maxRequestImageBytes: 20971520
+      requestImagePixelBudget: 4194304
+      requestImageMaxBytes: 1048576
+  subagentEffort: medium
+agent-presets:
+  default: standard
+ui-conversation:
+  busyEnter: steer
+permission:
+  defaultPreset: danger-full-access
+locale:
+  preference: zh

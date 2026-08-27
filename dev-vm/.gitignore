@@ -1,0 +1,17 @@
+# dev-vm local
+*.tar
+smolvm.toml
+root/.pnpm-store/
+
+# api keys
+.api-keys
+.credentials.yaml
+
+# Node.js
+node_modules/
+
+# DSH runtime state
+root/.dsh/sessions/
+root/.dsh/storages/
+root/.dsh/plugins/subscriptions/
+root/.dsh/.anonymous-user-id
