@@ -21,6 +21,7 @@ Per-project dev VMs for OpenCode coding agents, managed by [Smolvm](https://gith
 | `smolvm.toml.example` | Template for VM resources/auth; `setup-devvm.sh` copies it to the gitignored `smolvm.toml` so `cpus`/`memory` can be tuned per host |
 | `scripts/` | Caddy/FRPC config and VM ingress launcher |
 | `root/` | Host-managed agent config and data mounted at `/devvm-root` |
+| `skills/` | Central skill collection shared by every coding agent (host shortcut to `root/skills/`) |
 | `root/.config/opencode/` | OpenCode config (providers, agents, DCP) |
 | `root/.dsh/` | Shared DeepSeek Harness plugins and data |
 
@@ -34,6 +35,10 @@ Requires Docker or Podman. Docker is preferred when both are installed. On macOS
 
 - The project at `/workspace`.
 - `root/` at `/devvm-root`. After each start, `devvm` links every entry into `/root`, replacing an existing entry with the same name. Children of `root/.config/` are linked individually into `/root/.config/`, so unmanaged config remains available. Adding another config or agent directory does not require rebuilding the image. In particular, `root/.dsh/` is linked to `/root/.dsh` in every VM.
+
+## Shared skills
+
+Put skill folders under `skills/`. OpenCode and DSH both link to this directory, so each skill only needs to exist once and is available in every Dev VM without rebuilding the image.
 
 **Known Issue**: under x86_64 libkrun's virtio device count limit, at most 2 fs locations can be mounted. Any more will result in smolvm machine start error. Keeping the shared files under one root keeps the aggregate virtio device count when using the virtio-net backend.
 
