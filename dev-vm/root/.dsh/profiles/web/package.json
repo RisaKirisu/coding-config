@@ -2,14 +2,16 @@
   "name": "dsh-profile-web",
   "private": true,
   "dependencies": {
-    "@hytime/dsh-thinking-effort": "github:hytime/dsh-thinking-effort"
+    "@hytime/dsh-thinking-effort": "github:hytime/dsh-thinking-effort",
+    "dsh-better-sidebar": "^0.16.1"
   },
   "dsh": {
     "profile": {
       "bundles": [
         "@deepseek-ai/dsh-base",
         "@deepseek-ai/dsh-web-app",
-        "@hytime/dsh-thinking-effort"
+        "@hytime/dsh-thinking-effort",
+        "dsh-better-sidebar"
       ]
     }
   }
