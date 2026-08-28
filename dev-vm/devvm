@@ -65,7 +65,7 @@ create() {
              --net-backend virtio-net \
              --image "$IMAGE" \
              -e "DEVVM_PROJECT_HOST=$PROJECT_HOST" \
-             -v "$PROJECT_DIR:/workspace/$(basename "$PROJECT_DIR")" \
+             -v "$PROJECT_DIR:/root/$(basename "$PROJECT_DIR")" \
              -v "$DEVVM_ROOT:/devvm-root"
     fi
 }
