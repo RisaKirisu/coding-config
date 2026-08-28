@@ -1,6 +1,6 @@
 ---
 name: developer
-description: Developer guidelines. OpenCode agent MUST load this skill IMMEDIATELY when it's full context is not already present. Other agents should NOT load it unless explicitly asked. YOU MUST LOAD THIS IMMEDIATELY AT EARLIEST POSSIBLE CHANCE IF YOU ARE OPENCODE AGENT.
+description: Developer guidelines. Agent MUST load this skill IMMEDIATELY when it's full context is not already present. Other agents should NOT load it unless explicitly asked. YOU MUST LOAD THIS IMMEDIATELY AT EARLIEST POSSIBLE CHANCE IF YOU ARE OPENCODE AGENT.
 ---
 
 ## Subagent Strategy
