@@ -59,4 +59,4 @@ description: Developer guidelines. Agent MUST load this skill IMMEDIATELY when i
 - Never rely on memory for library APIs: libraries update quickly and training data goes stale.
 
 ## Bash usage
-- When running tests and other commands where you need to examine the output, use `tee` to log the output to a temp file, then investigate the saved log. Do not directly use `| tail` to truncate the result.
+- When running tests and other commands where you need to examine the output, use `tee` to log the output to a temp file, then investigate the saved log. Do not directly use `| tail` as it may loss critical information.
