@@ -32,6 +32,11 @@ description: Developer guidelines. Agent MUST load this skill IMMEDIATELY when i
 - Never mark a task complete without proving it: run tests, check logs, demonstrate correctness.
 - Ask: "Would a staff engineer approve this?"
 
+## Test Discipline
+- NEVER write custom, hand-rolled mocks. Hand-rolled mocks almost always encode incorrect assumptions, create false confidence, and test against untested hallucinations.
+- Only use an well established and recognized mocking library designed specifically for that service. Never invent ad-hoc mock objects or mock frameworks.
+- Testing against hand-rolled mocks is completely useless and destroys test validity and system reliability.
+
 ## Documentation
 - When a task, issue, or story is finished, update the relevant documentation and `AGENTS.md` before marking it complete.
 

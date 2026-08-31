@@ -1,0 +1,6 @@
+# @devvm/dsh-voice-input bundle patch: inserts the voice-input tool plugin
+- insert:
+    - id: tool-voice-input
+      name: '@devvm/dsh-voice-input'
+      config:
+        file: /root/voice-dictation-cleanup/data/archive_voice_input.jsonl

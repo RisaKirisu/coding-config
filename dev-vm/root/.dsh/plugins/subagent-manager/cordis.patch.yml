@@ -1,0 +1,4 @@
+# @devvm/dsh-subagent-manager bundle patch: persistent host tool and web settings page
+- insert:
+    - id: subagent-manager
+      name: '@devvm/dsh-subagent-manager'

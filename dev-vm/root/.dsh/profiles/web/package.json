@@ -2,8 +2,13 @@
   "name": "dsh-profile-web",
   "private": true,
   "dependencies": {
+    "@deepseek-ai/dsh-web-fetch-http": "0.1.1-rc.2",
+    "@devvm/dsh-remote-sync": "file:/root/.dsh/plugins/remote-sync",
+    "@devvm/dsh-subagent-manager": "file:/root/.dsh/plugins/subagent-manager",
+    "@devvm/dsh-voice-input": "file:/root/.dsh/plugins/voice-input",
     "@hytime/dsh-thinking-effort": "github:hytime/dsh-thinking-effort",
-    "dsh-better-sidebar": "^0.16.1"
+    "dsh-better-sidebar": "^0.16.1",
+    "dsh-skill-mcp-panel": "file:/root/.dsh/plugins/dsh-skill-mcp-panel"
   },
   "dsh": {
     "profile": {
@@ -11,7 +16,11 @@
         "@deepseek-ai/dsh-base",
         "@deepseek-ai/dsh-web-app",
         "@hytime/dsh-thinking-effort",
-        "dsh-better-sidebar"
+        "dsh-better-sidebar",
+        "dsh-skill-mcp-panel",
+        "@devvm/dsh-remote-sync",
+        "@devvm/dsh-subagent-manager",
+        "@devvm/dsh-voice-input"
       ]
     }
   }

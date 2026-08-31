@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DEVVM_HOME="${DEVVM_HOME:-$HOME/coding-config/dev-vm}"
-FRPS_BIN="$HOME/.local/bin/frps"
+FRPS_BIN="${FRPS_BIN:-$HOME/.local/bin/frps}"
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -13,6 +13,7 @@ esac
 
 INGRESS_PORT=17007
 HTTP_PORT=8102
+FRPS_TIMEOUT=1800
 
 PROJECT_DIR="$(realpath "$PWD")"
 PROJECT_NAME="$(printf '%s' "$(basename "$PROJECT_DIR")" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-')"
@@ -33,16 +34,18 @@ ensure_ingress() {
         exit 1
     fi
 
-    local command="$FRPS_BIN --bind-addr 127.0.0.1 --bind-port $INGRESS_PORT --vhost-http-port $HTTP_PORT"
-    if pgrep -u "$(id -u)" -f "^$command$" >/dev/null; then
+    local command=(
+        "$FRPS_BIN"
+        --bind-addr 127.0.0.1
+        --bind-port "$INGRESS_PORT"
+        --vhost-http-port "$HTTP_PORT"
+        --vhost-http-timeout "$FRPS_TIMEOUT"
+    )
+    if pgrep -u "$(id -u)" -f "^${command[*]}$" >/dev/null; then
         return
     fi
 
-    nohup "$FRPS_BIN" \
-        --bind-addr 127.0.0.1 \
-        --bind-port "$INGRESS_PORT" \
-        --vhost-http-port "$HTTP_PORT" \
-        >/dev/null 2>&1 &
+    nohup "${command[@]}" >/dev/null 2>&1 &
     local pid=$!
     sleep 0.2
     if ! kill -0 "$pid" 2>/dev/null; then
@@ -51,11 +54,31 @@ ensure_ingress() {
     fi
 }
 
+ensure_project_id() {
+    local id_file="$PROJECT_DIR/.devvm-id"
+    if [[ ! -f "$id_file" || ! -s "$id_file" ]]; then
+        local uuid=""
+        if [[ -r /proc/sys/kernel/random/uuid ]]; then
+            uuid="$(cat /proc/sys/kernel/random/uuid)"
+        elif command -v uuidgen >/dev/null 2>&1; then
+            uuid="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+        elif command -v python3 >/dev/null 2>&1; then
+            uuid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+        fi
+        if [[ -z "$uuid" ]]; then
+            echo "Failed to generate UUID for .devvm-id" >&2
+            exit 1
+        fi
+        printf '%s\n' "$uuid" > "$id_file"
+    fi
+}
+
 exists() {
     smolvm machine status --name "$NAME" >/dev/null 2>&1
 }
 
 create() {
+    ensure_project_id
     ensure_ingress
     if ! exists; then
         echo "Creating $NAME"
@@ -65,7 +88,7 @@ create() {
              --net-backend virtio-net \
              --image "$IMAGE" \
              -e "DEVVM_PROJECT_HOST=$PROJECT_HOST" \
-             -v "$PROJECT_DIR:/root/$(basename "$PROJECT_DIR")" \
+             -v "$PROJECT_DIR:/root/workspace" \
              -v "$DEVVM_ROOT:/devvm-root"
     fi
 }
@@ -75,13 +98,6 @@ link_root() {
         set -euo pipefail
         shopt -s dotglob nullglob
 
-        # A macOS host shares /devvm-root over a virtiofs server that hands back
-        # a read-only fd for a file published with link()+unlink() (write EBADF,
-        # ftruncate EINVAL). That is exactly how dsh writes a session log, so
-        # its session state cannot live on the mount there. Linux hosts are fine.
-        split_dsh=""
-        [[ "$1" == "Darwin" ]] && split_dsh=1
-
         install -d /root/.config
         for source in /devvm-root/.config/*; do
             target="/root/.config/${source##*/}"
@@ -89,27 +105,32 @@ link_root() {
             ln -s "$source" "$target"
         done
 
-        if [[ -n "$split_dsh" ]]; then
-            if [[ -L /root/.dsh ]]; then rm -f /root/.dsh; fi
-            install -d -m 700 /root/.dsh /root/.dsh/sessions /root/.dsh/storages
-            for source in /devvm-root/.dsh/*; do
-                name="${source##*/}"
-                [[ "$name" == "sessions" || "$name" == "storages" ]] && continue
-                target="/root/.dsh/$name"
-                rm -rf -- "$target"
-                ln -s "$source" "$target"
-            done
-        fi
+        if [[ -L /root/.dsh ]]; then rm -f /root/.dsh; fi
+        install -d -m 700 /root/.dsh
+        for target in /root/.dsh/sessions /root/.dsh/storages /root/.dsh/attachments; do
+            if [[ -L "$target" ]]; then rm -f "$target"; fi
+            install -d -m 700 "$target"
+        done
+        for source in /devvm-root/.dsh/*; do
+            name="${source##*/}"
+            [[ "$name" == "sessions" || "$name" == "storages" || "$name" == "attachments" || "$name" == ".sync-dirty" ]] && continue
+            target="/root/.dsh/$name"
+            rm -rf -- "$target"
+            ln -s "$source" "$target"
+        done
 
         for source in /devvm-root/*; do
             name="${source##*/}"
-            [[ "$name" == ".config" ]] && continue
-            [[ -n "$split_dsh" && "$name" == ".dsh" ]] && continue
+            [[ "$name" == ".config" || "$name" == ".dsh" ]] && continue
             target="/root/$name"
             rm -rf -- "$target"
             ln -s "$source" "$target"
         done
-    ' link-root "$(uname -s)"
+
+        if command -v dsh >/dev/null 2>&1 && [[ -f /root/.dsh/profiles/web/package.json ]]; then
+            DSH_HOME=/root/.dsh dsh plugin --profile web install --frozen-lockfile
+        fi
+    ' link-root
 }
 
 start_ingress() {
@@ -137,6 +158,9 @@ case "${1:-shell}" in
 
     exec)
         shift
+        if [[ "${1:-}" == "--" ]]; then
+            shift
+        fi
         create
         start
         smolvm machine exec --stream --name "$NAME" -- "$@"

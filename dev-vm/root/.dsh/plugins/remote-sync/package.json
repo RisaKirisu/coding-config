@@ -1,0 +1,41 @@
+{
+  "name": "@devvm/dsh-remote-sync",
+  "version": "0.1.0",
+  "description": "DevVM Remote Sync Plugin for Portable DSH State",
+  "type": "module",
+  "main": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "client.js",
+    "cordis.patch.yml",
+    "package.json",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "bundle",
+    "sync",
+    "remote-sync",
+    "portable-state"
+  ],
+  "license": "MIT"
+}

@@ -21,6 +21,25 @@
 - id: approval
   disabled: true
 
+- id: compaction-basic
+  config:
+    thresholdRatio: 0.5
+    maxTokens: 10000
+    compactionRetries: 5
+    maxOverflowRetries: 5
+
+- id: tool-result-pruner
+  config:
+    thresholdChars: 8192
+    headChars: 2048
+    tailChars: 1024
+
+- id: tool-web
+  disabled: false
+  config:
+    search: false
+    fetch: true
+
 - insert:
     - id: bash-local
       name: '@deepseek-ai/dsh-bash-local'
@@ -30,27 +49,5 @@
     - id: fs-local
       name: '@deepseek-ai/dsh-fs-local'
 
-    - id: mcp-context7
-      name: '@deepseek-ai/dsh-mcp-client'
-      config:
-        serverName: context7
-        transport: streamable-http
-        url: https://mcp.context7.com/mcp
-        headers:
-          Authorization: !!js >-
-            `Bearer ${(() => {
-              try {
-                const fs = process.getBuiltinModule('node:fs');
-                const text = fs.readFileSync(dshHomePath('.credentials.yaml'), 'utf8');
-                const m = text.match(/^\s*CONTEXT7_API_KEY:\s*['"]?([^'"\r\n]+)/m);
-                return m ? m[1].trim() : (process.env.CONTEXT7_API_KEY ?? '');
-              } catch {
-                return process.env.CONTEXT7_API_KEY ?? '';
-              }
-            })()}`
-
-    # Local plugin paths resolve from profiles/<name>, not from DSH_HOME.
-    - id: tool-voice-input
-      name: ../../plugins/voice-input/index.mjs
-      config:
-        file: /root/voice-dictation-cleanup/data/archive_voice_input.jsonl
+    - id: web-fetch-http
+      name: '@deepseek-ai/dsh-web-fetch-http'

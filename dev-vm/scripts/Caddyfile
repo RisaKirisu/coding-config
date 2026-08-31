@@ -5,8 +5,11 @@
 
 :10080 {
 	route {
-		@devvm header_regexp devvm Host ^([0-9]{1,5})\.[a-z0-9-]+\.devvm\.localhost(:[0-9]+)?$
-		reverse_proxy @devvm 127.0.0.1:{re.devvm.1}
+		@devvm header_regexp devvm Host ^([0-9]{1,5})\.([a-z0-9-]+)\.(devvm\.localhost|devvm\.internal)(:[0-9]+)?$
+		reverse_proxy @devvm 127.0.0.1:{re.devvm.1} {
+			header_up Host localhost:{re.devvm.1}
+			header_up Origin ^https?://{re.devvm.1}\.{re.devvm.2}\.{re.devvm.3}(:[0-9]+)?$ "http://localhost:{re.devvm.1}"
+		}
 		respond "Invalid devvm hostname" 400
 	}
 }

@@ -1,0 +1,54 @@
+{
+  "name": "dsh-skill-mcp-panel",
+  "version": "2.0.1",
+  "description": "dsh-skill-mcp-panel: manage skills and MCP servers from the DSH web settings UI plus the unified dsh-panel CLI.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-api-gateway"
+      ]
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@deepseek-ai/dsh-home-paths": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-typert-protocol": "^0.1.0-rc.6",
+    "fflate": "^0.8.3",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3",
+    "@deepseek-ai/dsh-subprocess": "^0.1.0-rc.6",
+    "@modelcontextprotocol/sdk": "^1.12.0"
+  },
+  "bin": {
+    "dsh-panel": "./lib/cli.js"
+  },
+  "files": [
+    "lib",
+    "assets",
+    "README.md",
+    "README.en.md",
+    "LICENSE",
+    "cordis.patch.yml"
+  ],
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2",
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/strip-client-export.mjs"
+  }
+}

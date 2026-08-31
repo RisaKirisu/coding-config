@@ -3,6 +3,7 @@
 smolvm.toml
 root/.pnpm-store/
 tmp/
+target/
 
 # api keys
 .api-keys
@@ -16,3 +17,12 @@ root/.dsh/sessions/
 root/.dsh/storages/
 root/.dsh/plugins/subscriptions/
 root/.dsh/.anonymous-user-id
+root/.dsh/attachments
+thinking-effort-loaded.json
+
+# Ingress logs
+root/.ingress-logs/
+root/.logs/
+
+# Agent exploration
+.agents/exploration/

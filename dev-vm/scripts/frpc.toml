@@ -6,4 +6,7 @@ name = "{{ .Envs.DEVVM_PROJECT_HOST }}"
 type = "http"
 localIP = "127.0.0.1"
 localPort = 10080
-customDomains = ["*.{{ .Envs.DEVVM_PROJECT_HOST }}.devvm.localhost"]
+customDomains = [
+	"*.{{ .Envs.DEVVM_PROJECT_HOST }}.devvm.localhost",
+	"*.{{ .Envs.DEVVM_PROJECT_HOST }}.devvm.internal",
+]

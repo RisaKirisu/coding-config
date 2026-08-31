@@ -1,0 +1,4 @@
+# DevVM Remote Sync bundle patch: inserts the Remote Sync host plugin by package name
+- insert:
+    - id: remote-sync
+      name: '@devvm/dsh-remote-sync'
