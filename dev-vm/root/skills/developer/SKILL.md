@@ -14,6 +14,7 @@ description: Developer guidelines. Agent MUST load this skill IMMEDIATELY when i
 
 ## Implementation Discipline
 - No scope creep. No new design decisions mid-implementation; unresolved choices -> `question` tool, even in autonomous mode.
+- Do NOT make changes unless user intends to. Distinguish between user asking a question and directing a change. NEVER jump the gun when user is only asking a possibility.
 
 ## Question Discipline
 - Ask only when an unresolved design choice would materially change architecture, behavior, ownership, persistence, public contracts, or tradeoffs. Otherwise pick the simplest reasonable interpretation and proceed.
