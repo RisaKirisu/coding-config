@@ -118,11 +118,18 @@ if [[ ! -f smolvm.toml ]]; then
 fi
 
 IMAGE="rust-dev-opencode-$DEVVM_ARCH.tar"
+STALE_INPUT=""
+if [[ -f "$IMAGE" ]]; then
+    STALE_INPUT="$(find Dockerfile scripts patches tmp -newer "$IMAGE" -print -quit 2>/dev/null)"
+fi
 if [[ "$SKIP_IMAGE" == "1" ]]; then
     echo "=== Skipping machine image build as requested ==="
-elif [[ -f "$IMAGE" ]]; then
-    echo "=== Machine image '$IMAGE' already exists, skipping build (run ./build.sh to rebuild) ==="
+elif [[ -f "$IMAGE" && -z "$STALE_INPUT" ]]; then
+    echo "=== Machine image '$IMAGE' is up to date, skipping build ==="
 else
+    if [[ -n "$STALE_INPUT" ]]; then
+        echo "=== '$STALE_INPUT' is newer than '$IMAGE', rebuilding ==="
+    fi
     echo "=== Building Machine Image ==="
     ./build.sh
 fi
