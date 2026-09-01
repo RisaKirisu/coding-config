@@ -7,7 +7,7 @@ FRPS_BIN="$HOME/.local/bin/frps"
 INSTALL_SERVICE=0
 SKIP_IMAGE=0
 SMOLVM_INSTALLER_URL="https://smolmachines.com/install.sh"
-SMOLVM_RELEASE_URL="https://api.github.com/repos/smol-machines/smolvm/releases/latest"
+SMOLVM_RELEASE_URL="https://github.com/smol-machines/smolvm/releases/latest"
 
 installed_smolvm_version() {
     if [[ -f "$HOME/.smolvm/.version" ]]; then
@@ -20,9 +20,8 @@ installed_smolvm_version() {
 }
 
 latest_smolvm_version() {
-    curl -fsSL "$SMOLVM_RELEASE_URL" \
-        | sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v?([^"]+)".*/\1/p' \
-        | head -1
+    curl -fsSLI -o /dev/null -w '%{url_effective}' "$SMOLVM_RELEASE_URL" \
+        | sed -nE 's#.*/releases/tag/v?([^/]+)$#\1#p'
 }
 
 # Parse command-line flags
