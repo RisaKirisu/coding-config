@@ -11,6 +11,7 @@ target/
 
 # Node.js
 node_modules/
+.pnpm-store/
 
 # DSH runtime state
 root/.dsh/sessions/

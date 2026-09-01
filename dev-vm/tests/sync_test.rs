@@ -251,11 +251,21 @@ async fn test_startup_reconciliation_clean_pull() {
         .await
         .unwrap();
 
-    // If SSH connection to dummy host fails, degraded sync kicks in or clean pull succeeds
-    assert!(
-        launch_res.status().is_success()
-            || launch_res.status() == StatusCode::INTERNAL_SERVER_ERROR
-    );
+    assert_eq!(launch_res.status(), StatusCode::OK);
+
+    let project_res = ctx
+        .client
+        .get(format!(
+            "http://{}/api/projects/{}",
+            ctx.server_addr, project_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(project_res.status(), StatusCode::OK);
+    let project: Value = project_res.json().await.unwrap();
+    assert_eq!(project["dsh_status"], "running");
+    assert_eq!(project["sync_status"], "synchronized");
 }
 
 #[tokio::test]

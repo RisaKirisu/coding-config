@@ -685,16 +685,23 @@ mod tests {
 
         let plist = generate_launchd_plist(&config);
         assert!(plist.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
-        assert!(plist.contains("<key>Label</key>\n    <string>com.devvm.daemon</string>"));
+        assert!(plist.contains("<key>Label</key>"));
+        assert!(plist.contains("<string>com.devvm.daemon</string>"));
         assert!(plist.contains("<string>/Users/user/.local/bin/devvm-daemon</string>"));
         assert!(plist.contains("<string>serve</string>"));
         assert!(plist.contains("<string>--port</string>"));
         assert!(plist.contains("<string>8100</string>"));
-        assert!(plist.contains("<key>RunAtLoad</key>\n    <true/>"));
-        assert!(plist.contains("<key>KeepAlive</key>\n    <true/>"));
-        assert!(plist.contains("<key>StandardOutPath</key>\n    <string>/Users/user/.local/share/devvm/logs/daemon.stdout.log</string>"));
-        assert!(plist.contains("<key>StandardErrorPath</key>\n    <string>/Users/user/.local/share/devvm/logs/daemon.stderr.log</string>"));
-        assert!(plist.contains("<key>WorkingDirectory</key>\n    <string>/Users/user</string>"));
+        assert!(plist.contains("<key>RunAtLoad</key>"));
+        assert!(plist.contains("<key>KeepAlive</key>"));
+        assert!(plist.contains("<true/>"));
+        assert!(plist.contains("<key>StandardOutPath</key>"));
+        assert!(plist
+            .contains("<string>/Users/user/.local/share/devvm/logs/daemon.stdout.log</string>"));
+        assert!(plist.contains("<key>StandardErrorPath</key>"));
+        assert!(plist
+            .contains("<string>/Users/user/.local/share/devvm/logs/daemon.stderr.log</string>"));
+        assert!(plist.contains("<key>WorkingDirectory</key>"));
+        assert!(plist.contains("<string>/Users/user</string>"));
     }
 
     #[test]

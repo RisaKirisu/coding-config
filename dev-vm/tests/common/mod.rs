@@ -13,40 +13,27 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tokio::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
-/// Mock `SyncRunner` implementation tracking all sync operations in atomic counters
-/// and providing failure/reachability toggles.
-pub struct MockSyncRunner {
+/// Fake `SyncRunner` providing deterministic reachability and transfer outcomes.
+pub struct FakeSyncRunner {
     pub vps_reachable: AtomicBool,
     pub rsync_fails: AtomicBool,
-    pub verify_count: AtomicUsize,
-    pub push_count: AtomicUsize,
-    pub pull_count: AtomicUsize,
-    pub delete_count: AtomicUsize,
-    pub deleted_projects: Mutex<Vec<Uuid>>,
 }
 
-impl MockSyncRunner {
+impl FakeSyncRunner {
     pub fn new() -> Self {
         Self {
             vps_reachable: AtomicBool::new(true),
             rsync_fails: AtomicBool::new(false),
-            verify_count: AtomicUsize::new(0),
-            push_count: AtomicUsize::new(0),
-            pull_count: AtomicUsize::new(0),
-            delete_count: AtomicUsize::new(0),
-            deleted_projects: Mutex::new(Vec::new()),
         }
     }
 }
 
 #[async_trait]
-impl SyncRunner for MockSyncRunner {
+impl SyncRunner for FakeSyncRunner {
     async fn verify_connection(&self, _config: &SyncConfig) -> Result<(), SyncError> {
-        self.verify_count.fetch_add(1, Ordering::SeqCst);
         if self.vps_reachable.load(Ordering::SeqCst) {
             Ok(())
         } else {
@@ -62,7 +49,6 @@ impl SyncRunner for MockSyncRunner {
         _project_id: Uuid,
         _project_path: &Path,
     ) -> Result<(), SyncError> {
-        self.push_count.fetch_add(1, Ordering::SeqCst);
         if !self.vps_reachable.load(Ordering::SeqCst) || self.rsync_fails.load(Ordering::SeqCst) {
             Err(SyncError::PushFailed(
                 "rsync push connection timed out".to_string(),
@@ -78,7 +64,6 @@ impl SyncRunner for MockSyncRunner {
         _project_id: Uuid,
         project_path: &Path,
     ) -> Result<(), SyncError> {
-        self.pull_count.fetch_add(1, Ordering::SeqCst);
         if !self.vps_reachable.load(Ordering::SeqCst) || self.rsync_fails.load(Ordering::SeqCst) {
             Err(SyncError::PullFailed(
                 "rsync pull connection timed out".to_string(),
@@ -95,16 +80,13 @@ impl SyncRunner for MockSyncRunner {
     async fn delete_remote_store(
         &self,
         _config: &SyncConfig,
-        project_id: Uuid,
+        _project_id: Uuid,
     ) -> Result<(), SyncError> {
-        self.delete_count.fetch_add(1, Ordering::SeqCst);
         if !self.vps_reachable.load(Ordering::SeqCst) {
             Err(SyncError::DeletionFailed(
                 "Failed to connect to VPS for deletion".to_string(),
             ))
         } else {
-            let mut list = self.deleted_projects.lock().await;
-            list.push(project_id);
             Ok(())
         }
     }
@@ -167,6 +149,9 @@ case "$cmd" in
         fi
         ;;
     start)
+        if [[ -f ".vm_start_slow" ]]; then
+            sleep 0.4
+        fi
         touch ".vm_running"
         echo "Mock DevVM: started"
         exit 0
@@ -186,8 +171,16 @@ case "$cmd" in
             shift
         fi
         if [[ "$1" == "dsh" && "$2" == "web" ]] || [[ "$*" == *"dsh web"* ]]; then
+            mock_pid_file="$PWD/.mock_dsh.pid"
+            printf '%s\n' "$$" > "$mock_pid_file"
+            trap 'rm -f "$mock_pid_file"' EXIT
             if [[ -f ".dsh_start_slow" ]]; then
                 sleep 0.4
+            fi
+            if [[ -f ".dsh_never_ready" ]]; then
+                while true; do
+                    sleep 0.1
+                done
             fi
             echo "dsh web: http://127.0.0.1:3080"
             if [[ -f ".dsh_fail_fast" ]]; then
@@ -212,6 +205,10 @@ case "$cmd" in
 
         if [[ "$1" == "/bin/sh" || "$1" == "/bin/bash" ]] && [[ "$2" == "-c" ]]; then
             cmd_body="$3"
+            if [[ "$cmd_body" == *"/tmp/devvm-daemon-dsh.pid"* ]]; then
+                rm -f "$PWD/.mock_dsh.pid"
+                exit 0
+            fi
             mapped_cmd="${cmd_body//\/root\/.dsh/$VM_DSH}"
             eval "$mapped_cmd"
             exit $?

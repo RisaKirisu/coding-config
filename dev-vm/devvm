@@ -77,20 +77,25 @@ exists() {
     smolvm machine status --name "$NAME" >/dev/null 2>&1
 }
 
+running() {
+    smolvm machine status --name "$NAME" 2>/dev/null | grep -qw running
+}
+
 create() {
     ensure_project_id
-    ensure_ingress
-    if ! exists; then
-        echo "Creating $NAME"
-        smolvm machine create \
-             --name "$NAME" \
-             -s "$SMOLFILE" \
-             --net-backend virtio-net \
-             --image "$IMAGE" \
-             -e "DEVVM_PROJECT_HOST=$PROJECT_HOST" \
-             -v "$PROJECT_DIR:/root/workspace" \
-             -v "$DEVVM_ROOT:/devvm-root"
+    if exists; then
+        return
     fi
+
+    echo "Creating $NAME"
+    smolvm machine create \
+         --name "$NAME" \
+         -s "$SMOLFILE" \
+         --net-backend virtio-net \
+         --image "$IMAGE" \
+         -e "DEVVM_PROJECT_HOST=$PROJECT_HOST" \
+         -v "$PROJECT_DIR:/root/workspace" \
+         -v "$DEVVM_ROOT:/devvm-root"
 }
 
 link_root() {
@@ -127,8 +132,12 @@ link_root() {
             ln -s "$source" "$target"
         done
 
-        if command -v dsh >/dev/null 2>&1 && [[ -f /root/.dsh/profiles/web/package.json ]]; then
-            DSH_HOME=/root/.dsh dsh plugin --profile web install --frozen-lockfile
+        profile=/root/.dsh/profiles/web
+        if command -v dsh >/dev/null 2>&1 \
+            && [[ -f "$profile/package.json" ]] \
+            && { [[ ! -f "$profile/node_modules/.pnpm/lock.yaml" ]] \
+                || ! cmp -s "$profile/pnpm-lock.yaml" "$profile/node_modules/.pnpm/lock.yaml"; }; then
+            CI=true DSH_HOME=/root/.dsh dsh plugin --profile web install --frozen-lockfile
         fi
     ' link-root
 }
@@ -138,6 +147,11 @@ start_ingress() {
 }
 
 start() {
+    if running; then
+        return
+    fi
+
+    ensure_ingress
     smolvm machine start --name "$NAME"
     start_ingress
     link_root

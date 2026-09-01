@@ -141,6 +141,38 @@ async fn test_dns_server_resolution_and_wildcards() {
     assert_eq!(resp.rcode, 3); // NXDomain
     assert_eq!(resp.ancount, 0);
 
-    // Shut down server
+    let _ = shutdown_tx.send(true);
+
+    // Case 7: Matched AAAA query without configured IPv6 target returns NODATA.
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = socket.local_addr().unwrap();
+    let config = DnsConfig {
+        bind_addr: server_addr.to_string(),
+        target_ip,
+        domain: "devvm.internal".to_string(),
+        target_ipv6: None,
+        ttl: 120,
+    };
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        DnsServer::run_with_socket(socket, config, Some(shutdown_rx))
+            .await
+            .unwrap();
+    });
+
+    let query = build_dns_query(0x1007, "devvm.internal", 28);
+    client_socket.send_to(&query, server_addr).await.unwrap();
+    let (len, _) = tokio::time::timeout(
+        Duration::from_secs(1),
+        client_socket.recv_from(&mut recv_buf),
+    )
+    .await
+    .expect("DNS response timeout")
+    .unwrap();
+    let resp = parse_dns_response(&recv_buf[..len]);
+    assert_eq!(resp.tx_id, 0x1007);
+    assert_eq!(resp.rcode, 0);
+    assert_eq!(resp.ancount, 0);
+
     let _ = shutdown_tx.send(true);
 }

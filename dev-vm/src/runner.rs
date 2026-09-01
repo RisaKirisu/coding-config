@@ -2,12 +2,15 @@ use crate::config::DaemonConfig;
 use crate::logs::append_log;
 use crate::models::VmStatus;
 use std::path::Path;
+use std::process::Stdio;
 use tokio::process::Command;
 use uuid::Uuid;
 
 pub async fn check_vm_status(config: &DaemonConfig, project_path: &Path) -> VmStatus {
     let mut cmd = Command::new(&config.devvm_bin);
-    cmd.arg("status").current_dir(project_path);
+    cmd.arg("status")
+        .current_dir(project_path)
+        .stdin(Stdio::null());
 
     match cmd.output().await {
         Ok(output) => {
@@ -42,7 +45,9 @@ async fn run_devvm_command(
         &format!("Invoking `{}`", cmd_desc),
     );
     let mut cmd = Command::new(&config.devvm_bin);
-    cmd.arg(subcmd).current_dir(project_path);
+    cmd.arg(subcmd)
+        .current_dir(project_path)
+        .stdin(Stdio::null());
 
     match cmd.output().await {
         Ok(output) => {

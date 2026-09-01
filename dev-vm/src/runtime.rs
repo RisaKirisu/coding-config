@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{oneshot, Mutex};
@@ -14,6 +15,7 @@ use uuid::Uuid;
 
 const DSH_LAUNCH_COMMAND: &str =
     "cd /root/workspace && echo $$ > /tmp/devvm-daemon-dsh.pid && exec dsh web";
+const DSH_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const DSH_STOP_COMMAND: &str = r#"
 pid_file=/tmp/devvm-daemon-dsh.pid
 if [ -s "$pid_file" ]; then
@@ -58,9 +60,7 @@ pub struct DshRuntimeManager {
 
 impl DshRuntimeManager {
     pub fn new() -> Self {
-        Self {
-            states: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self::default()
     }
 
     pub async fn get_status(&self, project_id: Uuid) -> DshStatus {
@@ -81,6 +81,7 @@ impl DshRuntimeManager {
         project_id: Uuid,
         project_path: &Path,
     ) -> Result<(), String> {
+        let (stop_tx, mut stop_rx) = oneshot::channel::<StopResultSender>();
         {
             let mut states = self.states.lock().await;
             match states.get(&project_id) {
@@ -92,13 +93,29 @@ impl DshRuntimeManager {
                 }
                 _ => {}
             }
-            states.insert(project_id, ProcessState::Starting { stop_tx: None });
+            states.insert(
+                project_id,
+                ProcessState::Starting {
+                    stop_tx: Some(stop_tx),
+                },
+            );
         }
 
-        if let Err(error) = self
-            .prepare_launch(config, sync_manager, project_id, project_path)
-            .await
-        {
+        let prepare_result = tokio::select! {
+            result = self.prepare_launch(config, sync_manager, project_id, project_path) => result,
+            stop_result_tx = &mut stop_rx => {
+                self.states
+                    .lock()
+                    .await
+                    .insert(project_id, ProcessState::Stopped);
+                if let Ok(tx) = stop_result_tx {
+                    let _ = tx.send(Ok(()));
+                }
+                return Err("DSH launch was stopped".to_string());
+            }
+        };
+
+        if let Err(error) = prepare_result {
             self.states
                 .lock()
                 .await
@@ -121,6 +138,7 @@ impl DshRuntimeManager {
             .arg("-c")
             .arg(DSH_LAUNCH_COMMAND)
             .current_dir(project_path)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -138,7 +156,6 @@ impl DshRuntimeManager {
         };
 
         let (ready_tx, mut ready_rx) = oneshot::channel::<()>();
-        let (stop_tx, mut stop_rx) = oneshot::channel::<StopResultSender>();
         let (startup_tx, startup_rx) = oneshot::channel::<Result<(), String>>();
 
         if let Some(stdout) = child.stdout.take() {
@@ -167,13 +184,6 @@ impl DshRuntimeManager {
                 }
             });
         }
-
-        self.states.lock().await.insert(
-            project_id,
-            ProcessState::Starting {
-                stop_tx: Some(stop_tx),
-            },
-        );
 
         let config_clone = config.clone();
         let project_path = project_path.to_path_buf();
@@ -220,6 +230,25 @@ impl DshRuntimeManager {
                             let _ = startup_tx.send(Err(message));
                         }
                     }
+                }
+                _ = tokio::time::sleep(DSH_STARTUP_TIMEOUT) => {
+                    let message = format!(
+                        "DSH startup timed out after {} seconds",
+                        DSH_STARTUP_TIMEOUT.as_secs()
+                    );
+                    let _ = append_log(
+                        &config_clone.log_dir,
+                        project_id,
+                        "daemon:error",
+                        &message,
+                    );
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    states
+                        .lock()
+                        .await
+                        .insert(project_id, ProcessState::Failed(message.clone()));
+                    let _ = startup_tx.send(Err(message));
                 }
                 stop_result_tx = &mut stop_rx => {
                     let result = stop_managed_process(
@@ -320,7 +349,8 @@ async fn stop_dsh_inside_vm(
         .arg("/bin/bash")
         .arg("-c")
         .arg(DSH_STOP_COMMAND)
-        .current_dir(project_path);
+        .current_dir(project_path)
+        .stdin(Stdio::null());
 
     let output = command
         .output()

@@ -6,6 +6,24 @@ FRP_VERSION=0.71.0
 FRPS_BIN="$HOME/.local/bin/frps"
 INSTALL_SERVICE=0
 SKIP_IMAGE=0
+SMOLVM_INSTALLER_URL="https://smolmachines.com/install.sh"
+SMOLVM_RELEASE_URL="https://api.github.com/repos/smol-machines/smolvm/releases/latest"
+
+installed_smolvm_version() {
+    if [[ -f "$HOME/.smolvm/.version" ]]; then
+        tr -d '[:space:]' < "$HOME/.smolvm/.version"
+    elif command -v smolvm >/dev/null 2>&1; then
+        smolvm --version 2>/dev/null \
+            | sed -nE 's/.*v?([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' \
+            | head -1
+    fi
+}
+
+latest_smolvm_version() {
+    curl -fsSL "$SMOLVM_RELEASE_URL" \
+        | sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v?([^"]+)".*/\1/p' \
+        | head -1
+}
 
 # Parse command-line flags
 while [[ $# -gt 0 ]]; do
@@ -42,12 +60,23 @@ mkdir -p "$HOME/.local/bin"
 mkdir -p "$DEVVM_HOME/root/.config/devvm"
 install -d -m 0700 "$DEVVM_HOME/root/.ssh"
 
-echo "=== Checking smolvm ==="
-if ! command -v smolvm >/dev/null 2>&1; then
-    echo "Installing smolvm..."
-    curl -sSL https://smolmachines.com/install.sh | bash
+echo "=== Installing or upgrading smolvm ==="
+LATEST_SMOLVM_VERSION="$(latest_smolvm_version)"
+if [[ -z "$LATEST_SMOLVM_VERSION" ]]; then
+    echo "Failed to determine the latest smolvm release." >&2
+    exit 1
+fi
+CURRENT_SMOLVM_VERSION="$(installed_smolvm_version)"
+if [[ "$CURRENT_SMOLVM_VERSION" == "$LATEST_SMOLVM_VERSION" ]]; then
+    echo "smolvm $CURRENT_SMOLVM_VERSION is already up to date."
 else
-    echo "smolvm is already installed."
+    if [[ -n "$CURRENT_SMOLVM_VERSION" ]]; then
+        echo "Upgrading smolvm $CURRENT_SMOLVM_VERSION -> $LATEST_SMOLVM_VERSION..."
+    else
+        echo "Installing smolvm $LATEST_SMOLVM_VERSION..."
+    fi
+    curl -fsSL "$SMOLVM_INSTALLER_URL" \
+        | bash -s -- --version "$LATEST_SMOLVM_VERSION"
 fi
 
 case "$(uname -s)" in
@@ -105,8 +134,14 @@ ln -sfn "$DEVVM_HOME/devvm" "$HOME/.local/bin/devvm"
 echo "=== Building and installing devvm-daemon ==="
 if command -v cargo >/dev/null 2>&1; then
     cargo build --release
-    install -m 0755 "$DEVVM_HOME/target/release/devvm-daemon" "$HOME/.local/bin/devvm-daemon"
-    echo "Installed devvm-daemon to $HOME/.local/bin/devvm-daemon"
+    BUILT_DAEMON="$DEVVM_HOME/target/release/devvm-daemon"
+    INSTALLED_DAEMON="$HOME/.local/bin/devvm-daemon"
+    if [[ -f "$INSTALLED_DAEMON" ]] && cmp -s "$BUILT_DAEMON" "$INSTALLED_DAEMON"; then
+        echo "devvm-daemon is already up to date."
+    else
+        install -m 0755 "$BUILT_DAEMON" "$INSTALLED_DAEMON"
+        echo "Installed or upgraded devvm-daemon at $INSTALLED_DAEMON"
+    fi
 else
     echo "Warning: cargo not found. Please install Rust to build devvm-daemon." >&2
 fi

@@ -83,16 +83,26 @@ fn read_file_tail(path: &Path, max_bytes: usize) -> Option<String> {
     }
 
     let mut file = File::open(path).ok()?;
-    let metadata = file.metadata().ok()?;
-    let file_len = metadata.len() as usize;
+    let file_len = file.metadata().ok()?.len() as usize;
+    let start = file_len.saturating_sub(max_bytes);
 
-    if file_len > max_bytes {
-        let seek_offset = (file_len - max_bytes) as u64;
-        let _ = file.seek(SeekFrom::Start(seek_offset));
+    if start > 0 {
+        file.seek(SeekFrom::Start((start - 1) as u64)).ok()?;
     }
 
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer).ok()?;
+
+    if start > 0 {
+        if buffer.first() == Some(&b'\n') {
+            buffer.remove(0);
+        } else if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+            buffer.drain(..=newline);
+        } else {
+            buffer.clear();
+        }
+    }
+
     Some(String::from_utf8_lossy(&buffer).into_owned())
 }
 
@@ -110,10 +120,14 @@ pub fn append_log(log_dir: &Path, project_id: Uuid, source: &str, message: &str)
         Err(_) => "0".to_string(),
     };
 
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut entry = String::new();
     for line in message.lines() {
-        writeln!(file, "[{}] [{}] {}", timestamp, source, line)?;
+        writeln!(entry, "[{}] [{}] {}", timestamp, source, line)
+            .expect("writing to a String cannot fail");
     }
+
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    file.write_all(entry.as_bytes())?;
     file.flush()?;
     Ok(())
 }
@@ -121,22 +135,15 @@ pub fn append_log(log_dir: &Path, project_id: Uuid, source: &str, message: &str)
 pub fn read_recent_logs(log_dir: &Path, project_id: Uuid, max_bytes: usize) -> String {
     let project_log_str = read_file_tail(&project_log_path(log_dir, project_id), max_bytes);
 
-    let mut ingress_log_str = None;
-    for candidate in ingress_log_candidates(log_dir, project_id) {
-        if candidate.exists() {
-            if let Some(content) = read_file_tail(&candidate, max_bytes) {
-                if !content.trim().is_empty() {
-                    ingress_log_str = Some(content);
-                    break;
-                }
-            }
-        }
-    }
-
-    let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => format!("{}", d.as_secs()),
-        Err(_) => "0".to_string(),
-    };
+    let ingress_log_str = ingress_log_candidates(log_dir, project_id)
+        .into_iter()
+        .filter_map(|path| {
+            let modified = path.metadata().ok()?.modified().ok()?;
+            let content = read_file_tail(&path, max_bytes)?;
+            (!content.trim().is_empty()).then_some((modified, content))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, content)| content);
 
     match (project_log_str, ingress_log_str) {
         (Some(mut p_logs), Some(i_logs)) => {
@@ -144,7 +151,7 @@ pub fn read_recent_logs(log_dir: &Path, project_id: Uuid, max_bytes: usize) -> S
                 p_logs.push('\n');
             }
             for line in i_logs.lines() {
-                let _ = writeln!(p_logs, "[{}] [ingress] {}", timestamp, line);
+                let _ = writeln!(p_logs, "[ingress] {}", line);
             }
             p_logs
         }
@@ -152,7 +159,7 @@ pub fn read_recent_logs(log_dir: &Path, project_id: Uuid, max_bytes: usize) -> S
         (None, Some(i_logs)) => {
             let mut formatted = String::new();
             for line in i_logs.lines() {
-                let _ = writeln!(formatted, "[{}] [ingress] {}", timestamp, line);
+                let _ = writeln!(formatted, "[ingress] {}", line);
             }
             formatted
         }
@@ -180,18 +187,27 @@ mod tests {
     }
 
     #[test]
-    fn test_log_read_multibyte_utf8_offset() {
+    fn test_log_tail_starts_at_a_complete_entry() {
         let dir = tempdir().unwrap();
         let log_dir = dir.path().join("logs");
         let project_id = Uuid::new_v4();
 
-        // Write unicode characters (🦀 is 4 bytes)
-        append_log(&log_dir, project_id, "test", "Hello 🦀 Rust").unwrap();
+        for index in 0..20 {
+            append_log(
+                &log_dir,
+                project_id,
+                "test",
+                &format!("entry {index}: Hello 🦀 Rust"),
+            )
+            .unwrap();
+        }
 
-        // Read with small byte limit that cuts into middle of UTF-8 sequence
-        let logs = read_recent_logs(&log_dir, project_id, 8);
-        assert!(!logs.is_empty());
-        assert!(logs.contains("Rust"));
+        let logs = read_recent_logs(&log_dir, project_id, 120);
+        assert!(logs.starts_with('['), "log tail began mid-entry: {logs:?}");
+        assert!(
+            !logs.starts_with('�'),
+            "log tail began mid-character: {logs:?}"
+        );
     }
 
     #[test]
@@ -213,7 +229,10 @@ mod tests {
 
         let logs = read_recent_logs(&log_dir, project_id, 65536);
         assert!(logs.contains("[daemon] Starting VM"));
-        assert!(logs.contains("[ingress]"));
+        assert!(
+            logs.lines().any(|line| line.starts_with("[ingress] ")),
+            "ingress lines must keep their own timestamp instead of receiving a read-time timestamp: {logs}"
+        );
         assert!(logs.contains("start proxy success"));
     }
 

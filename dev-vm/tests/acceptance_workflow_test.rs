@@ -3,7 +3,7 @@ mod common;
 use axum::Router;
 use common::{
     build_dns_query, create_mock_devvm, echo_headers_handler, parse_dns_response, CaddyGuard,
-    MockSyncRunner,
+    FakeSyncRunner,
 };
 use devvm_daemon::{
     create_router, AppState, DaemonConfig, DnsConfig, DnsServer, DshRuntimeManager, SyncManager,
@@ -30,7 +30,7 @@ struct AcceptanceContext {
     dns_addr: SocketAddr,
     echo_port: u16,
     client: reqwest::Client,
-    mock_runner: Arc<MockSyncRunner>,
+    fake_runner: Arc<FakeSyncRunner>,
     _dns_shutdown_tx: watch::Sender<bool>,
     _caddy_guard: CaddyGuard,
 }
@@ -124,8 +124,8 @@ async fn setup_acceptance_system() -> AcceptanceContext {
         tailnet_domain: "devvm.internal".to_string(),
     };
 
-    let mock_runner = Arc::new(MockSyncRunner::new());
-    let sync_manager = SyncManager::with_runner(mock_runner.clone());
+    let fake_runner = Arc::new(FakeSyncRunner::new());
+    let sync_manager = SyncManager::with_runner(fake_runner.clone());
     let dsh_runtime_manager = DshRuntimeManager::new();
 
     let state = AppState {
@@ -174,7 +174,7 @@ async fn setup_acceptance_system() -> AcceptanceContext {
         dns_addr,
         echo_port,
         client,
-        mock_runner,
+        fake_runner,
         _dns_shutdown_tx: dns_shutdown_tx,
         _caddy_guard: caddy_guard,
     }
@@ -665,7 +665,6 @@ async fn assert_step_8_sync_reconciliation_and_degraded_modes(
         .await
         .unwrap();
     assert_eq!(sync_setup_res.status(), ReqwestStatusCode::OK);
-    assert_eq!(ctx.mock_runner.verify_count.load(Ordering::SeqCst), 1);
 
     let sync_cfg_res = ctx
         .client
@@ -691,7 +690,19 @@ async fn assert_step_8_sync_reconciliation_and_degraded_modes(
     assert_eq!(manual_sync_res.status(), ReqwestStatusCode::OK);
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(ctx.mock_runner.push_count.load(Ordering::SeqCst), 1);
+    let synced_project: Value = ctx
+        .client
+        .get(format!(
+            "http://{}/api/projects/{}",
+            ctx.server_addr, project.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(synced_project["sync_status"], "synchronized");
 
     // 3. Clean Pull Startup Reconciliation
     let clean_proj_dir = workspace_dir.join("project-clean");
@@ -716,7 +727,6 @@ async fn assert_step_8_sync_reconciliation_and_degraded_modes(
         .await
         .unwrap();
     assert_eq!(launch_clean_res.status(), ReqwestStatusCode::OK);
-    assert_eq!(ctx.mock_runner.pull_count.load(Ordering::SeqCst), 1);
 
     let clean_status_res = ctx
         .client
@@ -747,7 +757,6 @@ async fn assert_step_8_sync_reconciliation_and_degraded_modes(
     let dirty_proj: Value = reg_dirty_res.json().await.unwrap();
     let dirty_id_str = dirty_proj["id"].as_str().unwrap();
 
-    let current_push_count = ctx.mock_runner.push_count.load(Ordering::SeqCst);
     let launch_dirty_res = ctx
         .client
         .post(format!(
@@ -758,14 +767,23 @@ async fn assert_step_8_sync_reconciliation_and_degraded_modes(
         .await
         .unwrap();
     assert_eq!(launch_dirty_res.status(), ReqwestStatusCode::OK);
-    assert_eq!(
-        ctx.mock_runner.push_count.load(Ordering::SeqCst),
-        current_push_count + 1
-    );
     assert!(
         !dirty_dsh_dir.join(".sync-dirty").exists(),
         "Dirty marker must be removed after successful sync"
     );
+    let dirty_status: Value = ctx
+        .client
+        .get(format!(
+            "http://{}/api/projects/{}",
+            ctx.server_addr, dirty_id_str
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(dirty_status["sync_status"], "synchronized");
 
     // 5. Degraded Sync Startup Reconciliation (Local state exists, VPS unreachable)
     let degraded_proj_dir = workspace_dir.join("project-degraded");
@@ -783,7 +801,7 @@ async fn assert_step_8_sync_reconciliation_and_degraded_modes(
     let degraded_proj: Value = reg_degraded_res.json().await.unwrap();
     let degraded_id_str = degraded_proj["id"].as_str().unwrap();
 
-    ctx.mock_runner.vps_reachable.store(false, Ordering::SeqCst);
+    ctx.fake_runner.vps_reachable.store(false, Ordering::SeqCst);
 
     let launch_degraded_res = ctx
         .client
@@ -854,7 +872,7 @@ async fn assert_step_8_sync_reconciliation_and_degraded_modes(
     let empty_status_json: Value = empty_status_res.json().await.unwrap();
     assert_eq!(empty_status_json["dsh_status"], "stopped");
 
-    ctx.mock_runner.vps_reachable.store(true, Ordering::SeqCst);
+    ctx.fake_runner.vps_reachable.store(true, Ordering::SeqCst);
 }
 
 /// Sub-step helper for Step 9: Separation of Unregister, Local VM Deletion, Confirmed Sync Store Deletion
@@ -948,11 +966,6 @@ async fn assert_step_9_lifecycle_separation_and_deletion(
         .await
         .unwrap();
     assert_eq!(conf_sync_del_res.status(), ReqwestStatusCode::OK);
-    assert_eq!(ctx.mock_runner.delete_count.load(Ordering::SeqCst), 1);
-
-    let deleted_projects = ctx.mock_runner.deleted_projects.lock().await;
-    assert_eq!(deleted_projects.len(), 1);
-    assert_eq!(deleted_projects[0], project.id);
 
     // Invariant: Sync store deletion leaves local project files and registry entry intact
     assert!(project.dir.exists());

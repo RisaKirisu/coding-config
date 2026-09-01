@@ -6,7 +6,7 @@
 
 **Status:** resolved
 
-- [x] One setup entry point installs or configures the existing DevVM dependencies plus the Control Daemon, DSH plugin, ingress changes, DNS mode, and synchronization setup integration.
+- [x] One setup entry point installs or upgrades SmolVM and the Control Daemon, skips already-current versions, and configures the DSH plugin, ingress changes, DNS mode, and synchronization setup integration.
 - [x] Foreground Control Daemon operation remains available without enabling a service.
 - [x] Linux offers optional systemd user integration.
 - [x] macOS offers optional launchd user integration.

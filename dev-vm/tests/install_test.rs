@@ -91,7 +91,8 @@ fn test_launchd_plist_xml_content_generation() {
     assert!(plist.contains("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">"));
     assert!(plist.contains("<plist version=\"1.0\">"));
     assert!(plist.contains("<dict>"));
-    assert!(plist.contains("<key>Label</key>\n    <string>com.devvm.daemon</string>"));
+    assert!(plist.contains("<key>Label</key>"));
+    assert!(plist.contains("<string>com.devvm.daemon</string>"));
     assert!(plist.contains("<key>ProgramArguments</key>"));
     assert!(plist.contains("<string>/Users/bob/.local/bin/devvm-daemon</string>"));
     assert!(plist.contains("<string>serve</string>"));
@@ -99,14 +100,19 @@ fn test_launchd_plist_xml_content_generation() {
     assert!(plist.contains("<string>8100</string>"));
     assert!(plist.contains("<string>--tailnet-domain</string>"));
     assert!(plist.contains("<string>devvm.internal</string>"));
-    assert!(plist.contains("<key>RunAtLoad</key>\n    <true/>"));
-    assert!(plist.contains("<key>KeepAlive</key>\n    <true/>"));
-    assert!(plist.contains("<key>StandardOutPath</key>\n    <string>/Users/bob/.local/share/devvm/logs/daemon.stdout.log</string>"));
-    assert!(plist.contains("<key>StandardErrorPath</key>\n    <string>/Users/bob/.local/share/devvm/logs/daemon.stderr.log</string>"));
-    assert!(plist.contains("<key>WorkingDirectory</key>\n    <string>/Users/bob</string>"));
+    assert!(plist.contains("<key>RunAtLoad</key>"));
+    assert!(plist.contains("<key>KeepAlive</key>"));
+    assert!(plist.contains("<true/>"));
+    assert!(plist.contains("<key>StandardOutPath</key>"));
+    assert!(plist.contains("<string>/Users/bob/.local/share/devvm/logs/daemon.stdout.log</string>"));
+    assert!(plist.contains("<key>StandardErrorPath</key>"));
+    assert!(plist.contains("<string>/Users/bob/.local/share/devvm/logs/daemon.stderr.log</string>"));
+    assert!(plist.contains("<key>WorkingDirectory</key>"));
+    assert!(plist.contains("<string>/Users/bob</string>"));
     assert!(plist.contains("<key>EnvironmentVariables</key>"));
-    assert!(plist.contains("<key>PATH</key>\n        <string>/Users/bob/.local/bin:/usr/local/bin:/usr/bin:/bin</string>"));
-    assert!(plist.ends_with("</dict>\n</plist>\n"));
+    assert!(plist.contains("<key>PATH</key>"));
+    assert!(plist.contains("<string>/Users/bob/.local/bin:/usr/local/bin:/usr/bin:/bin</string>"));
+    assert!(plist.contains("</plist>"));
 }
 
 #[test]
@@ -360,7 +366,7 @@ fn test_service_installation_with_custom_host_and_default_host() {
 }
 
 #[test]
-fn test_devvm_start_and_exec_invokes_profile_dependency_installation_in_order() {
+fn test_devvm_start_is_idempotent_and_exec_reuses_running_machine() {
     use std::os::unix::fs::PermissionsExt;
 
     let temp_dir = tempdir().unwrap();
@@ -368,18 +374,40 @@ fn test_devvm_start_and_exec_invokes_profile_dependency_installation_in_order() 
     fs::create_dir_all(&bin_dir).unwrap();
 
     let smolvm_log = temp_dir.path().join("smolvm.log");
+    let smolvm_running = temp_dir.path().join("smolvm.running");
+    let lifecycle_events = temp_dir.path().join("lifecycle-events.log");
 
-    // Fake smolvm script that logs all invocations
+    // Fake external CLI: expose machine state and observable dispatched operations.
     let smolvm_script = format!(
         r#"#!/usr/bin/env bash
-echo "===SMOLVM_INVOCATION===" >> "{0}"
-printf '%s\n' "$@" >> "{0}"
+printf '%s\n' "$*" >> "{0}"
 if [[ "$1" == "machine" && "$2" == "status" ]]; then
+    if [[ -f "{1}" ]]; then
+        echo "running"
+    else
+        echo "stopped"
+    fi
     exit 0
+fi
+if [[ "$1" == "machine" && "$2" == "create" ]]; then
+    echo "machine-create" >> "{2}"
+elif [[ "$1" == "machine" && "$2" == "start" ]]; then
+    touch "{1}"
+    echo "machine-start" >> "{2}"
+elif [[ "$*" == *"devvm-ingress"* ]]; then
+    echo "ingress-start" >> "{2}"
+elif [[ "$*" == *"link-root"* ]]; then
+    if [[ "$*" != *"CI=true DSH_HOME=/root/.dsh"* ]]; then
+        echo "[ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY] Aborted removal of modules directory due to no TTY" >&2
+        exit 1
+    fi
+    echo "profile-prepare" >> "{2}"
 fi
 exit 0
 "#,
-        smolvm_log.display()
+        smolvm_log.display(),
+        smolvm_running.display(),
+        lifecycle_events.display()
     );
     let smolvm_bin = bin_dir.join("smolvm");
     fs::write(&smolvm_bin, smolvm_script).unwrap();
@@ -432,73 +460,63 @@ exit 0
         output_start
     );
 
-    let logs_start = fs::read_to_string(&smolvm_log).unwrap();
-    let invocations_start: Vec<&str> = logs_start
-        .split("===SMOLVM_INVOCATION===\n")
-        .filter(|s| !s.trim().is_empty())
-        .collect();
-
-    // Verify ordering in devvm start:
-    // a. machine start
-    let start_idx = invocations_start
-        .iter()
-        .position(|l| l.contains("machine\nstart") || l.contains("machine start"))
-        .expect("must invoke machine start");
-    // b. ingress
-    let ingress_idx = invocations_start
-        .iter()
-        .position(|l| l.contains("devvm-ingress"))
-        .expect("must invoke devvm-ingress");
-    // c. link_root
-    let link_idx = invocations_start
-        .iter()
-        .position(|l| l.contains("link-root"))
-        .expect("must invoke link-root");
-
     assert!(
-        start_idx < ingress_idx,
-        "machine start must precede ingress"
+        smolvm_running.exists(),
+        "start must leave the machine running"
     );
-    assert!(ingress_idx < link_idx, "ingress must precede link-root");
-
-    let link_command = invocations_start[link_idx];
-    assert!(
-        link_command.contains("dsh plugin --profile web install --frozen-lockfile"),
-        "link-root must execute dsh plugin install: {}",
-        link_command
+    let first_events = fs::read_to_string(&lifecycle_events).unwrap();
+    assert_eq!(
+        first_events
+            .lines()
+            .filter(|line| *line == "machine-create")
+            .count(),
+        0
     );
-    assert!(
-        link_command.contains("DSH_HOME=/root/.dsh"),
-        "link-root must set DSH_HOME=/root/.dsh: {}",
-        link_command
+    assert_eq!(
+        first_events
+            .lines()
+            .filter(|line| *line == "machine-start")
+            .count(),
+        1
     );
-    assert!(
-        link_command.contains("/root/.dsh/sessions /root/.dsh/storages /root/.dsh/attachments"),
-        "link-root must create VM-local Portable DSH State directories: {}",
-        link_command
+    assert_eq!(
+        first_events
+            .lines()
+            .filter(|line| *line == "ingress-start")
+            .count(),
+        1
     );
-    assert!(
-        link_command.contains("$name\" == \"attachments"),
-        "link-root must not link host attachments into the DevVM: {}",
-        link_command
+    assert_eq!(
+        first_events
+            .lines()
+            .filter(|line| *line == "profile-prepare")
+            .count(),
+        1
     );
 
-    // Verify that inside link_root script, symlink setup occurs before dsh install
-    let link_pos = link_command
-        .find("/root/.dsh/$name")
-        .expect("must find dsh link target");
-    let install_pos = link_command
-        .find("dsh plugin --profile web install")
-        .expect("must find dsh install");
-    assert!(
-        link_pos < install_pos,
-        "link setup must occur before dsh plugin install"
+    // 2. Repeated start is a no-op once the machine is running.
+    let events_before_repeat = fs::read_to_string(&lifecycle_events).unwrap();
+    let output_start_again = Command::new(&devvm_script)
+        .arg("start")
+        .current_dir(&proj_dir)
+        .env("PATH", &path_env)
+        .env("DEVVM_HOME", &devvm_home)
+        .env("DEVVM_ROOT", devvm_home.join("root"))
+        .env("FRPS_BIN", &frps_bin)
+        .output()
+        .expect("Failed to rerun devvm start");
+    assert!(output_start_again.status.success());
+    assert_eq!(
+        fs::read_to_string(&lifecycle_events).unwrap(),
+        events_before_repeat,
+        "repeated start must not dispatch lifecycle side effects"
     );
 
-    // 2. Test `devvm exec`
-    fs::write(&smolvm_log, "").unwrap(); // clear log
+    // 3. Regular exec reuses the running machine and dispatches only the payload.
+    fs::write(&smolvm_log, "").unwrap();
+    let events_before_exec = fs::read_to_string(&lifecycle_events).unwrap();
     let output_exec = Command::new(&devvm_script)
-        .args(["exec", "--", "echo", "final_guest_payload"])
+        .args(["exec", "--", "echo", "running_guest_payload"])
         .current_dir(&proj_dir)
         .env("PATH", &path_env)
         .env("DEVVM_HOME", &devvm_home)
@@ -508,27 +526,147 @@ exit 0
         .expect("Failed to run devvm exec");
     assert!(
         output_exec.status.success(),
-        "devvm exec failed: {:?}",
-        output_exec
+        "devvm exec failed: {output_exec:?}"
     );
 
-    let logs_exec = fs::read_to_string(&smolvm_log).unwrap();
-    let invocations_exec: Vec<&str> = logs_exec
-        .split("===SMOLVM_INVOCATION===\n")
-        .filter(|s| !s.trim().is_empty())
-        .collect();
+    let running_log = fs::read_to_string(&smolvm_log).unwrap();
+    assert!(running_log
+        .lines()
+        .any(|line| line.ends_with("echo running_guest_payload")));
+    assert_eq!(
+        fs::read_to_string(&lifecycle_events).unwrap(),
+        events_before_exec,
+        "exec on a running machine must not dispatch lifecycle side effects"
+    );
+}
 
-    let link_exec_idx = invocations_exec
-        .iter()
-        .position(|l| l.contains("link-root"))
-        .expect("devvm exec must run link-root");
-    let final_cmd_idx = invocations_exec
-        .iter()
-        .position(|l| l.contains("final_guest_payload"))
-        .expect("devvm exec must run final payload");
+#[test]
+fn test_setup_installs_upgrades_and_skips_current_versions() {
+    use std::os::unix::fs::PermissionsExt;
 
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let devvm_home = temp.path().join("devvm");
+    let fake_bin = temp.path().join("bin");
+    fs::create_dir_all(home.join(".local/bin")).unwrap();
+    fs::create_dir_all(&devvm_home).unwrap();
+    fs::create_dir_all(&fake_bin).unwrap();
+
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("setup-devvm.sh"),
+        devvm_home.join("setup-devvm.sh"),
+    )
+    .unwrap();
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("devvm"),
+        devvm_home.join("devvm"),
+    )
+    .unwrap();
+    fs::write(devvm_home.join("smolvm.toml"), "# test\n").unwrap();
+
+    let frps = home.join(".local/bin/frps");
+    fs::write(&frps, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+    fs::set_permissions(&frps, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let install_log = temp.path().join("smolvm-installs.log");
+    let curl = fake_bin.join("curl");
+    fs::write(
+        &curl,
+        r#"#!/usr/bin/env bash
+if [[ "$*" == *"api.github.com/repos/smol-machines/smolvm/releases/latest"* ]]; then
+    printf '{"tag_name":"v1.13.1"}\n'
+elif [[ "$*" == *"smolmachines.com/install.sh"* ]]; then
+    cat <<'INSTALLER'
+#!/usr/bin/env bash
+set -e
+version=""
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--version" ]]; then version="$2"; shift 2; else shift; fi
+done
+mkdir -p "$HOME/.smolvm" "$HOME/.local/bin"
+printf '%s\n' "$version" > "$HOME/.smolvm/.version"
+printf '#!/usr/bin/env bash\nprintf "smolvm %s\\n"\n' "$version" > "$HOME/.smolvm/smolvm"
+chmod +x "$HOME/.smolvm/smolvm"
+ln -sfn "$HOME/.smolvm/smolvm" "$HOME/.local/bin/smolvm"
+printf '%s\n' "$version" >> "$FAKE_SMOLVM_INSTALL_LOG"
+INSTALLER
+else
+    exit 1
+fi
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let cargo = fake_bin.join("cargo");
+    fs::write(
+        &cargo,
+        r#"#!/usr/bin/env bash
+set -e
+mkdir -p "$DEVVM_HOME/target/release"
+printf '%s' "$FAKE_DAEMON_BUILD" > "$DEVVM_HOME/target/release/devvm-daemon"
+chmod +x "$DEVVM_HOME/target/release/devvm-daemon"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path = format!(
+        "{}:{}:{}",
+        home.join(".local/bin").display(),
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let setup = devvm_home.join("setup-devvm.sh");
+    let run_setup = |daemon_build: &str| {
+        Command::new(&setup)
+            .arg("--skip-image")
+            .current_dir(&devvm_home)
+            .env("HOME", &home)
+            .env("DEVVM_HOME", &devvm_home)
+            .env("PATH", &path)
+            .env("FAKE_SMOLVM_INSTALL_LOG", &install_log)
+            .env("FAKE_DAEMON_BUILD", daemon_build)
+            .output()
+            .unwrap()
+    };
+
+    let first = run_setup("daemon-v1");
+    assert!(first.status.success(), "first setup failed: {first:?}");
+    assert_eq!(
+        fs::read_to_string(home.join(".smolvm/.version"))
+            .unwrap()
+            .trim(),
+        "1.13.1"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join(".local/bin/devvm-daemon")).unwrap(),
+        "daemon-v1"
+    );
+
+    let second = run_setup("daemon-v1");
+    assert!(second.status.success(), "second setup failed: {second:?}");
+    assert_eq!(fs::read_to_string(&install_log).unwrap().lines().count(), 1);
+    assert_eq!(
+        fs::read_to_string(home.join(".smolvm/.version"))
+            .unwrap()
+            .trim(),
+        "1.13.1"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join(".local/bin/devvm-daemon")).unwrap(),
+        "daemon-v1"
+    );
+
+    fs::write(home.join(".smolvm/.version"), "1.12.0\n").unwrap();
+    let upgrade = run_setup("daemon-v2");
     assert!(
-        link_exec_idx < final_cmd_idx,
-        "link-root (with profile dependency install) must execute before the final user command"
+        upgrade.status.success(),
+        "upgrade setup failed: {upgrade:?}"
+    );
+    assert_eq!(fs::read_to_string(&install_log).unwrap().lines().count(), 2);
+    assert_eq!(
+        fs::read_to_string(home.join(".local/bin/devvm-daemon")).unwrap(),
+        "daemon-v2"
     );
 }

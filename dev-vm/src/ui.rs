@@ -514,6 +514,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         let currentPath = '';
         let currentParent = null;
         let activeLogProjectId = null;
+        let logRefreshTimer = null;
         let currentProjects = [];
         const pendingActions = new Map();
 
@@ -910,7 +911,9 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
             activeLogProjectId = id;
             document.getElementById('logs-title').textContent = `Logs: ${name}`;
             document.getElementById('logs-modal').style.display = 'flex';
-            refreshCurrentLogs();
+            await refreshCurrentLogs();
+            clearInterval(logRefreshTimer);
+            logRefreshTimer = setInterval(refreshCurrentLogs, 2000);
         }
 
         async function refreshCurrentLogs() {
@@ -931,6 +934,8 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
             document.getElementById(id).style.display = 'none';
             if (id === 'logs-modal') {
                 activeLogProjectId = null;
+                clearInterval(logRefreshTimer);
+                logRefreshTimer = null;
             }
         }
 
