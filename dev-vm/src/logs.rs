@@ -103,7 +103,81 @@ fn read_file_tail(path: &Path, max_bytes: usize) -> Option<String> {
         }
     }
 
+    if buffer.last() != Some(&b'\n') {
+        if let Some(newline) = buffer.iter().rposition(|byte| *byte == b'\n') {
+            buffer.truncate(newline + 1);
+        } else {
+            buffer.clear();
+        }
+    }
+
     Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+fn strip_terminal_controls(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            0x1b => {
+                index += 1;
+                match bytes.get(index) {
+                    Some(b'[') => {
+                        index += 1;
+                        while index < bytes.len() {
+                            let byte = bytes[index];
+                            index += 1;
+                            if (0x40..=0x7e).contains(&byte) {
+                                break;
+                            }
+                        }
+                    }
+                    Some(b']') => {
+                        index += 1;
+                        while index < bytes.len() {
+                            if bytes[index] == 0x07 {
+                                index += 1;
+                                break;
+                            }
+                            if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+                                index += 2;
+                                break;
+                            }
+                            index += 1;
+                        }
+                    }
+                    Some(_) => {
+                        while index < bytes.len() {
+                            let byte = bytes[index];
+                            index += 1;
+                            if (0x30..=0x7e).contains(&byte) {
+                                break;
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+            b'\t' | b'\n' | 0x20..=0x7e | 0x80..=0xff => {
+                output.push(bytes[index]);
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn append_clean_lines(output: &mut String, prefix: &str, content: &str) {
+    for line in content.lines() {
+        let clean = strip_terminal_controls(line);
+        if !clean.trim().is_empty() {
+            let _ = writeln!(output, "{}{}", prefix, clean);
+        }
+    }
 }
 
 pub fn append_log(log_dir: &Path, project_id: Uuid, source: &str, message: &str) -> io::Result<()> {
@@ -122,8 +196,11 @@ pub fn append_log(log_dir: &Path, project_id: Uuid, source: &str, message: &str)
 
     let mut entry = String::new();
     for line in message.lines() {
-        writeln!(entry, "[{}] [{}] {}", timestamp, source, line)
-            .expect("writing to a String cannot fail");
+        let clean = strip_terminal_controls(line);
+        if !clean.trim().is_empty() {
+            writeln!(entry, "[{}] [{}] {}", timestamp, source, clean)
+                .expect("writing to a String cannot fail");
+        }
     }
 
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
@@ -145,26 +222,14 @@ pub fn read_recent_logs(log_dir: &Path, project_id: Uuid, max_bytes: usize) -> S
         .max_by_key(|(modified, _)| *modified)
         .map(|(_, content)| content);
 
-    match (project_log_str, ingress_log_str) {
-        (Some(mut p_logs), Some(i_logs)) => {
-            if !p_logs.is_empty() && !p_logs.ends_with('\n') {
-                p_logs.push('\n');
-            }
-            for line in i_logs.lines() {
-                let _ = writeln!(p_logs, "[ingress] {}", line);
-            }
-            p_logs
-        }
-        (Some(p_logs), None) => p_logs,
-        (None, Some(i_logs)) => {
-            let mut formatted = String::new();
-            for line in i_logs.lines() {
-                let _ = writeln!(formatted, "[ingress] {}", line);
-            }
-            formatted
-        }
-        (None, None) => String::new(),
+    let mut formatted = String::new();
+    if let Some(project_logs) = project_log_str {
+        append_clean_lines(&mut formatted, "", &project_logs);
     }
+    if let Some(ingress_logs) = ingress_log_str {
+        append_clean_lines(&mut formatted, "[ingress] ", &ingress_logs);
+    }
+    formatted
 }
 
 #[cfg(test)]
@@ -179,11 +244,19 @@ mod tests {
         let project_id = Uuid::new_v4();
 
         append_log(&log_dir, project_id, "daemon", "Starting VM").unwrap();
-        append_log(&log_dir, project_id, "dsh", "DSH listening on port 3080").unwrap();
+        append_log(
+            &log_dir,
+            project_id,
+            "dsh",
+            "\u{1b}[1;34mDSH listening on port 3080\u{1b}[0m\n\u{1b}[0m",
+        )
+        .unwrap();
 
         let logs = read_recent_logs(&log_dir, project_id, 65536);
         assert!(logs.contains("[daemon] Starting VM"));
         assert!(logs.contains("[dsh] DSH listening on port 3080"));
+        assert!(!logs.contains('\u{1b}'));
+        assert!(!logs.lines().any(|line| line.trim_end() == "[dsh]"));
     }
 
     #[test]

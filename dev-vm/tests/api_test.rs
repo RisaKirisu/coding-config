@@ -957,9 +957,11 @@ async fn test_ongoing_ingress_log_capture_persists_after_vm_deletion() {
     let ingress_log_file = ingress_log_dir.join("ingress.log");
     fs::write(
         &ingress_log_file,
-        "[INFO] [client] [3080.ongoing-proj] start proxy success\n\
+        "\u{1b}[1;34m[INFO] [client] [3080.ongoing-proj] start proxy success\u{1b}[0m\n\
          [INFO] [caddy] reverse_proxy: 127.0.0.1:3080 -> loopback upstream connected\n\
-         [WARN] [client] heartbeat timeout, reconnecting to frps\n",
+         [WARN] [client] heartbeat timeout, reconnecting to frps\n\
+         \u{1b}[0m\n\
+         incomplete trailing write",
     )
     .unwrap();
 
@@ -991,6 +993,18 @@ async fn test_ongoing_ingress_log_capture_persists_after_vm_deletion() {
     assert!(logs.contains("reverse_proxy: 127.0.0.1:3080 -> loopback upstream connected"));
     assert!(logs.contains("heartbeat timeout, reconnecting to frps"));
     assert!(logs.contains("[ingress]"));
+    assert!(
+        !logs.contains('\u{1b}'),
+        "terminal control sequences must be removed"
+    );
+    assert!(
+        !logs.contains("incomplete trailing write"),
+        "partial ingress writes must remain hidden until their newline arrives"
+    );
+    assert!(
+        !logs.lines().any(|line| line.trim() == "[ingress]"),
+        "reset-only terminal lines must not render"
+    );
 }
 
 #[tokio::test]

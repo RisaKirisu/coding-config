@@ -573,8 +573,8 @@ fn test_setup_installs_upgrades_and_skips_current_versions() {
     fs::write(
         &curl,
         r#"#!/usr/bin/env bash
-if [[ "$*" == *"api.github.com/repos/smol-machines/smolvm/releases/latest"* ]]; then
-    printf '{"tag_name":"v1.13.1"}\n'
+if [[ "$*" == *"github.com/smol-machines/smolvm/releases/latest"* ]]; then
+    printf 'https://github.com/smol-machines/smolvm/releases/tag/v1.13.1'
 elif [[ "$*" == *"smolmachines.com/install.sh"* ]]; then
     cat <<'INSTALLER'
 #!/usr/bin/env bash

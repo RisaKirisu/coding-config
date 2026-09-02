@@ -17,6 +17,7 @@ installed_smolvm_version() {
             | sed -nE 's/.*v?([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' \
             | head -1
     fi
+    return 0
 }
 
 latest_smolvm_version() {
@@ -120,7 +121,7 @@ fi
 IMAGE="rust-dev-opencode-$DEVVM_ARCH.tar"
 STALE_INPUT=""
 if [[ -f "$IMAGE" ]]; then
-    STALE_INPUT="$(find Dockerfile scripts patches tmp -newer "$IMAGE" -print -quit 2>/dev/null)"
+    STALE_INPUT="$(find Dockerfile scripts patches -newer "$IMAGE" -print -quit 2>/dev/null)"
 fi
 if [[ "$SKIP_IMAGE" == "1" ]]; then
     echo "=== Skipping machine image build as requested ==="
