@@ -33,13 +33,13 @@ export function apply(ctx, config) {
         raw: {
           type: 'string',
           required: true,
-          description: 'Raw actual voice-input portion only.',
+          description: 'Raw voice-input text.',
         },
         cleaned: {
           type: 'string',
           required: true,
           description:
-            'Cleaned voice-input text; be faithful to the original message. Do not paraphrase or summarize.',
+            'Cleaned voice-input text, faithful to the original wording. Do not paraphrase or summarize.',
         },
       },
       output: {
