@@ -1,21 +1,33 @@
 use crate::config::DaemonConfig;
-use crate::logs::append_log;
-use crate::models::DshStatus;
-use crate::runner::{check_vm_status, run_vm_start};
-use crate::sync::SyncManager;
+use crate::logs::{append_log, append_log_logged};
+use crate::models::{DshStatus, VmStatus};
+use crate::runner::{
+    check_vm_status, log_command_failure, log_command_spawn_failure, run_vm_start,
+};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Child;
-use tokio::sync::{oneshot, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
-const DSH_LAUNCH_COMMAND: &str =
-    "cd /root/workspace && echo $$ > /tmp/devvm-daemon-dsh.pid && exec dsh web";
-const DSH_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Starts DSH detached inside the DevVM. Idempotent: an existing live pid short-circuits it.
+/// `{project_id}` is substituted before the snippet runs. `echo $$` runs inside the inner
+/// bash, which `exec`s DSH, so the pid file holds DSH's own pid and never the prefixer's.
+const DSH_START_COMMAND: &str = r#"
+pid_file=/tmp/devvm-daemon-dsh.pid
+if [ -s "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then exit 0; fi
+log_dir=/devvm-root/.project-logs/{project_id}
+install -d -m 0700 "$log_dir"
+setsid bash -c '
+  echo $$ > /tmp/devvm-daemon-dsh.pid
+  cd /root/workspace && devvm-sync-startup
+  exec dsh web
+' </dev/null 2>&1 | while IFS= read -r line; do printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" "$line"; done >> "$log_dir/dsh.log" 2>&1 &
+"#;
+const DSH_STATUS_COMMAND: &str =
+    r#"[ -s /tmp/devvm-daemon-dsh.pid ] && kill -0 "$(cat /tmp/devvm-daemon-dsh.pid)""#;
 const DSH_STOP_COMMAND: &str = r#"
 pid_file=/tmp/devvm-daemon-dsh.pid
 if [ -s "$pid_file" ]; then
@@ -40,22 +52,20 @@ if [ -s "$pid_file" ]; then
 fi
 "#;
 
-type StopResultSender = oneshot::Sender<Result<(), String>>;
-type StopRequestSender = oneshot::Sender<StopResultSender>;
+const STATUS_CACHE_TTL: Duration = Duration::from_secs(2);
 
-#[derive(Debug)]
-#[allow(dead_code)]
-enum ProcessState {
-    Starting { stop_tx: Option<StopRequestSender> },
-    Running { stop_tx: Option<StopRequestSender> },
+#[derive(Clone, Copy)]
+enum InFlight {
+    Starting,
     Stopping,
-    Stopped,
-    Failed(String),
 }
 
+/// The DevVM owns the DSH Runtime; the daemon holds no child process, only the lifecycle
+/// operation it is currently running and a short-lived cache of the last guest probe.
 #[derive(Clone, Default)]
 pub struct DshRuntimeManager {
-    states: Arc<Mutex<HashMap<Uuid, ProcessState>>>,
+    in_flight: Arc<Mutex<HashMap<Uuid, InFlight>>>,
+    status_cache: Arc<Mutex<HashMap<Uuid, (Instant, DshStatus)>>>,
 }
 
 impl DshRuntimeManager {
@@ -63,235 +73,57 @@ impl DshRuntimeManager {
         Self::default()
     }
 
-    pub async fn get_status(&self, project_id: Uuid) -> DshStatus {
-        let states = self.states.lock().await;
-        match states.get(&project_id) {
-            Some(ProcessState::Starting { .. }) => DshStatus::Starting,
-            Some(ProcessState::Running { .. }) => DshStatus::Running,
-            Some(ProcessState::Stopping) => DshStatus::Stopping,
-            Some(ProcessState::Failed(_)) => DshStatus::Failed,
-            Some(ProcessState::Stopped) | None => DshStatus::Stopped,
+    pub async fn get_status(
+        &self,
+        config: &DaemonConfig,
+        project_id: Uuid,
+        project_path: &Path,
+    ) -> DshStatus {
+        if let Some(operation) = self.in_flight.lock().await.get(&project_id) {
+            return match operation {
+                InFlight::Starting => DshStatus::Starting,
+                InFlight::Stopping => DshStatus::Stopping,
+            };
         }
+
+        // `devvm exec` would create and start a DevVM, so it must not be probed while stopped.
+        if check_vm_status(config, project_path).await != VmStatus::Running {
+            return DshStatus::Stopped;
+        }
+
+        if let Some((probed_at, status)) = self.status_cache.lock().await.get(&project_id) {
+            if probed_at.elapsed() < STATUS_CACHE_TTL {
+                return *status;
+            }
+        }
+
+        let status = probe_dsh(config, project_path).await;
+        self.status_cache
+            .lock()
+            .await
+            .insert(project_id, (Instant::now(), status));
+        status
     }
 
     pub async fn launch_dsh(
         &self,
         config: &DaemonConfig,
-        sync_manager: &SyncManager,
         project_id: Uuid,
         project_path: &Path,
     ) -> Result<(), String> {
-        let (stop_tx, mut stop_rx) = oneshot::channel::<StopResultSender>();
-        {
-            let mut states = self.states.lock().await;
-            match states.get(&project_id) {
-                Some(ProcessState::Running { .. }) | Some(ProcessState::Starting { .. }) => {
-                    return Ok(())
-                }
-                Some(ProcessState::Stopping) => {
-                    return Err("DSH stop is still in progress".to_string())
-                }
-                _ => {}
-            }
-            states.insert(
-                project_id,
-                ProcessState::Starting {
-                    stop_tx: Some(stop_tx),
-                },
-            );
-        }
-
-        let prepare_result = tokio::select! {
-            result = self.prepare_launch(config, sync_manager, project_id, project_path) => result,
-            stop_result_tx = &mut stop_rx => {
-                self.states
-                    .lock()
-                    .await
-                    .insert(project_id, ProcessState::Stopped);
-                if let Ok(tx) = stop_result_tx {
-                    let _ = tx.send(Ok(()));
-                }
-                return Err("DSH launch was stopped".to_string());
-            }
-        };
-
-        if let Err(error) = prepare_result {
-            self.states
-                .lock()
-                .await
-                .insert(project_id, ProcessState::Stopped);
-            return Err(error);
-        }
-
-        append_log(
-            &config.log_dir,
-            project_id,
-            "daemon",
-            "Launching DSH Runtime inside DevVM...",
-        )
-        .map_err(|error| error.to_string())?;
-
-        let mut command = tokio::process::Command::new(&config.devvm_bin);
-        command
-            .arg("exec")
-            .arg("/bin/bash")
-            .arg("-c")
-            .arg(DSH_LAUNCH_COMMAND)
-            .current_dir(project_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                let message = format!("Failed to spawn DSH command: {}", error);
-                let _ = append_log(&config.log_dir, project_id, "daemon:error", &message);
-                self.states
-                    .lock()
-                    .await
-                    .insert(project_id, ProcessState::Failed(message.clone()));
-                return Err(message);
-            }
-        };
-
-        let (ready_tx, mut ready_rx) = oneshot::channel::<()>();
-        let (startup_tx, startup_rx) = oneshot::channel::<Result<(), String>>();
-
-        if let Some(stdout) = child.stdout.take() {
-            let log_dir = config.log_dir.clone();
-            tokio::spawn(async move {
-                let mut ready_tx = Some(ready_tx);
-                let mut reader = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
-                    let ready = line.contains("dsh web: http://");
-                    let _ = append_log(&log_dir, project_id, "dsh", &line);
-                    if ready {
-                        if let Some(tx) = ready_tx.take() {
-                            let _ = tx.send(());
-                        }
-                    }
-                }
-            });
-        }
-
-        if let Some(stderr) = child.stderr.take() {
-            let log_dir = config.log_dir.clone();
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
-                    let _ = append_log(&log_dir, project_id, "dsh:err", &line);
-                }
-            });
-        }
-
-        let config_clone = config.clone();
-        let project_path = project_path.to_path_buf();
-        let states = Arc::clone(&self.states);
-        tokio::spawn(async move {
-            tokio::select! {
-                readiness = &mut ready_rx => {
-                    match readiness {
-                        Ok(()) => {
-                            let mut process_states = states.lock().await;
-                            let stop_tx = match process_states.get_mut(&project_id) {
-                                Some(ProcessState::Starting { stop_tx }) => stop_tx.take(),
-                                _ => None,
-                            };
-                            process_states.insert(project_id, ProcessState::Running { stop_tx });
-                            drop(process_states);
-                            let _ = startup_tx.send(Ok(()));
-
-                            tokio::select! {
-                                stop_result_tx = &mut stop_rx => {
-                                    let result = stop_managed_process(
-                                        &config_clone,
-                                        &states,
-                                        project_id,
-                                        &project_path,
-                                        &mut child,
-                                    ).await;
-                                    let _ = stop_result_tx.map(|tx| tx.send(result));
-                                }
-                                status = child.wait() => {
-                                    record_unexpected_exit(
-                                        &config_clone,
-                                        &states,
-                                        project_id,
-                                        status,
-                                    ).await;
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            let message = "DSH closed its output before reporting readiness".to_string();
-                            let _ = child.kill().await;
-                            states.lock().await.insert(project_id, ProcessState::Failed(message.clone()));
-                            let _ = startup_tx.send(Err(message));
-                        }
-                    }
-                }
-                _ = tokio::time::sleep(DSH_STARTUP_TIMEOUT) => {
-                    let message = format!(
-                        "DSH startup timed out after {} seconds",
-                        DSH_STARTUP_TIMEOUT.as_secs()
-                    );
-                    let _ = append_log(
-                        &config_clone.log_dir,
-                        project_id,
-                        "daemon:error",
-                        &message,
-                    );
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    states
-                        .lock()
-                        .await
-                        .insert(project_id, ProcessState::Failed(message.clone()));
-                    let _ = startup_tx.send(Err(message));
-                }
-                stop_result_tx = &mut stop_rx => {
-                    let result = stop_managed_process(
-                        &config_clone,
-                        &states,
-                        project_id,
-                        &project_path,
-                        &mut child,
-                    ).await;
-                    let _ = stop_result_tx.map(|tx| tx.send(result.clone()));
-                    let _ = startup_tx.send(Err("DSH launch was stopped".to_string()));
-                }
-                status = child.wait() => {
-                    let message = record_unexpected_exit(
-                        &config_clone,
-                        &states,
-                        project_id,
-                        status,
-                    ).await;
-                    let _ = startup_tx.send(Err(message));
-                }
-            }
-        });
-
-        startup_rx
-            .await
-            .map_err(|_| "DSH startup monitor exited unexpectedly".to_string())?
+        self.begin(project_id, InFlight::Starting).await?;
+        let result = self.run_launch(config, project_id, project_path).await;
+        self.finish(project_id).await;
+        result
     }
 
-    async fn prepare_launch(
+    async fn run_launch(
         &self,
         config: &DaemonConfig,
-        sync_manager: &SyncManager,
         project_id: Uuid,
         project_path: &Path,
     ) -> Result<(), String> {
-        sync_manager
-            .reconcile_startup(config, project_id, project_path)
-            .await
-            .map_err(|error| error.to_string())?;
-
-        let vm_status = check_vm_status(config, project_path).await;
-        if vm_status != crate::models::VmStatus::Running {
+        if check_vm_status(config, project_path).await != VmStatus::Running {
             append_log(
                 &config.log_dir,
                 project_id,
@@ -302,132 +134,188 @@ impl DshRuntimeManager {
             run_vm_start(config, project_id, project_path).await?;
         }
 
+        append_log(
+            &config.log_dir,
+            project_id,
+            "daemon",
+            "Launching DSH Runtime inside DevVM...",
+        )
+        .map_err(|error| error.to_string())?;
+
+        // Invariant (ADR 0004): the guest snippet exits early when the pid file names a live
+        // DSH, so a second launch starts no second process and reruns no reconciliation.
+        run_guest_command(
+            config,
+            project_path,
+            &DSH_START_COMMAND.replace("{project_id}", &project_id.to_string()),
+            "Starting DSH inside DevVM",
+        )
+        .await
+    }
+
+    pub async fn stop_dsh(
+        &self,
+        config: &DaemonConfig,
+        project_id: Uuid,
+        project_path: &Path,
+    ) -> Result<(), String> {
+        // A stopped DevVM has no DSH Runtime, and `devvm exec` would start the DevVM to look.
+        if check_vm_status(config, project_path).await != VmStatus::Running {
+            self.status_cache.lock().await.remove(&project_id);
+            return Ok(());
+        }
+
+        self.begin(project_id, InFlight::Stopping).await?;
+        append_log_logged(&config.log_dir, project_id, "daemon", "DSH stop requested");
+        let result = run_guest_command(
+            config,
+            project_path,
+            DSH_STOP_COMMAND,
+            "Stopping DSH inside DevVM",
+        )
+        .await;
+        self.finish(project_id).await;
+        result
+    }
+
+    async fn begin(&self, project_id: Uuid, operation: InFlight) -> Result<(), String> {
+        let mut in_flight = self.in_flight.lock().await;
+        if in_flight.contains_key(&project_id) {
+            return Err("A DSH lifecycle operation is already in progress".to_string());
+        }
+        in_flight.insert(project_id, operation);
         Ok(())
     }
 
-    pub async fn stop_dsh(&self, config: &DaemonConfig, project_id: Uuid) -> Result<(), String> {
-        let stop_tx = {
-            let mut states = self.states.lock().await;
-            let Some(state) = states.get_mut(&project_id) else {
-                return Ok(());
-            };
-
-            let tx = match state {
-                ProcessState::Starting { stop_tx } | ProcessState::Running { stop_tx } => stop_tx
-                    .take()
-                    .ok_or_else(|| "DSH lifecycle operation is already in progress".to_string())?,
-                ProcessState::Stopping => return Err("DSH stop is already in progress".to_string()),
-                ProcessState::Stopped | ProcessState::Failed(_) => return Ok(()),
-            };
-            *state = ProcessState::Stopping;
-            tx
-        };
-
-        let _ = append_log(&config.log_dir, project_id, "daemon", "DSH stop requested");
-        let (result_tx, result_rx) = oneshot::channel();
-        stop_tx
-            .send(result_tx)
-            .map_err(|_| "DSH process monitor is unavailable".to_string())?;
-        result_rx
-            .await
-            .map_err(|_| "DSH process monitor stopped before cleanup finished".to_string())?
+    async fn finish(&self, project_id: Uuid) {
+        self.in_flight.lock().await.remove(&project_id);
+        self.status_cache.lock().await.remove(&project_id);
     }
 
-    pub async fn handle_vm_stopped(&self, config: &DaemonConfig, project_id: Uuid) {
-        let _ = self.stop_dsh(config, project_id).await;
+    pub async fn handle_vm_stopped(
+        &self,
+        config: &DaemonConfig,
+        project_id: Uuid,
+        project_path: &Path,
+    ) {
+        if let Err(e) = self.stop_dsh(config, project_id, project_path).await {
+            tracing::error!(project = ?project_id, error = %e, "stopping DSH after DevVM stop failed");
+        }
     }
 }
 
-async fn stop_dsh_inside_vm(
+/// A non-zero exit means no live pid file, which is an ordinary stopped DSH, not an error.
+async fn probe_dsh(config: &DaemonConfig, project_path: &Path) -> DshStatus {
+    let mut command = guest_command(config, project_path, DSH_STATUS_COMMAND);
+    match command.output().await {
+        Ok(output) if output.status.success() => DshStatus::Running,
+        Ok(_) => DshStatus::Stopped,
+        Err(error) => {
+            log_command_spawn_failure(
+                &config.devvm_bin.display().to_string(),
+                &guest_args(DSH_STATUS_COMMAND),
+                &error,
+            );
+            DshStatus::Stopped
+        }
+    }
+}
+
+fn guest_args(snippet: &str) -> Vec<String> {
+    vec![
+        "exec".to_string(),
+        "/bin/bash".to_string(),
+        "-c".to_string(),
+        snippet.to_string(),
+    ]
+}
+
+fn guest_command(
     config: &DaemonConfig,
-    project_id: Uuid,
     project_path: &Path,
-) -> Result<(), String> {
+    snippet: &str,
+) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(&config.devvm_bin);
     command
         .arg("exec")
         .arg("/bin/bash")
         .arg("-c")
-        .arg(DSH_STOP_COMMAND)
+        .arg(snippet)
         .current_dir(project_path)
         .stdin(Stdio::null());
-
-    let output = command
-        .output()
-        .await
-        .map_err(|error| format!("Failed to stop DSH inside DevVM: {}", error))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stdout.trim().is_empty() {
-        let _ = append_log(&config.log_dir, project_id, "dsh:stop", stdout.trim());
-    }
-    if !stderr.trim().is_empty() {
-        let _ = append_log(&config.log_dir, project_id, "dsh:stop:err", stderr.trim());
-    }
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Stopping DSH inside DevVM exited with status {:?}: {}",
-            output.status.code(),
-            stderr.trim()
-        ))
-    }
+    command
 }
 
-async fn stop_managed_process(
+async fn run_guest_command(
     config: &DaemonConfig,
-    states: &Arc<Mutex<HashMap<Uuid, ProcessState>>>,
-    project_id: Uuid,
     project_path: &Path,
-    child: &mut Child,
+    snippet: &str,
+    context: &str,
 ) -> Result<(), String> {
-    let _ = append_log(
-        &config.log_dir,
-        project_id,
-        "daemon",
-        "Stopping DSH process...",
-    );
-    let result = stop_dsh_inside_vm(config, project_id, project_path).await;
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-
-    let next_state = match &result {
-        Ok(()) => ProcessState::Stopped,
-        Err(error) => ProcessState::Failed(error.clone()),
-    };
-    states.lock().await.insert(project_id, next_state);
-
-    match &result {
-        Ok(()) => {
-            let _ = append_log(
-                &config.log_dir,
-                project_id,
-                "daemon",
-                "DSH process stopped.",
-            );
-        }
+    let program = config.devvm_bin.display().to_string();
+    let args = guest_args(snippet);
+    let output = match guest_command(config, project_path, snippet).output().await {
+        Ok(output) => output,
         Err(error) => {
-            let _ = append_log(&config.log_dir, project_id, "daemon:error", error);
+            log_command_spawn_failure(&program, &args, &error);
+            return Err(format!("{}: {}", context, error));
         }
+    };
+
+    if output.status.success() {
+        return Ok(());
     }
-    result
+
+    log_command_failure(&program, &args, &output);
+    Err(format!(
+        "{} exited with status {:?}: {}",
+        context,
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
 }
 
-async fn record_unexpected_exit(
-    config: &DaemonConfig,
-    states: &Arc<Mutex<HashMap<Uuid, ProcessState>>>,
-    project_id: Uuid,
-    status: std::io::Result<std::process::ExitStatus>,
-) -> String {
-    let message = match status {
-        Ok(status) => format!("DSH process exited with status: {:?}", status.code()),
-        Err(error) => format!("DSH process wait error: {}", error),
-    };
-    let _ = append_log(&config.log_dir, project_id, "daemon:error", &message);
-    states
-        .lock()
-        .await
-        .insert(project_id, ProcessState::Failed(message.clone()));
-    message
+#[cfg(test)]
+mod tests {
+    use super::{DSH_START_COMMAND, DSH_STATUS_COMMAND};
+
+    #[test]
+    fn test_start_command_runs_startup_script_before_dsh_web() {
+        let script_at = DSH_START_COMMAND
+            .find("devvm-sync-startup")
+            .expect("start command must run devvm-sync-startup");
+        let dsh_at = DSH_START_COMMAND
+            .find("exec dsh web")
+            .expect("start command must exec dsh web");
+        assert!(script_at < dsh_at);
+    }
+
+    #[test]
+    fn test_start_command_records_the_pid_of_dsh_itself() {
+        let pid_write_at = DSH_START_COMMAND
+            .find("echo $$ > /tmp/devvm-daemon-dsh.pid")
+            .expect("the inner bash must record its own pid, which becomes DSH's after exec");
+        let prefixer_at = DSH_START_COMMAND
+            .find("while IFS= read -r line")
+            .expect("start command must pipe DSH output through the timestamp prefixer");
+        assert!(
+            pid_write_at < prefixer_at,
+            "the pid must be written inside the process that execs DSH, not in the prefixer"
+        );
+    }
+
+    #[test]
+    fn test_start_command_substitutes_the_project_id_into_the_log_dir() {
+        let rendered = DSH_START_COMMAND.replace("{project_id}", "abc-123");
+        assert!(rendered.contains("log_dir=/devvm-root/.project-logs/abc-123"));
+        assert!(!rendered.contains("{project_id}"));
+    }
+
+    #[test]
+    fn test_status_command_checks_the_guest_pid_file() {
+        assert_eq!(
+            DSH_STATUS_COMMAND,
+            r#"[ -s /tmp/devvm-daemon-dsh.pid ] && kill -0 "$(cat /tmp/devvm-daemon-dsh.pid)""#
+        );
+    }
 }

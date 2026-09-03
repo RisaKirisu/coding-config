@@ -6,6 +6,14 @@ ARG NVM_VERSION=0.40.6
 ARG FRP_VERSION=0.71.0
 ARG CADDY_VERSION=2.11.4
 
+COPY tmp/zscaler-root.crt /usr/local/share/ca-certificates/zscaler-root.crt
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+ && update-ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# helps npm and any Node tooling later in the build
+ENV NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/zscaler-root.crt
+
 ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_HOME=/root/.cargo \
     NVM_DIR=/root/.nvm \
@@ -142,6 +150,7 @@ RUN set -eux; \
 COPY scripts/Caddyfile /etc/devvm/Caddyfile
 COPY scripts/frpc.toml /etc/devvm/frpc.toml
 COPY --chmod=0755 scripts/devvm-ingress /usr/local/bin/devvm-ingress
+COPY --chmod=0755 scripts/devvm-sync-startup /usr/local/bin/devvm-sync-startup
 # ---------------------------------------------------------------------------
 # Python
 # ---------------------------------------------------------------------------

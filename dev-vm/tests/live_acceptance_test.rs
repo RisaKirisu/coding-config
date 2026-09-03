@@ -844,7 +844,24 @@ async fn test_live_complete_version_one_system() {
         .unwrap();
     assert_eq!(launch_res.status(), StatusCode::OK);
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // DSH is started detached inside the DevVM, so its status appears shortly afterwards.
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let status: Value = client
+            .get(format!(
+                "http://{}/api/projects/{}",
+                daemon_addr, project_id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if status["dsh_status"] == "running" {
+            break;
+        }
+    }
 
     let proj_res = client
         .get(format!(
@@ -945,9 +962,9 @@ printf 'console.log("plugin")' > /root/.dsh/plugins/custom-plugin.js
         String::from_utf8_lossy(&pop_out.stderr)
     );
 
-    // 10. Configure VPS Sync Store & Trigger Manual Sync
+    // 10. Configure VPS Sync Store and restart DSH so startup reconciliation pushes
     println!(
-        ">>> Configuring VPS Sync Store and triggering live manual synchronization with {}@{}:{}...",
+        ">>> Configuring VPS Sync Store and restarting DSH for live synchronization with {}@{}:{}...",
         ssh_user, ssh_host, ssh_port
     );
     let setup_res = client
@@ -969,18 +986,21 @@ printf 'console.log("plugin")' > /root/.dsh/plugins/custom-plugin.js
         "Live sync setup must succeed"
     );
 
-    let trigger_res = client
+    // The daemon has no manual trigger: the DSH plugin pushes after startup
+    // reconciliation, so restarting the DSH Runtime with sync configured is the
+    // live push path (ADR 0003).
+    let restart_res = client
         .post(format!(
-            "http://{}/api/projects/{}/sync/trigger",
+            "http://{}/api/projects/{}/dsh/restart",
             daemon_addr, project_id
         ))
         .send()
         .await
         .unwrap();
     assert_eq!(
-        trigger_res.status(),
+        restart_res.status(),
         StatusCode::OK,
-        "Live sync trigger must succeed"
+        "Live DSH restart must succeed"
     );
 
     // 11. Poll until terminal status and fail on failed/degraded
@@ -989,7 +1009,7 @@ printf 'console.log("plugin")' > /root/.dsh/plugins/custom-plugin.js
         poll_project_sync_status(&client, daemon_addr, project_id, Duration::from_secs(30)).await;
     assert!(
         sync_outcome.is_ok(),
-        "Manual synchronization failed: {:?}",
+        "Startup synchronization failed: {:?}",
         sync_outcome.err()
     );
     println!("  - Synchronization reached terminal status: synchronized");
@@ -1071,7 +1091,7 @@ test ! -d /root/.dsh/attachments/v1/request-images
 test ! -f /root/.dsh/credentials/secret.key
 test ! -f /root/.dsh/settings/user-settings.json
 test ! -f /root/.dsh/plugins/custom-plugin.js
-test ! -f /root/.dsh/.sync-dirty
+test ! -f /root/.dsh/.sync-head.json
 "#;
 
     let verify_out = devvm_exec(

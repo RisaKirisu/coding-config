@@ -7,3 +7,7 @@
 - Give subagents exact, bounded scopes and required skills. Explicitly forbid them from launching subagents. Do not investigate delegated scope while it is running; continue separate work or wait.
 - Do not add bypass lifecycle commands to avoid repeated setup. Make shared `create` and `start` operations state-aware no-ops, and gate dependency installation on package-manager state.
 - Lifecycle fakes must isolate absolute guest paths before evaluating guest commands. The old fake evaluated `/tmp/devvm-daemon-dsh.pid` on the host and killed the DSH Runtime running the tests. Guard lifecycle test runs by verifying the hosting PID remains alive and unchanged.
+- The web DSH profile installs local `file:` plugins as pnpm hardlink copies; editing the source breaks the links and leaves the installed copy stale. Refresh the profile install after editing a plugin before trusting a boot test.
+- Functions that read process-wide env vars (`DEVVM_ROOT`) race under parallel tests; serialize those tests and point the env var into the temp tree so provisioning never writes into the real home.
+- Never rewrite executables in this repo with the `write` tool; after any edit to `devvm` or `scripts/*`, re-check the mode with `ls -l`.
+- Builder "non-vacuity" claims are not verification. Mutate the production code the test is meant to protect (disable the branch, flip the tag, drop the sort) and confirm a test fails; a test that only checks presence passes when a second code path produces the same text.

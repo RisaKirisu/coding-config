@@ -14,6 +14,7 @@ pub mod ui;
 pub use api::{create_router, AppState};
 pub use config::{determine_bind_addresses, DaemonConfig};
 pub use dns::{detect_tailscale_ipv4, DnsConfig, DnsServer};
+pub use logs::LogEntry;
 pub use runtime::DshRuntimeManager;
 pub use service::{
     default_home_dir, generate_dns_setup_instructions, generate_launchd_plist,
@@ -21,8 +22,6 @@ pub use service::{
     Platform, ServiceError, ServiceManager, ServicePlistConfig, ServiceStatus, ServiceUnitConfig,
 };
 pub use sync::{
-    apply_rsync_filters, check_local_portable_state_exists, is_local_state_dirty, load_sync_config,
-    mark_local_state_clean, mark_local_state_dirty, provision_sync_setup,
-    resolve_host_ssh_key_path, save_sync_config, SyncConfig, SyncDirection, SyncError, SyncManager,
-    SyncRunner, SystemSyncRunner,
+    load_sync_config, provision_sync_setup, resolve_host_ssh_key_path, save_sync_config,
+    shell_quote, SyncConfig, SyncError, SyncManager, SyncRunner, SystemSyncRunner,
 };

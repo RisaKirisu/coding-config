@@ -68,13 +68,11 @@ impl DaemonConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|_| config_dir_base.join("sync.json"));
 
+        // Project logs live in the DevVM root so the guest sees them at
+        // /devvm-root/.project-logs and writes dsh.log and ingress.log beside daemon.log.
         let log_dir = std::env::var("DEVVM_LOG_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                dirs::data_local_dir()
-                    .map(|p| p.join("devvm/logs"))
-                    .unwrap_or_else(|| home_dir.join(".local/share/devvm/logs"))
-            });
+            .unwrap_or_else(|_| crate::sync::devvm_root().join(".project-logs"));
 
         let devvm_bin = std::env::var("DEVVM_BIN")
             .map(PathBuf::from)

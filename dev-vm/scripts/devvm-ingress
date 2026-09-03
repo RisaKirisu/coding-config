@@ -11,10 +11,16 @@ fi
 
 INGRESS_LOG="/run/devvm/ingress.log"
 if [[ -n "$PROJECT_ID" && -d /devvm-root ]]; then
-    HOST_LOG_DIR="/devvm-root/.ingress-logs/$PROJECT_ID"
+    HOST_LOG_DIR="/devvm-root/.project-logs/$PROJECT_ID"
     install -d -m 0700 "$HOST_LOG_DIR"
     INGRESS_LOG="$HOST_LOG_DIR/ingress.log"
 fi
+
+prefix_lines() {
+    while IFS= read -r line; do
+        printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" "$line"
+    done
+}
 
 process_running() {
     local process="$1"
@@ -48,6 +54,7 @@ if ! adopt_running_process caddy /run/devvm/caddy.pid; then
 fi
 
 if ! adopt_running_process frpc /run/devvm/frpc.pid; then
-    nohup frpc -c /etc/devvm/frpc.toml >> "$INGRESS_LOG" 2>&1 &
+    # Process substitution, not a pipe: `$!` must stay frpc's pid, not the prefixer's.
+    nohup frpc -c /etc/devvm/frpc.toml > >(prefix_lines >> "$INGRESS_LOG") 2>&1 &
     printf '%s\n' "$!" > /run/devvm/frpc.pid
 fi

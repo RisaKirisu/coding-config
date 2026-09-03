@@ -5,14 +5,22 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 pub fn detect_tailscale_ipv4() -> Option<Ipv4Addr> {
-    let output = std::process::Command::new("tailscale")
+    let args = ["ip".to_string(), "-4".to_string()];
+    let output = match std::process::Command::new("tailscale")
         .args(["ip", "-4"])
         .output()
-        .ok()?;
+    {
+        Ok(output) => output,
+        Err(e) => {
+            crate::runner::log_command_spawn_failure("tailscale", &args, &e);
+            return None;
+        }
+    };
     if output.status.success() {
         let ip_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
         ip_str.parse::<Ipv4Addr>().ok()
     } else {
+        crate::runner::log_command_failure("tailscale", &args, &output);
         None
     }
 }
@@ -75,7 +83,9 @@ impl DnsServer {
                         Ok((len, src)) => {
                             let query_data = &buf[..len];
                             if let Some(resp) = handle_dns_query(query_data, &config) {
-                                let _ = socket.send_to(&resp, src).await;
+                                if let Err(e) = socket.send_to(&resp, src).await {
+                                    tracing::error!(peer = %src, error = %e, "failed to send DNS response");
+                                }
                             }
                         }
                         Err(e) => {
@@ -85,7 +95,9 @@ impl DnsServer {
                 }
                 _ = async {
                     if let Some(rx) = shutdown.as_deref_mut() {
-                        let _ = rx.changed().await;
+                        if let Err(e) = rx.changed().await {
+                            tracing::error!(error = %e, "DNS shutdown signal sender dropped");
+                        }
                     } else {
                         std::future::pending::<()>().await;
                     }

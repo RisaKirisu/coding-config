@@ -20,14 +20,14 @@ pub enum VmStatus {
     Unknown,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// A crashed DSH Runtime reads back as `Stopped`; the cause is in the Project's `dsh.log`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DshStatus {
     Starting,
     Running,
     Stopping,
     Stopped,
-    Failed,
     Unknown,
 }
 
@@ -38,6 +38,7 @@ pub enum SyncStatus {
     NotConfigured,
     Synchronizing,
     Synchronized,
+    RemoteAhead,
     Degraded,
     Failed,
 }
@@ -64,7 +65,8 @@ pub struct ProjectView {
     pub project_host: String,
     pub vm_status: VmStatus,
     pub dsh_status: DshStatus,
-    pub sync_status: SyncStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_status: Option<SyncStatus>,
     pub links: ProjectLinks,
 }
 
@@ -90,7 +92,7 @@ pub struct RegisterRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LogsResponse {
     pub project_id: Uuid,
-    pub logs: String,
+    pub entries: Vec<crate::logs::LogEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

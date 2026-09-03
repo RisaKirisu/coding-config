@@ -18,13 +18,14 @@ DevVM Workspace Supervision: isolated development microVMs for OpenCode and Deep
 |---|---|
 | `devvm` | CLI wrapper around Smolvm for shell and VM lifecycle |
 | `devvm-daemon` / `src/` | Control Daemon, embedded Web UI, background runtime supervision, and wildcard DNS server |
-| `scripts/devvm-ingress` | Ingress starter (Caddy + FRP client) streaming logs to host-persisted Project Logs |
+| `scripts/devvm-ingress` | Ingress starter (Caddy + FRP client) writing timestamped `ingress.log` into the Project's host log directory |
+| `scripts/devvm-sync-startup` | Guest startup script that runs Session Sync reconciliation before `dsh web`; never blocks the launch |
 | `scripts/Caddyfile` | Ingress Loopback Facade configuration |
 | `scripts/frpc.toml` | FRP client virtual-host configuration |
 | `setup-devvm.sh` | Complete version-one setup script for Linux and macOS |
 | `root/` | Host-managed agent config mounted at `/devvm-root` |
 | `skills/` | Central skill collection shared across all projects (shortcut to `root/skills/`) |
-| `root/.dsh/plugins/remote-sync/` | DSH plugin for turn-triggered and manual Portable DSH State synchronization |
+| `root/.dsh/plugins/remote-sync/` | DSH plugin that is the single Session Sync engine: automatic pushes after saved changes, startup reconciliation, status indicator, and manual retry |
 
 ## Setup
 
@@ -65,10 +66,12 @@ devvm-daemon service status
 The Web UI allows you to:
 1. Browse directories beneath `$HOME` and register Projects (creating or reading `.devvm-id`).
 2. Start, stop, and delete DevVM instances.
-3. Launch and monitor DSH Runtimes with direct browser links. DevVM and DSH actions show animated starting/stopping states; DSH links appear only after runtime readiness is confirmed.
+3. Launch and monitor DSH Runtimes with direct browser links. DSH runs detached inside its DevVM, and its status is read back from the DevVM, so it survives Control Daemon restarts: `running` means the process is alive (an immediate click may still see a brief ingress 502 before it listens), and a crashed DSH reads back as `stopped` with the reason in its `dsh.log`.
 4. Open arbitrary guest HTTP ports with instant Loopback Facade links.
-5. Inspect host-persisted Project Logs (surviving VM stop/deletion).
-6. View Sync Status (synchronized, synchronizing, degraded, or failed) and trigger manual syncs.
+5. Inspect host-persisted Project Logs (surviving VM stop/deletion). Each Project has one host log directory, `root/.project-logs/<project-id>/` (override with `DEVVM_LOG_DIR`), holding `daemon.log` written by the Control Daemon, plus `dsh.log` and `ingress.log` written inside the DevVM, which sees the directory at `/devvm-root/.project-logs/<project-id>/`. Every line starts with an ISO-8601 UTC timestamp in milliseconds.
+6. View Sync Status (not configured, synchronizing, synchronized, remote ahead, degraded, or failed) as reported by the DSH Runtime, and restart a running DSH Runtime to pull work another workstation pushed. Manual retry lives in the DSH sync indicator, not here.
+
+The log viewer merges the three files into one time-ordered list. Each row shows the local time (`HH:MM:SS.mmm`), a badge for its source (`daemon`, `dsh`, or `ingress`), and the message, with error rows tinted red and warnings amber; Caddy's JSON access lines are compacted to `GET /path → 502 (0.2 ms)`. The toolbar carries one chip per source, an `errors only` toggle, and a `Follow` toggle that keeps the view pinned to the newest line — scrolling up more than 24 px turns Follow off so the refresh every two seconds no longer moves the view, and scrolling back to the bottom turns it on again.
 
 ## Wildcard Private DNS (Tailscale)
 

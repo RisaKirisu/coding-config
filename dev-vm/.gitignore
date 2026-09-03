@@ -21,7 +21,8 @@ root/.dsh/.anonymous-user-id
 root/.dsh/attachments
 thinking-effort-loaded.json
 
-# Ingress logs
+# Project logs
+root/.project-logs/
 root/.ingress-logs/
 root/.logs/
 

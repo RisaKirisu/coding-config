@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Startup reconciliation for Session Sync. Runs before `dsh web` inside the DevVM.
+# It only records its outcome in /root/.dsh/.sync-status.json and must never block the DSH launch,
+# so it always exits 0 (ADR 0003).
+set -uo pipefail
+script=/root/.dsh/plugins/remote-sync/reconcile.mjs
+if [[ ! -f "$script" ]]; then
+    echo "remote-sync: reconcile script not found at $script; skipping startup reconciliation" >&2
+    exit 0
+fi
+node "$script" || echo "remote-sync: startup reconciliation exited with status $?" >&2
+exit 0

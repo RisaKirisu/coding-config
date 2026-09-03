@@ -110,18 +110,28 @@ link_root() {
             ln -s "$source" "$target"
         done
 
+        # DSH saves by renaming a temp sibling over the target, which replaces a
+        # symlink instead of writing through it, so /root/.dsh is a bind mount of
+        # the shared directory and Portable DSH State stays VM-local underneath.
+        install -d -m 700 /var/lib/devvm-dsh/{sessions,storages,attachments}
+
+        if ! mountpoint -q /root/.dsh; then
+            for name in sessions storages attachments; do
+                dir="/root/.dsh/$name"
+                if [[ -d "$dir" && ! -L "$dir" ]] && ! mountpoint -q "$dir"; then
+                    contents=("$dir"/*)
+                    if (( ${#contents[@]} > 0 )); then
+                        mv -- "${contents[@]}" "/var/lib/devvm-dsh/$name/"
+                    fi
+                fi
+            done
+        fi
+
         if [[ -L /root/.dsh ]]; then rm -f /root/.dsh; fi
         install -d -m 700 /root/.dsh
-        for target in /root/.dsh/sessions /root/.dsh/storages /root/.dsh/attachments; do
-            if [[ -L "$target" ]]; then rm -f "$target"; fi
-            install -d -m 700 "$target"
-        done
-        for source in /devvm-root/.dsh/*; do
-            name="${source##*/}"
-            [[ "$name" == "sessions" || "$name" == "storages" || "$name" == "attachments" || "$name" == ".sync-dirty" ]] && continue
-            target="/root/.dsh/$name"
-            rm -rf -- "$target"
-            ln -s "$source" "$target"
+        mountpoint -q /root/.dsh || mount --bind /devvm-root/.dsh /root/.dsh
+        for name in sessions storages attachments; do
+            mountpoint -q "/root/.dsh/$name" || mount --bind "/var/lib/devvm-dsh/$name" "/root/.dsh/$name"
         done
 
         for source in /devvm-root/*; do

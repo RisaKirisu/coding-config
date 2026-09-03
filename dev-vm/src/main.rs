@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use devvm_daemon::{
     create_router, default_home_dir, detect_tailscale_ipv4, determine_bind_addresses,
-    generate_dns_setup_instructions, save_sync_config, AppState, DaemonConfig, DnsConfig,
+    generate_dns_setup_instructions, provision_sync_setup, AppState, DaemonConfig, DnsConfig,
     DnsServer, DshRuntimeManager, Platform, ServiceManager, SyncConfig, SyncManager,
 };
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -126,6 +126,9 @@ pub struct SyncSetupArgs {
 
     #[arg(long, default_value_t = false)]
     pub no_verify: bool,
+
+    #[arg(long, env = "DEVVM_PORT")]
+    pub port: Option<u16>,
 }
 
 #[derive(clap::Args, Debug, Clone, PartialEq, Eq)]
@@ -356,15 +359,17 @@ async fn run_sync_setup(args: SyncSetupArgs) -> Result<(), Box<dyn std::error::E
         ssh_port: args.ssh_port,
         ssh_key_path: args.ssh_key,
         remote_sync_root: args.remote_root,
+        writer_id: None,
+        daemon_url: None,
     };
 
     let sync_manager = SyncManager::new();
     if !args.no_verify {
         println!(
-            "Verifying SSH/rsync connectivity with Sync Store at {}@{}:{}...",
+            "Verifying SSH connectivity with Sync Store at {}@{}:{}...",
             sync_config.ssh_user, sync_config.ssh_host, sync_config.ssh_port
         );
-        if let Err(e) = sync_manager.verify_connection(&sync_config).await {
+        if let Err(e) = sync_manager.verify(&sync_config).await {
             eprintln!("Verification failed: {}", e);
             return Err(e.into());
         }
@@ -376,7 +381,10 @@ async fn run_sync_setup(args: SyncSetupArgs) -> Result<(), Box<dyn std::error::E
         home.join(".config/devvm/sync.json")
     });
 
-    save_sync_config(&config_path, &sync_config)?;
+    let port = args.port.unwrap_or_else(|| DaemonConfig::new().port);
+    let daemon_url = format!("http://127.0.0.1:{}", port);
+
+    provision_sync_setup(&config_path, &sync_config, &daemon_url)?;
     println!("Sync configuration saved to {}", config_path.display());
     Ok(())
 }

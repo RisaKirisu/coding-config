@@ -1,6 +1,6 @@
 use crate::browser::{browse_directory, BrowserError};
 use crate::config::DaemonConfig;
-use crate::logs::read_recent_logs;
+use crate::logs::{append_log_logged, read_recent_logs};
 use crate::models::{
     compute_project_host, ActionResponse, DshStatus, LogsResponse, OpenPortRequest,
     OpenPortResponse, ProjectLinks, ProjectRecord, ProjectView, RegisterRequest,
@@ -32,6 +32,24 @@ pub struct AppState {
     pub sync_manager: SyncManager,
 }
 
+/// The single place a handler error is recorded: one `tracing` event, one `[daemon:error]`
+/// line in the Project's `daemon.log` when the Project is known, and the JSON error body.
+/// Callers that fail must not append their own error line, or the viewer shows it twice.
+fn api_error(
+    status: StatusCode,
+    log_dir: &std::path::Path,
+    project: Option<Uuid>,
+    context: &str,
+    error: impl std::fmt::Display,
+) -> Response {
+    let error = error.to_string();
+    tracing::error!(project = ?project, context, error = %error, "request failed");
+    if let Some(project_id) = project {
+        append_log_logged(log_dir, project_id, "daemon:error", &error);
+    }
+    (status, Json(json!({ "error": error }))).into_response()
+}
+
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index_handler))
@@ -48,15 +66,21 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/projects/{id}/vm/delete", post(delete_vm_handler))
         .route("/api/projects/{id}/dsh/launch", post(launch_dsh_handler))
         .route("/api/projects/{id}/dsh/stop", post(stop_dsh_handler))
+        .route("/api/projects/{id}/dsh/restart", post(restart_dsh_handler))
         .route("/api/projects/{id}/open-port", post(open_port_handler))
-        .route(
-            "/api/projects/{id}/sync/trigger",
-            post(trigger_sync_handler),
-        )
         .route("/api/projects/{id}/sync/delete", post(delete_sync_handler))
         .route("/api/sync/config", get(get_sync_config_handler))
         .route("/api/sync/setup", post(setup_sync_handler))
         .route("/api/browser", get(browser_handler))
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http()
+                .make_span_with(
+                    tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO),
+                )
+                .on_response(
+                    tower_http::trace::DefaultOnResponse::new().level(tracing::Level::INFO),
+                ),
+        )
         .with_state(Arc::new(state))
 }
 
@@ -74,15 +98,21 @@ async fn build_project_view(state: &AppState, record: &ProjectRecord) -> Project
 
     let project_host = compute_project_host(&record.path);
     let vm_status = check_vm_status(&state.config, &record.path).await;
-    let dsh_status = state.dsh_runtime_manager.get_status(record.id).await;
+    let dsh_status = state
+        .dsh_runtime_manager
+        .get_status(&state.config, record.id, &record.path)
+        .await;
 
     let is_configured = load_sync_config(&state.config.sync_config_path)
         .map(|c| c.is_some())
         .unwrap_or(false);
-    let sync_status = state
-        .sync_manager
-        .get_status(record.id, is_configured)
-        .await;
+    // `devvm exec` auto-creates and starts a DevVM, so the runner must never be called
+    // for a Project whose DevVM is not already running.
+    let sync_status = if is_configured && vm_status == crate::models::VmStatus::Running {
+        state.sync_manager.read_status(&record.path).await
+    } else {
+        None
+    };
 
     let (local_dsh_url, tailnet_dsh_url) = if dsh_status == DshStatus::Running {
         (
@@ -131,11 +161,13 @@ async fn list_projects(State(state): State<Arc<AppState>>) -> Response {
     let records = match load_projects(&state.config.config_path) {
         Ok(r) => r,
         Err(e) => {
-            return (
+            return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("Failed to load projects: {}", e) })),
-            )
-                .into_response();
+                &state.config.log_dir,
+                None,
+                "list_projects",
+                format!("Failed to load projects: {}", e),
+            );
         }
     };
 
@@ -147,27 +179,30 @@ async fn list_projects(State(state): State<Arc<AppState>>) -> Response {
     Json(views).into_response()
 }
 
-fn get_project_or_response(
-    state: &AppState,
-    id: Uuid,
-) -> Result<ProjectRecord, (StatusCode, Json<serde_json::Value>)> {
+fn get_project_or_response(state: &AppState, id: Uuid) -> Result<ProjectRecord, Box<Response>> {
     match get_project(&state.config.config_path, id) {
         Ok(Some(p)) => Ok(p),
-        Ok(None) => Err((
+        Ok(None) => Err(Box::new(api_error(
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": "Project not found" })),
-        )),
-        Err(e) => Err((
+            &state.config.log_dir,
+            None,
+            "get_project",
+            "Project not found",
+        ))),
+        Err(e) => Err(Box::new(api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("Registry error: {}", e) })),
-        )),
+            &state.config.log_dir,
+            None,
+            "get_project",
+            format!("Registry error: {}", e),
+        ))),
     }
 }
 
 async fn get_project_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
     let project = match get_project_or_response(&state, id) {
         Ok(p) => p,
-        Err(resp) => return resp.into_response(),
+        Err(resp) => return *resp,
     };
     let view = build_project_view(&state, &project).await;
     Json(view).into_response()
@@ -182,21 +217,27 @@ async fn register_project_handler(
             let view = build_project_view(&state, &rec).await;
             Json(view).into_response()
         }
-        Err(RegistryError::PathNotFound(p)) => (
+        Err(RegistryError::PathNotFound(p)) => api_error(
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": format!("Path not found: {}", p) })),
-        )
-            .into_response(),
-        Err(RegistryError::NotADirectory(p)) => (
+            &state.config.log_dir,
+            None,
+            "register_project",
+            format!("Path not found: {}", p),
+        ),
+        Err(RegistryError::NotADirectory(p)) => api_error(
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": format!("Path is not a directory: {}", p) })),
-        )
-            .into_response(),
-        Err(e) => (
+            &state.config.log_dir,
+            None,
+            "register_project",
+            format!("Path is not a directory: {}", p),
+        ),
+        Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("Registration failed: {}", e) })),
-        )
-            .into_response(),
+            &state.config.log_dir,
+            None,
+            "register_project",
+            format!("Registration failed: {}", e),
+        ),
     }
 }
 
@@ -210,24 +251,28 @@ async fn unregister_project_handler(
             message: Some("Project unregistered successfully".to_string()),
         })
         .into_response(),
-        Ok(false) => (
+        Ok(false) => api_error(
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": "Project not found in registry" })),
-        )
-            .into_response(),
-        Err(e) => (
+            &state.config.log_dir,
+            None,
+            "unregister_project",
+            "Project not found in registry",
+        ),
+        Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("Failed to unregister: {}", e) })),
-        )
-            .into_response(),
+            &state.config.log_dir,
+            Some(id),
+            "unregister_project",
+            format!("Failed to unregister: {}", e),
+        ),
     }
 }
 
 async fn get_logs_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
-    let logs = read_recent_logs(&state.config.log_dir, id, 65536);
+    let entries = read_recent_logs(&state.config.log_dir, id, 65536);
     Json(LogsResponse {
         project_id: id,
-        logs,
+        entries,
     })
     .into_response()
 }
@@ -235,7 +280,7 @@ async fn get_logs_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uui
 async fn start_vm_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
     let project = match get_project_or_response(&state, id) {
         Ok(p) => p,
-        Err(resp) => return resp.into_response(),
+        Err(resp) => return *resp,
     };
 
     match run_vm_start(&state.config, id, &project.path).await {
@@ -244,23 +289,25 @@ async fn start_vm_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uui
             message: Some("DevVM started".to_string()),
         })
         .into_response(),
-        Err(e) => (
+        Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e })),
-        )
-            .into_response(),
+            &state.config.log_dir,
+            Some(id),
+            "start_vm",
+            e,
+        ),
     }
 }
 
 async fn stop_vm_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
     let project = match get_project_or_response(&state, id) {
         Ok(p) => p,
-        Err(resp) => return resp.into_response(),
+        Err(resp) => return *resp,
     };
 
     state
         .dsh_runtime_manager
-        .handle_vm_stopped(&state.config, id)
+        .handle_vm_stopped(&state.config, id, &project.path)
         .await;
 
     match run_vm_stop(&state.config, id, &project.path).await {
@@ -269,23 +316,25 @@ async fn stop_vm_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uuid
             message: Some("DevVM stopped".to_string()),
         })
         .into_response(),
-        Err(e) => (
+        Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e })),
-        )
-            .into_response(),
+            &state.config.log_dir,
+            Some(id),
+            "stop_vm",
+            e,
+        ),
     }
 }
 
 async fn delete_vm_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
     let project = match get_project_or_response(&state, id) {
         Ok(p) => p,
-        Err(resp) => return resp.into_response(),
+        Err(resp) => return *resp,
     };
 
     state
         .dsh_runtime_manager
-        .handle_vm_stopped(&state.config, id)
+        .handle_vm_stopped(&state.config, id, &project.path)
         .await;
 
     match run_vm_delete(&state.config, id, &project.path).await {
@@ -294,23 +343,25 @@ async fn delete_vm_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uu
             message: Some("DevVM deleted".to_string()),
         })
         .into_response(),
-        Err(e) => (
+        Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e })),
-        )
-            .into_response(),
+            &state.config.log_dir,
+            Some(id),
+            "delete_vm",
+            e,
+        ),
     }
 }
 
 async fn launch_dsh_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
     let project = match get_project_or_response(&state, id) {
         Ok(p) => p,
-        Err(resp) => return resp.into_response(),
+        Err(resp) => return *resp,
     };
 
     match state
         .dsh_runtime_manager
-        .launch_dsh(&state.config, &state.sync_manager, id, &project.path)
+        .launch_dsh(&state.config, id, &project.path)
         .await
     {
         Ok(()) => Json(ActionResponse {
@@ -318,39 +369,54 @@ async fn launch_dsh_handler(State(state): State<Arc<AppState>>, Path(id): Path<U
             message: Some("DSH launched".to_string()),
         })
         .into_response(),
-        Err(e) => (
+        Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e })),
-        )
-            .into_response(),
+            &state.config.log_dir,
+            Some(id),
+            "launch_dsh",
+            e,
+        ),
     }
 }
 
-async fn trigger_sync_handler(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<Uuid>,
-) -> Response {
+async fn restart_dsh_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
     let project = match get_project_or_response(&state, id) {
         Ok(p) => p,
-        Err(resp) => return resp.into_response(),
+        Err(resp) => return *resp,
     };
 
-    match state
-        .sync_manager
-        .trigger_sync(&state.config, id, &project.path)
+    // `stop_dsh` already reports an absent or stopped runtime as `Ok(())`.
+    if let Err(e) = state
+        .dsh_runtime_manager
+        .stop_dsh(&state.config, id, &project.path)
         .await
     {
-        Ok(status) => Json(json!({
-            "status": "ok",
-            "message": "Synchronization triggered",
-            "sync_status": status
-        }))
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &state.config.log_dir,
+            Some(id),
+            "restart_dsh",
+            e,
+        );
+    }
+
+    match state
+        .dsh_runtime_manager
+        .launch_dsh(&state.config, id, &project.path)
+        .await
+    {
+        Ok(()) => Json(ActionResponse {
+            status: "ok".to_string(),
+            message: Some("DSH restarted".to_string()),
+        })
         .into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &state.config.log_dir,
+            Some(id),
+            "restart_dsh",
+            e,
+        ),
     }
 }
 
@@ -360,16 +426,18 @@ async fn delete_sync_handler(
     Json(payload): Json<SyncDeleteRequest>,
 ) -> Response {
     if !payload.confirmed {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "Confirmation required: set confirmed=true to delete remote sync store" })),
-        )
-            .into_response();
+            &state.config.log_dir,
+            Some(id),
+            "delete_sync",
+            "Confirmation required: set confirmed=true to delete remote sync store",
+        );
     }
 
     let _project = match get_project_or_response(&state, id) {
         Ok(p) => p,
-        Err(resp) => return resp.into_response(),
+        Err(resp) => return *resp,
     };
 
     match state
@@ -382,11 +450,13 @@ async fn delete_sync_handler(
             message: Some("Remote sync store deleted".to_string()),
         })
         .into_response(),
-        Err(e) => (
+        Err(e) => api_error(
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+            &state.config.log_dir,
+            Some(id),
+            "delete_sync",
+            e,
+        ),
     }
 }
 
@@ -402,11 +472,13 @@ async fn get_sync_config_handler(State(state): State<Arc<AppState>>) -> Response
             config: None,
         })
         .into_response(),
-        Err(e) => (
+        Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("Failed to read sync config: {}", e) })),
-        )
-            .into_response(),
+            &state.config.log_dir,
+            None,
+            "get_sync_config",
+            format!("Failed to read sync config: {}", e),
+        ),
     }
 }
 
@@ -420,24 +492,32 @@ async fn setup_sync_handler(
         ssh_port: payload.ssh_port,
         ssh_key_path: payload.ssh_key_path,
         remote_sync_root: payload.remote_sync_root,
+        writer_id: None,
+        daemon_url: None,
     };
 
     if payload.verify {
-        if let Err(e) = state.sync_manager.verify_connection(&sync_config).await {
-            return (
+        if let Err(e) = state.sync_manager.verify(&sync_config).await {
+            return api_error(
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "error": format!("Verification failed: {}", e) })),
-            )
-                .into_response();
+                &state.config.log_dir,
+                None,
+                "setup_sync",
+                format!("Verification failed: {}", e),
+            );
         }
     }
 
-    if let Err(e) = provision_sync_setup(&state.config.sync_config_path, &sync_config) {
-        return (
+    let daemon_url = format!("http://127.0.0.1:{}", state.config.port);
+    if let Err(e) = provision_sync_setup(&state.config.sync_config_path, &sync_config, &daemon_url)
+    {
+        return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("Failed to save sync config: {}", e) })),
-        )
-            .into_response();
+            &state.config.log_dir,
+            None,
+            "setup_sync",
+            format!("Failed to save sync config: {}", e),
+        );
     }
 
     Json(json!({
@@ -449,17 +529,28 @@ async fn setup_sync_handler(
 }
 
 async fn stop_dsh_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
-    match state.dsh_runtime_manager.stop_dsh(&state.config, id).await {
+    let project = match get_project_or_response(&state, id) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+
+    match state
+        .dsh_runtime_manager
+        .stop_dsh(&state.config, id, &project.path)
+        .await
+    {
         Ok(()) => Json(ActionResponse {
             status: "ok".to_string(),
             message: Some("DSH stopped".to_string()),
         })
         .into_response(),
-        Err(e) => (
+        Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e })),
-        )
-            .into_response(),
+            &state.config.log_dir,
+            Some(id),
+            "stop_dsh",
+            e,
+        ),
     }
 }
 
@@ -469,16 +560,18 @@ async fn open_port_handler(
     Json(payload): Json<OpenPortRequest>,
 ) -> Response {
     if payload.port == 0 {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "Port must be greater than 0" })),
-        )
-            .into_response();
+            &state.config.log_dir,
+            Some(id),
+            "open_port",
+            "Port must be greater than 0",
+        );
     }
 
     let project = match get_project_or_response(&state, id) {
         Ok(p) => p,
-        Err(resp) => return resp.into_response(),
+        Err(resp) => return *resp,
     };
 
     let project_host = compute_project_host(&project.path);
@@ -509,19 +602,33 @@ async fn browser_handler(
 ) -> Response {
     match browse_directory(&state.config.home_dir, params.path.as_deref()) {
         Ok(result) => Json(result).into_response(),
-        Err(BrowserError::AccessDenied(msg)) => {
-            (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response()
-        }
-        Err(BrowserError::PathNotFound(msg)) => {
-            (StatusCode::NOT_FOUND, Json(json!({ "error": msg }))).into_response()
-        }
-        Err(BrowserError::NotADirectory(msg)) => {
-            (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
-        }
-        Err(BrowserError::IoError(e)) => (
+        Err(BrowserError::AccessDenied(msg)) => api_error(
+            StatusCode::FORBIDDEN,
+            &state.config.log_dir,
+            None,
+            "browse_directory",
+            msg,
+        ),
+        Err(BrowserError::PathNotFound(msg)) => api_error(
+            StatusCode::NOT_FOUND,
+            &state.config.log_dir,
+            None,
+            "browse_directory",
+            msg,
+        ),
+        Err(BrowserError::NotADirectory(msg)) => api_error(
+            StatusCode::BAD_REQUEST,
+            &state.config.log_dir,
+            None,
+            "browse_directory",
+            msg,
+        ),
+        Err(BrowserError::IoError(e)) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("I/O error: {}", e) })),
-        )
-            .into_response(),
+            &state.config.log_dir,
+            None,
+            "browse_directory",
+            format!("I/O error: {}", e),
+        ),
     }
 }

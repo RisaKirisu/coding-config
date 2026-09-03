@@ -194,7 +194,8 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         .badge-starting,
         .badge-stopping,
         .badge-sync-synchronizing { background-color: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
-        .badge-sync-degraded { background-color: #fffbeb; color: #b45309; border-color: #fde68a; }
+        .badge-sync-degraded,
+        .badge-sync-remote_ahead { background-color: #fffbeb; color: #b45309; border-color: #fde68a; }
 
         .spinner {
             width: 11px;
@@ -366,19 +367,95 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
             background-color: var(--surface-muted);
         }
 
-        .logs-pre {
+        .log-toolbar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+
+        .chip {
             background-color: var(--surface-muted);
-            color: #334155;
             border: 1px solid var(--card-border);
+            border-radius: 999px;
+            color: var(--text-muted);
+            cursor: pointer;
+            font-size: 0.78rem;
+            padding: 4px 12px;
+        }
+
+        .chip.active {
+            background-color: #1d4ed8;
+            border-color: #1d4ed8;
+            color: #ffffff;
+        }
+
+        .log-list {
+            background-color: var(--surface-muted);
+            border: 1px solid var(--card-border);
+            border-radius: 9px;
             font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
             font-size: 0.8125rem;
-            line-height: 1.6;
-            padding: 16px;
-            border-radius: 9px;
-            overflow-x: auto;
-            max-height: 500px;
+            height: 70vh;
+            overflow-y: auto;
+        }
+
+        .log-row {
+            display: flex;
+            gap: 10px;
+            padding: 3px 12px;
+            align-items: baseline;
+        }
+
+        .log-row:nth-child(even) {
+            background-color: rgba(15, 23, 42, 0.04);
+        }
+
+        .log-row.log-warn {
+            background-color: rgba(217, 119, 6, 0.12);
+        }
+
+        .log-row.log-error {
+            background-color: rgba(220, 38, 38, 0.12);
+        }
+
+        .log-ts {
+            color: var(--text-muted);
+            flex: none;
+        }
+
+        .log-badge {
+            border-radius: 4px;
+            color: #ffffff;
+            flex: none;
+            font-size: 0.7rem;
+            padding: 1px 6px;
+            text-transform: uppercase;
+            width: 68px;
+            text-align: center;
+        }
+
+        .log-badge-daemon {
+            background-color: #1d4ed8;
+        }
+
+        .log-badge-dsh {
+            background-color: #15803d;
+        }
+
+        .log-badge-ingress {
+            background-color: #64748b;
+        }
+
+        .log-msg {
+            color: #334155;
             white-space: pre-wrap;
             word-break: break-all;
+        }
+
+        .log-empty {
+            color: var(--text-muted);
+            padding: 16px;
         }
 
         .form-group {
@@ -495,13 +572,20 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
     <!-- Logs Modal -->
     <div id="logs-modal" class="modal-overlay">
-        <div class="modal" style="max-width: 900px;">
+        <div class="modal" style="max-width: 1100px;">
             <div class="modal-header">
                 <h2 id="logs-title">Project Logs</h2>
                 <button class="close-btn" onclick="closeModal('logs-modal')">&times;</button>
             </div>
             <div class="modal-body">
-                <pre id="logs-content" class="logs-pre">Loading logs...</pre>
+                <div class="log-toolbar">
+                    <button class="chip active" data-source="daemon" onclick="toggleLogSource('daemon', this)">daemon</button>
+                    <button class="chip active" data-source="dsh" onclick="toggleLogSource('dsh', this)">dsh</button>
+                    <button class="chip active" data-source="ingress" onclick="toggleLogSource('ingress', this)">ingress</button>
+                    <button class="chip" id="log-errors-chip" onclick="toggleLogErrorsOnly(this)">errors only</button>
+                    <button class="chip active" id="log-follow-chip" onclick="toggleLogFollow(this)">Follow</button>
+                </div>
+                <div id="logs-content" class="log-list"><div class="log-empty">Loading logs...</div></div>
             </div>
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="refreshCurrentLogs()">Refresh Logs</button>
@@ -515,6 +599,10 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         let currentParent = null;
         let activeLogProjectId = null;
         let logRefreshTimer = null;
+        let logEntries = [];
+        let logSources = { daemon: true, dsh: true, ingress: true };
+        let logErrorsOnly = false;
+        let logFollow = true;
         let currentProjects = [];
         const pendingActions = new Map();
 
@@ -593,10 +681,14 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
                 const vmBadge = `<span class="badge badge-${vmStatus.value}">${vmSpinner}VM: ${vmStatus.label}</span>`;
                 const dshBadge = `<span class="badge badge-${dshStatus.value}">${dshSpinner}DSH: ${dshStatus.label}</span>`;
 
-                const syncStatus = p.sync_status || 'not_configured';
+                const syncStatus = p.sync_status;
                 const syncSpinner = syncStatus === 'synchronizing' ? '<span class="spinner" aria-hidden="true"></span>' : '';
-                const syncLabel = syncStatus.charAt(0).toUpperCase() + syncStatus.slice(1).replace('_', ' ');
-                const syncBadge = `<span class="badge badge-sync-${syncStatus}">${syncSpinner}Sync: ${syncLabel}</span>`;
+                const syncLabel = syncStatus
+                    ? syncStatus.charAt(0).toUpperCase() + syncStatus.slice(1).replace('_', ' ')
+                    : '';
+                const syncBadge = syncStatus
+                    ? `<span class="badge badge-sync-${syncStatus}">${syncSpinner}Sync: ${syncLabel}</span>`
+                    : '';
 
                 const localDshUrl = p.links && (p.links.local_dsh_url || p.links.dsh_url);
                 const tailnetDshUrl = p.links && p.links.tailnet_dsh_url;
@@ -620,6 +712,10 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
                     : dshStatus.value === 'running'
                         ? `<button class="btn btn-secondary btn-sm" onclick="stopDsh('${p.id}')">Stop DSH</button>`
                         : `<button class="btn btn-secondary btn-sm" onclick="launchDsh('${p.id}')">Launch DSH</button>`;
+
+                const dshRestartBtn = dshStatus.value === 'running' && !dshStatus.loading
+                    ? `<button class="btn btn-secondary btn-sm" onclick="restartDsh('${p.id}')">Restart DSH</button>`
+                    : '';
 
                 return `
                     <div class="project-card" id="card-${p.id}">
@@ -647,8 +743,8 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
                             ${localDshLink}
                             ${tailnetDshLink}
                             ${dshActionBtn}
+                            ${dshRestartBtn}
                             ${vmActionBtn}
-                            <button class="btn btn-secondary btn-sm" onclick="triggerProjectSync('${p.id}')">Sync Now</button>
                             <button class="btn btn-secondary btn-sm" onclick="viewLogs('${p.id}', '${escapeHtml(p.name)}')">View Logs</button>
                             <button class="btn btn-secondary btn-sm" onclick="unregisterProject('${p.id}')">Unregister</button>
                             <button class="btn btn-secondary btn-sm" onclick="deleteProjectSync('${p.id}', '${escapeHtml(p.name)}')">Delete Sync Store</button>
@@ -801,17 +897,8 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
             await runLifecycleAction(id, { dsh: 'stopping' }, `/api/projects/${id}/dsh/stop`, 'stopping DSH');
         }
 
-        async function triggerProjectSync(id) {
-            try {
-                const res = await fetch(`/api/projects/${id}/sync/trigger`, { method: 'POST' });
-                if (!res.ok) {
-                    const err = await res.json().catch(() => ({}));
-                    throw new Error(err.error || 'Failed to trigger sync');
-                }
-                fetchProjects();
-            } catch (err) {
-                alert('Error triggering sync: ' + err.message);
-            }
+        async function restartDsh(id) {
+            await runLifecycleAction(id, { dsh: 'starting' }, `/api/projects/${id}/dsh/restart`, 'restarting DSH');
         }
 
         async function deleteProjectSync(id, name) {
@@ -909,11 +996,67 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
         async function viewLogs(id, name) {
             activeLogProjectId = id;
+            logSources = { daemon: true, dsh: true, ingress: true };
+            logErrorsOnly = false;
+            logFollow = true;
+            logEntries = [];
+            document.querySelectorAll('#logs-modal .chip[data-source]').forEach(chip => chip.classList.add('active'));
+            document.getElementById('log-errors-chip').classList.remove('active');
+            document.getElementById('log-follow-chip').classList.add('active');
             document.getElementById('logs-title').textContent = `Logs: ${name}`;
             document.getElementById('logs-modal').style.display = 'flex';
             await refreshCurrentLogs();
             clearInterval(logRefreshTimer);
             logRefreshTimer = setInterval(refreshCurrentLogs, 2000);
+        }
+
+        function toggleLogSource(source, chip) {
+            logSources[source] = !logSources[source];
+            chip.classList.toggle('active', logSources[source]);
+            renderLogEntries();
+        }
+
+        function toggleLogErrorsOnly(chip) {
+            logErrorsOnly = !logErrorsOnly;
+            chip.classList.toggle('active', logErrorsOnly);
+            renderLogEntries();
+        }
+
+        function toggleLogFollow(chip) {
+            logFollow = !logFollow;
+            chip.classList.toggle('active', logFollow);
+            renderLogEntries();
+        }
+
+        function formatLogTime(ts) {
+            const date = new Date(ts);
+            if (!ts || isNaN(date.getTime())) return '--:--:--.---';
+            const pad = (value, width) => String(value).padStart(width, '0');
+            return `${pad(date.getHours(), 2)}:${pad(date.getMinutes(), 2)}:${pad(date.getSeconds(), 2)}.${pad(date.getMilliseconds(), 3)}`;
+        }
+
+        function renderLogEntries() {
+            const el = document.getElementById('logs-content');
+            const previousScroll = el.scrollTop;
+            const rows = logEntries.filter(entry =>
+                logSources[entry.source] !== false && (!logErrorsOnly || entry.level === 'error'));
+
+            if (rows.length === 0) {
+                el.innerHTML = '<div class="log-empty">(No logs recorded yet)</div>';
+                return;
+            }
+
+            el.innerHTML = rows.map(entry => {
+                const source = ['daemon', 'dsh', 'ingress'].includes(entry.source) ? entry.source : 'daemon';
+                const level = ['info', 'warn', 'error'].includes(entry.level) ? entry.level : 'info';
+                return `<div class="log-row log-${level}">` +
+                    `<span class="log-ts">${formatLogTime(entry.ts)}</span>` +
+                    `<span class="log-badge log-badge-${source}">${source}</span>` +
+                    `<span class="log-msg">${escapeHtml(entry.message)}</span>` +
+                    `</div>`;
+            }).join('');
+
+            el.scrollTop = logFollow ? el.scrollHeight : previousScroll;
         }
 
         async function refreshCurrentLogs() {
@@ -923,10 +1066,10 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
                 const res = await fetch(`/api/projects/${activeLogProjectId}/logs`);
                 if (!res.ok) throw new Error('Failed to fetch logs');
                 const data = await res.json();
-                logsEl.textContent = data.logs || '(No logs recorded yet)';
-                logsEl.scrollTop = logsEl.scrollHeight;
+                logEntries = data.entries || [];
+                renderLogEntries();
             } catch (err) {
-                logsEl.textContent = 'Error loading logs: ' + err.message;
+                logsEl.innerHTML = `<div class="log-empty">Error loading logs: ${escapeHtml(err.message)}</div>`;
             }
         }
 
@@ -948,6 +1091,14 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
             if (!str) return '';
             return str.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
         }
+
+        // Follow tracks whether the reader is parked at the bottom of the log list.
+        document.getElementById('logs-content').addEventListener('scroll', (event) => {
+            const el = event.currentTarget;
+            const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 24;
+            logFollow = atBottom;
+            document.getElementById('log-follow-chip').classList.toggle('active', atBottom);
+        });
 
         // Initial load and periodic polling
         fetchProjects();

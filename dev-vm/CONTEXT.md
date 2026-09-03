@@ -17,7 +17,7 @@ The isolated microVM assigned to one Project. A Project has at most one active D
 _Avoid_: Container, sandbox, workspace VM
 
 **DSH Runtime**:
-The managed DeepSeek Harness process running inside a DevVM. Its lifecycle and status are distinct from the DevVM lifecycle.
+The managed DeepSeek Harness process running inside a DevVM. Its lifecycle and status are distinct from the DevVM lifecycle, and its status is read from the DevVM rather than from Control Daemon memory.
 _Avoid_: DSH server, Harness VM
 
 **Portable DSH State**:
@@ -31,10 +31,6 @@ _Avoid_: Cloud, session server, remote database
 **Session Sync**:
 Synchronization of a Project's DSH sessions and related Portable DSH State between its DevVM and Sync Store.
 _Avoid_: Specialized architecture jargon for ordinary session syncing
-
-**Dirty Local State**:
-Portable DSH State containing durable local changes not yet confirmed in the Sync Store. Dirty Local State takes precedence during startup reconciliation.
-_Avoid_: Unsaved state, pending cache
 
 **Loopback Facade**:
 The ingress behavior that presents routed requests to applications as loopback-origin traffic while preserving the browser-facing Project URL.
@@ -69,9 +65,9 @@ Remove a Project from the Control Daemon's registry without deleting its DevVM o
 _Avoid_: Delete project, remove VM
 
 **Sync Status**:
-The latest observable state of a Project's synchronization: not yet synchronized, synchronizing, synchronized, or failed.
-_Avoid_: Connection status, backup status
+The latest observable state of a Project's synchronization: not configured, synchronizing, synchronized, remote ahead, degraded, or failed. Remote ahead means another workstation has written to the Sync Store since this one last exchanged with it, so the running DSH Runtime must be restarted to pick up that work.
+_Avoid_: Connection status, backup status, dirty, out of date
 
 **Project Log**:
-A host-persisted diagnostic stream associated with one Project and one managed process or operation.
+A host-persisted diagnostic stream associated with one Project and one writer: `daemon.log` from the Control Daemon, `dsh.log` from the DSH Runtime, and `ingress.log` from the ingress proxies, all in one host directory shared with the DevVM.
 _Avoid_: VM console, terminal history

@@ -6,6 +6,7 @@
   "main": "./index.mjs",
   "files": [
     "index.mjs",
+    "reconcile.mjs",
     "client.js",
     "cordis.patch.yml",
     "package.json",
@@ -24,6 +25,7 @@
   },
   "exports": {
     ".": "./index.mjs",
+    "./reconcile": "./reconcile.mjs",
     "./client": "./client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"

@@ -1,12 +1,34 @@
 use crate::config::DaemonConfig;
-use crate::logs::append_log;
+use crate::logs::append_log_logged;
 use crate::models::VmStatus;
 use std::path::Path;
 use std::process::Stdio;
 use tokio::process::Command;
 use uuid::Uuid;
 
+pub fn log_command_failure(program: &str, args: &[String], output: &std::process::Output) {
+    tracing::error!(
+        program,
+        args = ?args,
+        exit_code = ?output.status.code(),
+        stdout = %String::from_utf8_lossy(&output.stdout),
+        stderr = %String::from_utf8_lossy(&output.stderr),
+        "command failed"
+    );
+}
+
+pub fn log_command_spawn_failure(program: &str, args: &[String], error: &std::io::Error) {
+    tracing::error!(
+        program,
+        args = ?args,
+        error = %error,
+        "command could not be executed"
+    );
+}
+
 pub async fn check_vm_status(config: &DaemonConfig, project_path: &Path) -> VmStatus {
+    let program = config.devvm_bin.display().to_string();
+    let args = vec!["status".to_string()];
     let mut cmd = Command::new(&config.devvm_bin);
     cmd.arg("status")
         .current_dir(project_path)
@@ -21,13 +43,23 @@ pub async fn check_vm_status(config: &DaemonConfig, project_path: &Path) -> VmSt
                 } else if stdout.contains("stopped") {
                     VmStatus::Stopped
                 } else {
+                    tracing::warn!(
+                        program,
+                        args = ?args,
+                        stdout = %stdout,
+                        "devvm status reported neither running nor stopped"
+                    );
                     VmStatus::Running
                 }
             } else {
+                log_command_failure(&program, &args, &output);
                 VmStatus::Stopped
             }
         }
-        Err(_) => VmStatus::Stopped,
+        Err(e) => {
+            log_command_spawn_failure(&program, &args, &e);
+            VmStatus::Stopped
+        }
     }
 }
 
@@ -38,12 +70,14 @@ async fn run_devvm_command(
     subcmd: &str,
 ) -> Result<(), String> {
     let cmd_desc = format!("devvm {}", subcmd);
-    let _ = append_log(
+    append_log_logged(
         &config.log_dir,
         project_id,
         "daemon",
         &format!("Invoking `{}`", cmd_desc),
     );
+    let program = config.devvm_bin.display().to_string();
+    let args = vec![subcmd.to_string()];
     let mut cmd = Command::new(&config.devvm_bin);
     cmd.arg(subcmd)
         .current_dir(project_path)
@@ -54,14 +88,14 @@ async fn run_devvm_command(
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !stdout.is_empty() {
-                let _ = append_log(&config.log_dir, project_id, "devvm", &stdout);
+                append_log_logged(&config.log_dir, project_id, "devvm", &stdout);
             }
             if !stderr.is_empty() {
-                let _ = append_log(&config.log_dir, project_id, "devvm:err", &stderr);
+                append_log_logged(&config.log_dir, project_id, "devvm:err", &stderr);
             }
 
             if output.status.success() {
-                let _ = append_log(
+                append_log_logged(
                     &config.log_dir,
                     project_id,
                     "daemon",
@@ -69,20 +103,19 @@ async fn run_devvm_command(
                 );
                 Ok(())
             } else {
+                log_command_failure(&program, &args, &output);
                 let err_msg = format!(
                     "{} exited with status {:?}: {}",
                     cmd_desc,
                     output.status.code(),
                     stderr.trim()
                 );
-                let _ = append_log(&config.log_dir, project_id, "daemon:error", &err_msg);
                 Err(err_msg)
             }
         }
         Err(e) => {
-            let err_msg = format!("Failed to execute `{}`: {}", cmd_desc, e);
-            let _ = append_log(&config.log_dir, project_id, "daemon:error", &err_msg);
-            Err(err_msg)
+            log_command_spawn_failure(&program, &args, &e);
+            Err(format!("Failed to execute `{}`: {}", cmd_desc, e))
         }
     }
 }

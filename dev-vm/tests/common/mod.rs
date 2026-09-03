@@ -1,145 +1,99 @@
 #![allow(dead_code)]
 
-use async_trait::async_trait;
 use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
-use devvm_daemon::{SyncConfig, SyncError, SyncRunner};
 use serde_json::json;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, Ordering};
-use uuid::Uuid;
 
-/// Fake `SyncRunner` providing deterministic reachability and transfer outcomes.
-pub struct FakeSyncRunner {
-    pub vps_reachable: AtomicBool,
-    pub rsync_fails: AtomicBool,
+/// Flattens the `entries` of `GET /api/projects/{id}/logs` into `[source] message` lines,
+/// for substring assertions over the merged Project Log.
+pub fn log_entries_text(logs: &serde_json::Value) -> String {
+    logs["entries"]
+        .as_array()
+        .expect("logs response must carry an entries array")
+        .iter()
+        .map(|entry| {
+            format!(
+                "[{}] {}",
+                entry["source"].as_str().unwrap_or_default(),
+                entry["message"].as_str().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-impl FakeSyncRunner {
-    pub fn new() -> Self {
-        Self {
-            vps_reachable: AtomicBool::new(true),
-            rsync_fails: AtomicBool::new(false),
-        }
-    }
+/// Creates a mock `ssh` executable that succeeds unless the Sync Store looks unreachable.
+/// Placed beside the mock `devvm` binary, which is where `SystemSyncRunner` looks for ssh.
+pub fn create_mock_ssh(bin_path: &Path) {
+    let script = r#"#!/usr/bin/env bash
+if [[ -f ".mock_ssh_fail" ]] || [[ "$*" == *"127.0.0.1:1"* ]] || [[ "$*" == *"-p 1 "* ]]; then
+    echo "Mock SSH: connection refused" >&2
+    exit 255
+fi
+exit 0
+"#;
+    let mut file = File::create(bin_path).unwrap();
+    file.write_all(script.as_bytes()).unwrap();
+    let mut perms = file.metadata().unwrap().permissions();
+    perms.set_mode(0o755);
+    file.set_permissions(perms).unwrap();
 }
 
-#[async_trait]
-impl SyncRunner for FakeSyncRunner {
-    async fn verify_connection(&self, _config: &SyncConfig) -> Result<(), SyncError> {
-        if self.vps_reachable.load(Ordering::SeqCst) {
-            Ok(())
-        } else {
-            Err(SyncError::ConnectionFailed(
-                "Connection refused to VPS Sync Store".to_string(),
-            ))
-        }
-    }
-
-    async fn run_rsync_push(
-        &self,
-        _config: &SyncConfig,
-        _project_id: Uuid,
-        _project_path: &Path,
-    ) -> Result<(), SyncError> {
-        if !self.vps_reachable.load(Ordering::SeqCst) || self.rsync_fails.load(Ordering::SeqCst) {
-            Err(SyncError::PushFailed(
-                "rsync push connection timed out".to_string(),
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    async fn run_rsync_pull(
-        &self,
-        _config: &SyncConfig,
-        _project_id: Uuid,
-        project_path: &Path,
-    ) -> Result<(), SyncError> {
-        if !self.vps_reachable.load(Ordering::SeqCst) || self.rsync_fails.load(Ordering::SeqCst) {
-            Err(SyncError::PullFailed(
-                "rsync pull connection timed out".to_string(),
-            ))
-        } else {
-            // Simulate pulling some sessions
-            let sessions_dir = project_path.join(".dsh/sessions");
-            let _ = fs::create_dir_all(&sessions_dir);
-            let _ = fs::write(sessions_dir.join("synced-session.jsonl"), "{}\n");
-            Ok(())
-        }
-    }
-
-    async fn delete_remote_store(
-        &self,
-        _config: &SyncConfig,
-        _project_id: Uuid,
-    ) -> Result<(), SyncError> {
-        if !self.vps_reachable.load(Ordering::SeqCst) {
-            Err(SyncError::DeletionFailed(
-                "Failed to connect to VPS for deletion".to_string(),
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    async fn is_local_state_dirty(&self, project_path: &Path) -> Result<bool, SyncError> {
-        Ok(devvm_daemon::is_local_state_dirty(
-            &project_path.join(".dsh"),
-        ))
-    }
-
-    async fn mark_local_state_dirty(&self, project_path: &Path) -> Result<(), SyncError> {
-        devvm_daemon::mark_local_state_dirty(&project_path.join(".dsh")).map_err(SyncError::IoError)
-    }
-
-    async fn mark_local_state_clean(&self, project_path: &Path) -> Result<(), SyncError> {
-        devvm_daemon::mark_local_state_clean(&project_path.join(".dsh")).map_err(SyncError::IoError)
-    }
-
-    async fn check_local_portable_state_exists(
-        &self,
-        project_path: &Path,
-    ) -> Result<bool, SyncError> {
-        Ok(devvm_daemon::check_local_portable_state_exists(
-            &project_path.join(".dsh"),
-        ))
-    }
-
-    async fn get_in_vm_sync_status(
-        &self,
-        _project_path: &Path,
-    ) -> Result<Option<devvm_daemon::models::SyncStatus>, SyncError> {
-        Ok(None)
-    }
-
-    async fn set_in_vm_sync_status(
-        &self,
-        _project_path: &Path,
-        _status: devvm_daemon::models::SyncStatus,
-        _is_dirty: bool,
-    ) -> Result<(), SyncError> {
-        Ok(())
-    }
+fn write_executable(path: &Path, script: &str) {
+    let mut file = File::create(path).unwrap();
+    file.write_all(script.as_bytes()).unwrap();
+    let mut perms = file.metadata().unwrap().permissions();
+    perms.set_mode(0o755);
+    file.set_permissions(perms).unwrap();
 }
 
-/// Creates a mock executable bash script for `devvm` CLI that simulates VM lifecycle
-/// and DSH execution with optional failure injection hooks.
-pub fn create_mock_devvm(bin_path: &Path) {
+/// Creates a mock executable bash script for `devvm` CLI that simulates VM lifecycle and
+/// evaluates guest command snippets with the absolute guest paths remapped into the test's
+/// own directories, so `/tmp/devvm-daemon-dsh.pid` on the host is never touched.
+///
+/// `log_dir` is the daemon's Project log directory, which the guest sees as
+/// `/devvm-root/.project-logs`.
+pub fn create_mock_devvm(bin_path: &Path, log_dir: &Path) {
+    let guest_bin = bin_path.parent().unwrap().join("mock_guest_bin");
+    std::fs::create_dir_all(&guest_bin).unwrap();
+    // Stands in for `dsh web`: announces its URL, records the start, then blocks until killed.
+    write_executable(
+        &guest_bin.join("dsh"),
+        r#"#!/usr/bin/env bash
+if [[ "${1:-}" == "web" ]]; then
+    printf 'start\n' >> "$MOCK_DSH_START_COUNTER"
+    echo "dsh web: http://127.0.0.1:3080"
+    exec sleep 300
+fi
+exit 0
+"#,
+    );
+    write_executable(
+        &guest_bin.join("devvm-sync-startup"),
+        r#"#!/usr/bin/env bash
+echo "devvm-sync-startup: startup reconciliation done"
+exit 0
+"#,
+    );
+
     let script = r#"#!/usr/bin/env bash
 cmd="${1:-status}"
 shift || true
 
 case "$cmd" in
     status)
+        if [[ -f ".vm_status_fail" ]]; then
+            echo "Mock DevVM: status probe failed hard" >&2
+            exit 3
+        fi
         if [[ -f ".vm_running" ]]; then
             echo "running"
             exit 0
@@ -170,61 +124,34 @@ case "$cmd" in
         if [[ "${1:-}" == "--" ]]; then
             shift
         fi
-        if [[ "$1" == "dsh" && "$2" == "web" ]] || [[ "$*" == *"dsh web"* ]]; then
-            mock_pid_file="$PWD/.mock_dsh.pid"
-            printf '%s\n' "$$" > "$mock_pid_file"
-            trap 'rm -f "$mock_pid_file"' EXIT
-            if [[ -f ".dsh_start_slow" ]]; then
-                sleep 0.4
-            fi
-            if [[ -f ".dsh_never_ready" ]]; then
-                while true; do
-                    sleep 0.1
-                done
-            fi
-            echo "dsh web: http://127.0.0.1:3080"
-            if [[ -f ".dsh_fail_fast" ]]; then
-                echo "Mock DSH: simulated crash" >&2
-                exit 2
-            fi
-            if [[ -f ".dsh_fail_short" ]]; then
-                sleep 0.3
-                echo "Mock DSH: simulated runtime failure" >&2
-                exit 3
-            fi
-            # Keep running until killed
-            while true; do
-                sleep 0.1
-            done
-        fi
 
         VM_DSH="$PWD/.mock_dsh"
         mkdir -p "$VM_DSH"
+        VM_RUN="$PWD/.mock_run"
+        mkdir -p "$VM_RUN"
 
         echo "$@" >> "$PWD/.mock_exec_invocations" 2>/dev/null || true
 
         if [[ "$1" == "/bin/sh" || "$1" == "/bin/bash" ]] && [[ "$2" == "-c" ]]; then
             cmd_body="$3"
-            if [[ "$cmd_body" == *"/tmp/devvm-daemon-dsh.pid"* ]]; then
-                rm -f "$PWD/.mock_dsh.pid"
-                exit 0
+            if [[ -f ".dsh_start_fail" && "$cmd_body" == *"exec dsh web"* ]]; then
+                echo "Mock DevVM: dsh could not be started" >&2
+                exit 7
             fi
-            mapped_cmd="${cmd_body//\/root\/.dsh/$VM_DSH}"
-            eval "$mapped_cmd"
+            mapped_cmd="${cmd_body//\/tmp\/devvm-daemon-dsh.pid/$PWD/.mock_dsh.pid}"
+            mapped_cmd="${mapped_cmd//\/devvm-root\/.project-logs/__LOG_DIR__}"
+            mapped_cmd="${mapped_cmd//\/run\/devvm/$VM_RUN}"
+            mapped_cmd="${mapped_cmd//\/root\/workspace/$PWD}"
+            mapped_cmd="${mapped_cmd//\/root\/.dsh/$VM_DSH}"
+            PATH="__GUEST_BIN__:$PATH" \
+                MOCK_DSH_START_COUNTER="$PWD/.mock_dsh_starts" \
+                bash -c "$mapped_cmd"
             exit $?
         fi
 
         if [[ "$1" == "rsync" ]]; then
-            if [[ -f ".mock_sync_fail" ]]; then
-                echo "Mock rsync: simulated failure" >&2
-                exit 1
-            fi
-            # If pulling from remote into /root/.dsh/:
-            if [[ "$*" == *"/root/.dsh/"* && "$*" != *"/root/.dsh/ "* ]]; then
-                mkdir -p "$VM_DSH/sessions"
-                echo "{}" > "$VM_DSH/sessions/synced-session.jsonl"
-            fi
-            exit 0
+            echo "Mock DevVM: the daemon must not invoke rsync" >&2
+            exit 1
         fi
 
         echo "Mock DevVM exec: $@"
@@ -235,12 +162,23 @@ case "$cmd" in
         exit 1
         ;;
 esac
-"#;
-    let mut file = File::create(bin_path).unwrap();
-    file.write_all(script.as_bytes()).unwrap();
-    let mut perms = file.metadata().unwrap().permissions();
-    perms.set_mode(0o755);
-    file.set_permissions(perms).unwrap();
+"#
+    .replace("__LOG_DIR__", &log_dir.display().to_string())
+    .replace("__GUEST_BIN__", &guest_bin.display().to_string());
+
+    write_executable(bin_path, &script);
+}
+
+/// Number of times the mock `dsh web` actually started for a Project.
+pub fn mock_dsh_start_count(project_dir: &Path) -> usize {
+    std::fs::read_to_string(project_dir.join(".mock_dsh_starts"))
+        .map(|content| content.lines().count())
+        .unwrap_or(0)
+}
+
+/// The isolated stand-in for the guest's `/tmp/devvm-daemon-dsh.pid`.
+pub fn mock_dsh_pid_file(project_dir: &Path) -> std::path::PathBuf {
+    project_dir.join(".mock_dsh.pid")
 }
 
 /// Builds a binary DNS query packet for standard UDP DNS servers.

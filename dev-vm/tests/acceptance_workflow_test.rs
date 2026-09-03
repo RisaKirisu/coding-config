@@ -2,8 +2,8 @@ mod common;
 
 use axum::Router;
 use common::{
-    build_dns_query, create_mock_devvm, echo_headers_handler, parse_dns_response, CaddyGuard,
-    FakeSyncRunner,
+    build_dns_query, create_mock_devvm, create_mock_ssh, echo_headers_handler, log_entries_text,
+    parse_dns_response, CaddyGuard,
 };
 use devvm_daemon::{
     create_router, AppState, DaemonConfig, DnsConfig, DnsServer, DshRuntimeManager, SyncManager,
@@ -14,8 +14,6 @@ use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
 use tokio::net::{TcpListener, UdpSocket};
@@ -30,7 +28,6 @@ struct AcceptanceContext {
     dns_addr: SocketAddr,
     echo_port: u16,
     client: reqwest::Client,
-    fake_runner: Arc<FakeSyncRunner>,
     _dns_shutdown_tx: watch::Sender<bool>,
     _caddy_guard: CaddyGuard,
 }
@@ -56,7 +53,13 @@ async fn setup_acceptance_system() -> AcceptanceContext {
     fs::create_dir_all(&log_dir).unwrap();
 
     let devvm_bin = temp_dir.path().join("mock_devvm");
-    create_mock_devvm(&devvm_bin);
+    create_mock_devvm(&devvm_bin, &log_dir);
+    create_mock_ssh(&temp_dir.path().join("ssh"));
+
+    // Guest Session Sync provisioning writes under DEVVM_ROOT; keep it inside the temp tree.
+    let devvm_root = temp_dir.path().join("devvm_root");
+    fs::create_dir_all(&devvm_root).unwrap();
+    std::env::set_var("DEVVM_ROOT", &devvm_root);
 
     // 1. Start Mock Upstream Echo Server (handles proxied traffic)
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -124,8 +127,7 @@ async fn setup_acceptance_system() -> AcceptanceContext {
         tailnet_domain: "devvm.internal".to_string(),
     };
 
-    let fake_runner = Arc::new(FakeSyncRunner::new());
-    let sync_manager = SyncManager::with_runner(fake_runner.clone());
+    let sync_manager = SyncManager::with_devvm_bin(config.devvm_bin.clone());
     let dsh_runtime_manager = DshRuntimeManager::new();
 
     let state = AppState {
@@ -174,7 +176,6 @@ async fn setup_acceptance_system() -> AcceptanceContext {
         dns_addr,
         echo_port,
         client,
-        fake_runner,
         _dns_shutdown_tx: dns_shutdown_tx,
         _caddy_guard: caddy_guard,
     }
@@ -265,7 +266,10 @@ async fn assert_step_2_project_registration_and_id_lifecycle(
     assert_eq!(proj_a["name"], "project-alpha");
     assert_eq!(proj_a["vm_status"], "stopped");
     assert_eq!(proj_a["dsh_status"], "stopped");
-    assert_eq!(proj_a["sync_status"], "not_configured");
+    assert!(
+        proj_a.get("sync_status").is_none(),
+        "sync_status is absent until Session Sync is configured"
+    );
 
     // Verify .devvm-id file was created with exact UUID
     let id_file = project_a_dir.join(".devvm-id");
@@ -308,6 +312,27 @@ async fn assert_step_2_project_registration_and_id_lifecycle(
     }
 }
 
+/// DSH is started detached inside the DevVM, so its status becomes observable a moment
+/// after the launch call returns.
+async fn wait_for_dsh_status(ctx: &AcceptanceContext, proj_url: &str, expected: &str) {
+    for _ in 0..100 {
+        let status: Value = ctx
+            .client
+            .get(proj_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if status["dsh_status"] == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("DSH never reached status {expected}");
+}
+
 /// Sub-step helper for Step 3: Start DevVM, Launch DSH, Verify Separate Statuses & Project URLs
 async fn assert_step_3_vm_and_dsh_lifecycle(ctx: &AcceptanceContext, project: &RegisteredProject) {
     let proj_url = format!("http://{}/api/projects/{}", ctx.server_addr, project.id);
@@ -344,7 +369,7 @@ async fn assert_step_3_vm_and_dsh_lifecycle(ctx: &AcceptanceContext, project: &R
         .unwrap();
     assert_eq!(launch_dsh_res.status(), ReqwestStatusCode::OK);
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_dsh_status(ctx, &proj_url, "running").await;
 
     // Status: VM is running, DSH is running, and links are present
     let status_res2 = ctx.client.get(&proj_url).send().await.unwrap();
@@ -397,7 +422,7 @@ async fn assert_step_3_vm_and_dsh_lifecycle(ctx: &AcceptanceContext, project: &R
         .unwrap();
     assert_eq!(stop_dsh_res.status(), ReqwestStatusCode::OK);
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_dsh_status(ctx, &proj_url, "stopped").await;
 
     let status_res4 = ctx.client.get(&proj_url).send().await.unwrap();
     let status_json4: Value = status_res4.json().await.unwrap();
@@ -433,7 +458,7 @@ async fn assert_step_3_vm_and_dsh_lifecycle(ctx: &AcceptanceContext, project: &R
         .unwrap();
     assert_eq!(launch_from_stopped.status(), ReqwestStatusCode::OK);
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_dsh_status(ctx, &proj_url, "running").await;
 
     let status_res6 = ctx.client.get(&proj_url).send().await.unwrap();
     let status_json6: Value = status_res6.json().await.unwrap();
@@ -624,18 +649,23 @@ async fn assert_step_6_dns_resolution(ctx: &AcceptanceContext, project: &Registe
 
 /// Sub-step helper for Step 7: Project Logs Retrieval
 async fn assert_step_7_project_logs(ctx: &AcceptanceContext, project: &RegisteredProject) {
-    let logs_res = ctx
-        .client
-        .get(format!(
-            "http://{}/api/projects/{}/logs",
-            ctx.server_addr, project.id
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(logs_res.status(), ReqwestStatusCode::OK);
-    let logs_json: Value = logs_res.json().await.unwrap();
-    let logs_content = logs_json["logs"].as_str().unwrap();
+    let logs_url = format!(
+        "http://{}/api/projects/{}/logs",
+        ctx.server_addr, project.id
+    );
+
+    // The guest writes dsh.log itself, so its first line may arrive after the launch call.
+    let mut logs_content = String::new();
+    for _ in 0..100 {
+        let logs_res = ctx.client.get(&logs_url).send().await.unwrap();
+        assert_eq!(logs_res.status(), ReqwestStatusCode::OK);
+        let logs_json: Value = logs_res.json().await.unwrap();
+        logs_content = log_entries_text(&logs_json);
+        if logs_content.contains("dsh web: http://127.0.0.1:3080") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     assert!(logs_content.contains("Invoking `devvm start`"));
     assert!(logs_content.contains("Mock DevVM: started"));
@@ -643,11 +673,10 @@ async fn assert_step_7_project_logs(ctx: &AcceptanceContext, project: &Registere
     assert!(logs_content.contains("dsh web: http://127.0.0.1:3080"));
 }
 
-/// Sub-step helper for Step 8: Sync Setup, Manual Sync, Startup Reconciliation, Degraded Sync
-async fn assert_step_8_sync_reconciliation_and_degraded_modes(
+/// Sub-step helper for Step 8: Sync setup, guest-owned Sync Status, DSH restart, Sync Store deletion
+async fn assert_step_8_sync_status_and_dsh_restart(
     ctx: &AcceptanceContext,
     project: &RegisteredProject,
-    workspace_dir: &Path,
 ) {
     // 1. Setup Sync configuration
     let sync_setup_res = ctx
@@ -666,213 +695,110 @@ async fn assert_step_8_sync_reconciliation_and_degraded_modes(
         .unwrap();
     assert_eq!(sync_setup_res.status(), ReqwestStatusCode::OK);
 
-    let sync_cfg_res = ctx
+    let sync_cfg_json: Value = ctx
         .client
         .get(format!("http://{}/api/sync/config", ctx.server_addr))
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
-    assert_eq!(sync_cfg_res.status(), ReqwestStatusCode::OK);
-    let sync_cfg_json: Value = sync_cfg_res.json().await.unwrap();
     assert_eq!(sync_cfg_json["configured"], true);
     assert_eq!(sync_cfg_json["config"]["ssh_user"], "vps-devvm");
 
-    // 2. Trigger Manual Sync
-    let manual_sync_res = ctx
+    // 2. DevVM running is a precondition for reading Sync Status at all.
+    let start_vm_res = ctx
         .client
         .post(format!(
-            "http://{}/api/projects/{}/sync/trigger",
+            "http://{}/api/projects/{}/vm/start",
             ctx.server_addr, project.id
         ))
         .send()
         .await
         .unwrap();
-    assert_eq!(manual_sync_res.status(), ReqwestStatusCode::OK);
+    assert_eq!(start_vm_res.status(), ReqwestStatusCode::OK);
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let synced_project: Value = ctx
+    // 3. The plugin owns the status file; the daemon only reads it.
+    let guest_run = project.dir.join(".mock_run");
+    fs::create_dir_all(&guest_run).unwrap();
+    fs::write(
+        guest_run.join("sync-status.json"),
+        r#"{"status":"remote_ahead","head_seq":12,"last_error":null,"updated_at":"2024-05-01T10:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let proj_url = format!("http://{}/api/projects/{}", ctx.server_addr, project.id);
+    let status_json: Value = ctx
         .client
-        .get(format!(
-            "http://{}/api/projects/{}",
-            ctx.server_addr, project.id
-        ))
+        .get(&proj_url)
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(synced_project["sync_status"], "synchronized");
+    assert_eq!(status_json["sync_status"], "remote_ahead");
 
-    // 3. Clean Pull Startup Reconciliation
-    let clean_proj_dir = workspace_dir.join("project-clean");
-    fs::create_dir_all(&clean_proj_dir).unwrap();
-    let reg_clean_res = ctx
-        .client
-        .post(format!("http://{}/api/projects/register", ctx.server_addr))
-        .json(&json!({ "path": clean_proj_dir.to_str().unwrap() }))
-        .send()
-        .await
-        .unwrap();
-    let clean_proj: Value = reg_clean_res.json().await.unwrap();
-    let clean_id_str = clean_proj["id"].as_str().unwrap();
-
-    let launch_clean_res = ctx
+    // 4. Restart DSH while it is running: the only way to absorb a remote-ahead Sync Store.
+    let launch_res = ctx
         .client
         .post(format!(
             "http://{}/api/projects/{}/dsh/launch",
-            ctx.server_addr, clean_id_str
+            ctx.server_addr, project.id
         ))
         .send()
         .await
         .unwrap();
-    assert_eq!(launch_clean_res.status(), ReqwestStatusCode::OK);
+    assert_eq!(launch_res.status(), ReqwestStatusCode::OK);
 
-    let clean_status_res = ctx
-        .client
-        .get(format!(
-            "http://{}/api/projects/{}",
-            ctx.server_addr, clean_id_str
-        ))
-        .send()
-        .await
-        .unwrap();
-    let clean_status_json: Value = clean_status_res.json().await.unwrap();
-    assert_eq!(clean_status_json["sync_status"], "synchronized");
-
-    // 4. Dirty Push Startup Reconciliation
-    let dirty_proj_dir = workspace_dir.join("project-dirty");
-    let dirty_dsh_dir = dirty_proj_dir.join(".dsh");
-    fs::create_dir_all(dirty_dsh_dir.join("storages")).unwrap();
-    fs::write(dirty_dsh_dir.join(".sync-dirty"), "1\n").unwrap();
-    fs::write(dirty_dsh_dir.join("storages/workspace.json"), "{}\n").unwrap();
-
-    let reg_dirty_res = ctx
-        .client
-        .post(format!("http://{}/api/projects/register", ctx.server_addr))
-        .json(&json!({ "path": dirty_proj_dir.to_str().unwrap() }))
-        .send()
-        .await
-        .unwrap();
-    let dirty_proj: Value = reg_dirty_res.json().await.unwrap();
-    let dirty_id_str = dirty_proj["id"].as_str().unwrap();
-
-    let launch_dirty_res = ctx
+    let restart_res = ctx
         .client
         .post(format!(
-            "http://{}/api/projects/{}/dsh/launch",
-            ctx.server_addr, dirty_id_str
+            "http://{}/api/projects/{}/dsh/restart",
+            ctx.server_addr, project.id
         ))
         .send()
         .await
         .unwrap();
-    assert_eq!(launch_dirty_res.status(), ReqwestStatusCode::OK);
-    assert!(
-        !dirty_dsh_dir.join(".sync-dirty").exists(),
-        "Dirty marker must be removed after successful sync"
-    );
-    let dirty_status: Value = ctx
+    assert_eq!(restart_res.status(), ReqwestStatusCode::OK);
+
+    wait_for_dsh_status(ctx, &proj_url, "running").await;
+    let restarted_json: Value = ctx
         .client
-        .get(format!(
-            "http://{}/api/projects/{}",
-            ctx.server_addr, dirty_id_str
-        ))
+        .get(&proj_url)
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(dirty_status["sync_status"], "synchronized");
+    assert_eq!(restarted_json["dsh_status"], "running");
 
-    // 5. Degraded Sync Startup Reconciliation (Local state exists, VPS unreachable)
-    let degraded_proj_dir = workspace_dir.join("project-degraded");
-    let degraded_dsh_dir = degraded_proj_dir.join(".dsh/sessions");
-    fs::create_dir_all(&degraded_dsh_dir).unwrap();
-    fs::write(degraded_dsh_dir.join("local-session.jsonl"), "{}\n").unwrap();
-
-    let reg_degraded_res = ctx
-        .client
-        .post(format!("http://{}/api/projects/register", ctx.server_addr))
-        .json(&json!({ "path": degraded_proj_dir.to_str().unwrap() }))
-        .send()
-        .await
-        .unwrap();
-    let degraded_proj: Value = reg_degraded_res.json().await.unwrap();
-    let degraded_id_str = degraded_proj["id"].as_str().unwrap();
-
-    ctx.fake_runner.vps_reachable.store(false, Ordering::SeqCst);
-
-    let launch_degraded_res = ctx
+    // 5. Sync Store deletion is confirmation-gated.
+    let unconfirmed = ctx
         .client
         .post(format!(
-            "http://{}/api/projects/{}/dsh/launch",
-            ctx.server_addr, degraded_id_str
+            "http://{}/api/projects/{}/sync/delete",
+            ctx.server_addr, project.id
         ))
+        .json(&json!({ "confirmed": false }))
         .send()
         .await
         .unwrap();
-    assert_eq!(launch_degraded_res.status(), ReqwestStatusCode::OK);
+    assert_eq!(unconfirmed.status(), ReqwestStatusCode::BAD_REQUEST);
 
-    let degraded_status_res = ctx
-        .client
-        .get(format!(
-            "http://{}/api/projects/{}",
-            ctx.server_addr, degraded_id_str
-        ))
-        .send()
-        .await
-        .unwrap();
-    let degraded_status_json: Value = degraded_status_res.json().await.unwrap();
-    assert_eq!(degraded_status_json["sync_status"], "degraded");
-    assert_eq!(degraded_status_json["dsh_status"], "running");
-
-    // 6. Blocked DSH Startup (Empty local state + VPS unreachable -> BLOCKED)
-    let empty_proj_dir = workspace_dir.join("project-empty");
-    fs::create_dir_all(&empty_proj_dir).unwrap();
-
-    let reg_empty_res = ctx
-        .client
-        .post(format!("http://{}/api/projects/register", ctx.server_addr))
-        .json(&json!({ "path": empty_proj_dir.to_str().unwrap() }))
-        .send()
-        .await
-        .unwrap();
-    let empty_proj: Value = reg_empty_res.json().await.unwrap();
-    let empty_id_str = empty_proj["id"].as_str().unwrap();
-
-    let launch_empty_res = ctx
+    let confirmed = ctx
         .client
         .post(format!(
-            "http://{}/api/projects/{}/dsh/launch",
-            ctx.server_addr, empty_id_str
+            "http://{}/api/projects/{}/sync/delete",
+            ctx.server_addr, project.id
         ))
+        .json(&json!({ "confirmed": true }))
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        launch_empty_res.status(),
-        ReqwestStatusCode::INTERNAL_SERVER_ERROR
-    );
-    let empty_err: Value = launch_empty_res.json().await.unwrap();
-    assert!(empty_err["error"]
-        .as_str()
-        .unwrap()
-        .contains("preventing divergent empty history"));
-
-    let empty_status_res = ctx
-        .client
-        .get(format!(
-            "http://{}/api/projects/{}",
-            ctx.server_addr, empty_id_str
-        ))
-        .send()
-        .await
-        .unwrap();
-    let empty_status_json: Value = empty_status_res.json().await.unwrap();
-    assert_eq!(empty_status_json["dsh_status"], "stopped");
-
-    ctx.fake_runner.vps_reachable.store(true, Ordering::SeqCst);
+    assert_eq!(confirmed.status(), ReqwestStatusCode::OK);
 }
 
 /// Sub-step helper for Step 9: Separation of Unregister, Local VM Deletion, Confirmed Sync Store Deletion
@@ -1002,8 +928,8 @@ async fn test_acceptance_complete_version_one_workflow() {
     // STEP 7: Project Logs Retrieval
     assert_step_7_project_logs(&ctx, &project_a).await;
 
-    // STEP 8: Sync Setup, Manual Sync, Startup Reconciliation, Degraded Sync
-    assert_step_8_sync_reconciliation_and_degraded_modes(&ctx, &project_a, &workspace_dir).await;
+    // STEP 8: Sync Setup, guest-owned Sync Status, DSH restart, Sync Store deletion
+    assert_step_8_sync_status_and_dsh_restart(&ctx, &project_a).await;
 
     // STEP 9: Separation of Unregister, Local VM Deletion, Confirmed Sync Store Deletion
     assert_step_9_lifecycle_separation_and_deletion(&ctx, &project_a).await;
