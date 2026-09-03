@@ -1,8 +1,8 @@
 ui-onboarding:
   welcomeNoticeVersion: 2026-08-13.1
 agent-default-model:
-  provider: krill-codex
-  model: gpt-5.6-sol
+  provider: amazon-bedrock
+  model: arn:aws:bedrock:us-west-2:233532778289:application-inference-profile/gbb5tf1qqz2r
   reasoningEffort: high
 llm-pi-ai:
   providers:
@@ -104,6 +104,7 @@ llm-pi-ai:
       models:
         - id: arn:aws:bedrock:us-west-2:233532778289:application-inference-profile/zcsopmpsss4d
           name: Claude Opus 5
+          contextWindow: 1000000
           input:
             - text
             - image
@@ -116,7 +117,21 @@ llm-pi-ai:
             max: max
           compat:
             chatTemplateKwargs: {}
+        - id: arn:aws:bedrock:us-west-2:233532778289:application-inference-profile/gbb5tf1qqz2r
+          name: Claude Fable 5.1
           contextWindow: 1000000
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            off: null
+            low: low
+            medium: medium
+            high: high
+            xhigh: xhigh
+            max: max
+          compat:
+            chatTemplateKwargs: {}
       apiKeyEnv: AMAZON_BEDROCK_API_KEY
       modelOverrides: {}
       compat:
@@ -275,6 +290,8 @@ ui-theme:
   preference: system
 
 subagent-model:
-  provider: "proxy-cli"
-  model: "gemini-3.7-flash-high"
-  reasoningEffort: "high"
+  provider: "amazon-bedrock"
+  model: "arn:aws:bedrock:us-west-2:233532778289:application-inference-profile/zc\
+    sopmpsss4d"
+  reasoningEffort: "low"
+build-loop: {}

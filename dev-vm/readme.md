@@ -26,6 +26,7 @@ DevVM Workspace Supervision: isolated development microVMs for OpenCode and Deep
 | `root/` | Host-managed agent config mounted at `/devvm-root` |
 | `skills/` | Central skill collection shared across all projects (shortcut to `root/skills/`) |
 | `root/.dsh/plugins/remote-sync/` | DSH plugin that is the single Session Sync engine: automatic pushes after saved changes, startup reconciliation, status indicator, and manual retry |
+| `root/.dsh/plugins/build-loop/` | DSH plugin providing the `build_ticket` tool (build → review ‖ test → fix loop) and its Settings → Build Loop configuration page |
 
 ## Setup
 

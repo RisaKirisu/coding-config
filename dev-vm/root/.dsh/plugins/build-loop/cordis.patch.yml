@@ -1,0 +1,4 @@
+# @devvm/dsh-build-loop bundle patch: build_ticket tool, its settings namespace, web config routes
+- insert:
+    - id: build-loop
+      name: '@devvm/dsh-build-loop'
