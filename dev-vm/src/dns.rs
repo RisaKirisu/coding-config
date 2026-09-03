@@ -4,25 +4,60 @@ use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
+const TAILSCALE_CLI_PROGRAMS: [&str; 2] = ["tailscale", "tailscale.exe"];
+
 pub fn detect_tailscale_ipv4() -> Option<Ipv4Addr> {
+    detect_tailscale_ipv4_with_programs(&TAILSCALE_CLI_PROGRAMS)
+}
+
+fn detect_tailscale_ipv4_with_programs<P: AsRef<std::ffi::OsStr>>(
+    programs: &[P],
+) -> Option<Ipv4Addr> {
     let args = ["ip".to_string(), "-4".to_string()];
-    let output = match std::process::Command::new("tailscale")
-        .args(["ip", "-4"])
-        .output()
-    {
-        Ok(output) => output,
-        Err(e) => {
-            crate::runner::log_command_spawn_failure("tailscale", &args, &e);
-            return None;
+    for (index, program) in programs.iter().enumerate() {
+        let program_name = program.as_ref().to_string_lossy().to_string();
+        let is_last = index + 1 == programs.len();
+        match std::process::Command::new(program.as_ref())
+            .args(["ip", "-4"])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let value = String::from_utf8_lossy(&output.stdout);
+                match value.trim().parse::<Ipv4Addr>() {
+                    Ok(ip) => return Some(ip),
+                    Err(error) if is_last => tracing::warn!(
+                        program = program_name,
+                        stdout = %value,
+                        error = %error,
+                        "Tailscale CLI returned an invalid IPv4 address"
+                    ),
+                    Err(error) => tracing::debug!(
+                        program = program_name,
+                        stdout = %value,
+                        error = %error,
+                        "Tailscale CLI candidate returned an invalid IPv4 address"
+                    ),
+                }
+            }
+            Ok(output) if is_last => {
+                crate::runner::log_command_failure(&program_name, &args, &output)
+            }
+            Ok(output) => tracing::debug!(
+                program = program_name,
+                exit_code = ?output.status.code(),
+                "Tailscale CLI candidate failed; trying fallback"
+            ),
+            Err(error) if is_last => {
+                crate::runner::log_command_spawn_failure(&program_name, &args, &error)
+            }
+            Err(error) => tracing::debug!(
+                program = program_name,
+                error = %error,
+                "Tailscale CLI candidate unavailable; trying fallback"
+            ),
         }
-    };
-    if output.status.success() {
-        let ip_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        ip_str.parse::<Ipv4Addr>().ok()
-    } else {
-        crate::runner::log_command_failure("tailscale", &args, &output);
-        None
     }
+    None
 }
 
 #[derive(Clone, Debug)]
@@ -241,4 +276,38 @@ pub fn handle_dns_query(data: &[u8], config: &DnsConfig) -> Option<Vec<u8>> {
     }
 
     Some(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{detect_tailscale_ipv4_with_programs, TAILSCALE_CLI_PROGRAMS};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::tempdir;
+
+    fn write_executable(path: &std::path::Path, body: &str) {
+        fs::write(path, body).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
+    fn production_detection_includes_windows_cli() {
+        assert_eq!(TAILSCALE_CLI_PROGRAMS, ["tailscale", "tailscale.exe"]);
+    }
+
+    #[test]
+    fn tailscale_detection_falls_back_to_windows_cli_in_wsl() {
+        let dir = tempdir().unwrap();
+        let linux_cli = dir.path().join("tailscale");
+        let windows_cli = dir.path().join("tailscale.exe");
+        write_executable(&linux_cli, "#!/bin/sh\nexit 127\n");
+        write_executable(&windows_cli, "#!/bin/sh\nprintf '100.67.154.69\\n'\n");
+
+        assert_eq!(
+            detect_tailscale_ipv4_with_programs(&[&linux_cli, &windows_cli]),
+            Some("100.67.154.69".parse().unwrap())
+        );
+    }
 }

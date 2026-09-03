@@ -1,8 +1,8 @@
 ui-onboarding:
   welcomeNoticeVersion: 2026-08-13.1
 agent-default-model:
-  provider: proxy-cli
-  model: gemini-3.7-flash-high
+  provider: krill-codex
+  model: gpt-5.6-sol
   reasoningEffort: high
 llm-pi-ai:
   providers:
@@ -10,7 +10,7 @@ llm-pi-ai:
       displayName: Krill
       apiKeyEnv: KRILL_CODEX_API_KEY
       api: openai-responses
-      baseURL: https://api.krill-ai.net/codex/v1
+      baseURL: https://api.krill-code.net/codex/v1
       models:
         - id: gpt-5.6-sol
           contextWindow: 1000000
@@ -57,7 +57,7 @@ llm-pi-ai:
       displayName: Krill
       apiKeyEnv: KRILL_CHINA_API_KEY
       api: openai-responses
-      baseURL: https://api.krill-ai.net/coding/v1
+      baseURL: https://api.krill-code.net/coding/v1
       models:
         - id: kimi-k3
           input: []
@@ -68,10 +68,19 @@ llm-pi-ai:
           compat:
             chatTemplateKwargs: {}
         - id: deepseek-v4-flash-0731
+          contextWindow: 1000000
           input: []
           reasoningEfforts:
             off: null
             low: low
+            high: high
+            max: max
+          compat:
+            chatTemplateKwargs: {}
+        - id: deepseek-v4-pro-0813
+          input: []
+          reasoningEfforts:
+            off: null
             high: high
             max: max
           compat:

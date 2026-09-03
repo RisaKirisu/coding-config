@@ -9,9 +9,32 @@ use std::process::Command;
 use tempfile::tempdir;
 
 #[test]
+fn test_web_profile_links_first_party_plugins_to_their_sources() {
+    let profile_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("root/.dsh/profiles/web/package.json");
+    let profile: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(profile_path).unwrap()).unwrap();
+    let dependencies = profile["dependencies"].as_object().unwrap();
+
+    for (package, source) in [
+        ("@devvm/dsh-remote-sync", "remote-sync"),
+        ("@devvm/dsh-subagent-manager", "subagent-manager"),
+        ("@devvm/dsh-voice-input", "voice-input"),
+        ("dsh-skill-mcp-panel", "dsh-skill-mcp-panel"),
+    ] {
+        assert_eq!(
+            dependencies.get(package).and_then(|value| value.as_str()),
+            Some(format!("link:/root/.dsh/plugins/{source}").as_str()),
+            "{package} must resolve directly to its shared source directory"
+        );
+    }
+}
+
+#[test]
 fn test_systemd_unit_content_generation() {
     let bin_path = PathBuf::from("/home/alice/.local/bin/devvm-daemon");
-    let path_env = "/home/alice/.local/bin:/usr/local/bin:/usr/bin:/bin".to_string();
+    let path_env =
+        "/home/alice/.local/bin:/mnt/c/Program Files/Tailscale:/usr/bin:/bin".to_string();
     let config = ServiceUnitConfig {
         bin_path: bin_path.clone(),
         path_env: path_env.clone(),
@@ -38,7 +61,7 @@ fn test_systemd_unit_content_generation() {
     ));
     assert!(unit.contains("Restart=on-failure"));
     assert!(unit.contains("RestartSec=5"));
-    assert!(unit.contains(&format!("Environment=PATH={}", path_env)));
+    assert!(unit.contains(&format!("Environment=\"PATH={}\"", path_env)));
     assert!(unit.contains("WorkingDirectory=/home/alice"));
     assert!(unit.contains("[Install]"));
     assert!(unit.contains("WantedBy=default.target"));
@@ -254,25 +277,56 @@ fn test_dns_setup_helper_generation() {
         "nameserver 100.64.0.42\n"
     );
 
-    // Full instructions text includes key sections
     assert!(instructions
         .full_instructions
-        .contains("=== DevVM Wildcard DNS Setup Instructions ==="));
+        .contains("=== DevVM Wildcard DNS Setup ==="));
     assert!(instructions
         .full_instructions
-        .contains("1. Privileged Port 53 Capability (Linux only):"));
+        .contains("Local host setup is automated by setup-devvm.sh --service."));
     assert!(instructions
         .full_instructions
-        .contains("2. Local Split DNS on Linux (systemd-resolved):"));
+        .contains("One tailnet-admin action remains:"));
     assert!(instructions
         .full_instructions
-        .contains("3. Local Split DNS on macOS (/etc/resolver):"));
+        .contains("Nameserver: 100.64.0.42"));
     assert!(instructions
         .full_instructions
-        .contains("4. Tailscale Private Network Split DNS:"));
-    assert!(instructions
-        .full_instructions
-        .contains("Note: Normal daemon and CLI operations remain unprivileged."));
+        .contains("Restrict to domain: devvm.internal"));
+    assert!(!instructions.full_instructions.contains("macOS"));
+    assert!(!instructions.full_instructions.contains("systemd-resolved"));
+}
+
+#[test]
+fn test_dns_setup_uses_windows_tailscale_without_false_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().unwrap();
+    let windows_cli = temp.path().join("tailscale.exe");
+    fs::write(
+        &windows_cli,
+        "#!/usr/bin/env bash\nprintf '100.67.154.69\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&windows_cli, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path = format!("{}:/usr/bin:/bin", temp.path().display());
+    let output = Command::new(env!("CARGO_BIN_EXE_devvm-daemon"))
+        .args(["dns", "setup"])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "dns setup failed: {output:?}");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("Target IP: 100.67.154.69"));
+    assert!(
+        !combined.contains("ERROR") && !combined.contains("No such file or directory"),
+        "a successful fallback must not log the missing Linux CLI as an error: {combined}"
+    );
 }
 
 #[test]
@@ -323,13 +377,21 @@ fn test_script_syntax_and_dry_run() {
 
     // 4. Verify scripts/setup-dns.sh --dry-run
     let output = Command::new("bash")
-        .args(["scripts/setup-dns.sh", "--dry-run"])
+        .args([
+            "scripts/setup-dns.sh",
+            "--dry-run",
+            "--tailscale-ip",
+            "100.67.154.69",
+            "--bin",
+            "/bin/true",
+        ])
         .output()
         .expect("Failed to run scripts/setup-dns.sh --dry-run");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("=== DevVM One-Time DNS Setup ==="));
-    assert!(stdout.contains("Tailscale Split DNS"));
+    assert!(stdout.contains("devvm-daemon-dns.service"));
+    assert!(stdout.contains("One tailnet-admin action remains"));
 }
 
 #[test]
@@ -562,6 +624,12 @@ fn test_setup_installs_upgrades_and_skips_current_versions() {
         devvm_home.join("devvm"),
     )
     .unwrap();
+    fs::create_dir_all(devvm_home.join("scripts")).unwrap();
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-dns.sh"),
+        devvm_home.join("scripts/setup-dns.sh"),
+    )
+    .unwrap();
     fs::write(devvm_home.join("smolvm.toml"), "# test\n").unwrap();
 
     let frps = home.join(".local/bin/frps");
@@ -669,4 +737,58 @@ chmod +x "$DEVVM_HOME/target/release/devvm-daemon"
         fs::read_to_string(home.join(".local/bin/devvm-daemon")).unwrap(),
         "daemon-v2"
     );
+
+    // Service setup also provisions the wildcard DNS service when Windows Tailscale is visible.
+    let command_log = temp.path().join("service-commands.log");
+    for (name, body) in [
+        (
+            "tailscale.exe",
+            "#!/usr/bin/env bash\nprintf '100.67.154.69\\n'\n",
+        ),
+        (
+            "setcap",
+            "#!/usr/bin/env bash\nprintf 'setcap %s\\n' \"$*\" >> \"$FAKE_SERVICE_COMMAND_LOG\"\n",
+        ),
+        (
+            "systemctl",
+            "#!/usr/bin/env bash\nprintf 'systemctl %s\\n' \"$*\" >> \"$FAKE_SERVICE_COMMAND_LOG\"\n",
+        ),
+        ("sudo", "#!/usr/bin/env bash\nexec \"$@\"\n"),
+    ] {
+        let path = fake_bin.join(name);
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let daemon_script = format!(
+        "#!/usr/bin/env bash\nprintf 'daemon %s\\n' \"$*\" >> '{}'\n",
+        command_log.display()
+    );
+    let serviced = Command::new(&setup)
+        .args(["--skip-image", "--service"])
+        .current_dir(&devvm_home)
+        .env("HOME", &home)
+        .env("DEVVM_HOME", &devvm_home)
+        .env("PATH", &path)
+        .env("FAKE_SMOLVM_INSTALL_LOG", &install_log)
+        .env("FAKE_DAEMON_BUILD", &daemon_script)
+        .env("FAKE_SERVICE_COMMAND_LOG", &command_log)
+        .output()
+        .unwrap();
+    assert!(
+        serviced.status.success(),
+        "service setup failed: {serviced:?}"
+    );
+
+    let dns_unit = fs::read_to_string(home.join(".config/systemd/user/devvm-daemon-dns.service"))
+        .expect("setup --service must install the wildcard DNS service");
+    assert!(dns_unit.contains("ExecStart="));
+    assert!(dns_unit
+        .contains(" dns --bind 100.67.154.69:53 --ip 100.67.154.69 --domain devvm.internal"));
+    let commands = fs::read_to_string(&command_log).unwrap();
+    assert!(commands.contains("daemon service install --enable"));
+    assert!(!commands.contains("daemon service install --enable --start"));
+    assert!(commands.contains("systemctl --user restart devvm-daemon.service"));
+    assert!(commands.contains("setcap cap_net_bind_service=+ep"));
+    assert!(commands.contains("systemctl --user enable devvm-daemon-dns.service"));
+    assert!(commands.contains("systemctl --user restart devvm-daemon-dns.service"));
 }

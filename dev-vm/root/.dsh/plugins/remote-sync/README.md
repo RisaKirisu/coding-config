@@ -181,7 +181,7 @@ remote-sync/
 Install it into a DSH profile from the workspace root:
 
 ```sh
-dsh plugin --profile web add ./root/.dsh/plugins/remote-sync
+dsh plugin --profile web add link:./root/.dsh/plugins/remote-sync
 ```
 
 ## Tests

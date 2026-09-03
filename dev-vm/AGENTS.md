@@ -24,4 +24,4 @@ Lifecycle test fakes must isolate guest PID files and never evaluate commands ag
 
 ### Session Sync
 
-The DSH plugin at `root/.dsh/plugins/remote-sync/` is the only Session Sync engine (ADR 0003); the daemon never runs rsync. Plugin tests (`node --test root/.dsh/plugins/remote-sync/test.mjs`) use real rsync over the local transport (no `ssh_host`). The web profile holds a pnpm copy of the plugin under `root/.dsh/profiles/web/node_modules/@devvm/dsh-remote-sync/`; after editing the plugin, refresh it with `DSH_HOME=/root/.dsh dsh plugin --profile web install --force`, or the boot test and the running DSH exercise stale code.
+The DSH plugin at `root/.dsh/plugins/remote-sync/` is the only Session Sync engine (ADR 0003); the daemon never runs rsync. Plugin tests (`node --test root/.dsh/plugins/remote-sync/test.mjs`) use real rsync over the local transport (no `ssh_host`). First-party plugins in the web profile use pnpm `link:` dependencies, so `node_modules` resolves directly to `root/.dsh/plugins/`; never replace them with `file:` dependencies, whose hard-linked files can become stale after atomic source-file replacement.

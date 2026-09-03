@@ -11,3 +11,4 @@
 - Functions that read process-wide env vars (`DEVVM_ROOT`) race under parallel tests; serialize those tests and point the env var into the temp tree so provisioning never writes into the real home.
 - Never rewrite executables in this repo with the `write` tool; after any edit to `devvm` or `scripts/*`, re-check the mode with `ls -l`.
 - Builder "non-vacuity" claims are not verification. Mutate the production code the test is meant to protect (disable the branch, flip the tag, drop the sort) and confirm a test fails; a test that only checks presence passes when a second code path produces the same text.
+- A tailnet DNS acceptance test must traverse installed DNS service and tailnet resolver path. Binding a random loopback UDP port and querying it directly proves only packet parsing, not remote Project URL resolution.

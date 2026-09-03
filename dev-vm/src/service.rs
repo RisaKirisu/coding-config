@@ -190,11 +190,14 @@ Type=simple
 ExecStart={}
 Restart=on-failure
 RestartSec=5
-Environment=PATH={}
+Environment={}
 {}[Install]
 WantedBy=default.target
 "#,
-        config.description, exec_start, config.path_env, working_dir_line
+        config.description,
+        exec_start,
+        systemd_quote_arg(&format!("PATH={}", config.path_env)),
+        working_dir_line
     )
 }
 
@@ -561,48 +564,20 @@ pub fn generate_dns_setup_instructions(
     };
 
     let full_instructions = format!(
-        r#"=== DevVM Wildcard DNS Setup Instructions ===
+        r#"=== DevVM Wildcard DNS Setup ===
 
 Domain: *.{domain}
 Target IP: {target_ip}
-Port: {port}
-Daemon binary: {bin_display}
 
-1. Privileged Port 53 Capability (Linux only):
-   To allow devvm-daemon to bind to port 53 without root:
-     {linux_setcap_cmd}
+Local host setup is automated by setup-devvm.sh --service.
 
-2. Local Split DNS on Linux (systemd-resolved):
-   Create {linux_resolved_path}:
-----------------------------------------
-{linux_resolved_content}----------------------------------------
-   Apply changes:
-     sudo systemctl restart systemd-resolved
-
-3. Local Split DNS on macOS (/etc/resolver):
-   Create {macos_resolver_path}:
-----------------------------------------
-{macos_resolver_content}----------------------------------------
-
-4. Tailscale Private Network Split DNS:
-   To make *.{domain} resolve from any device on your Tailnet:
-   a. Open Tailscale Admin Console -> DNS -> Nameservers
-   b. Click "Add Nameserver" -> "Custom"
-   c. Domain: {domain}
-   d. Nameserver IP: {target_ip} (your workstation Tailscale IP)
-   e. Save changes.
-
-Note: Normal daemon and CLI operations remain unprivileged.
+One tailnet-admin action remains:
+  Tailscale Admin Console -> DNS -> Add nameserver
+  Nameserver: {target_ip}
+  Restrict to domain: {domain}
 "#,
         domain = domain,
         target_ip = target_ip,
-        port = port,
-        bin_display = resolved_bin.display(),
-        linux_setcap_cmd = linux_setcap_cmd,
-        linux_resolved_path = linux_resolved_path.display(),
-        linux_resolved_content = linux_resolved_content,
-        macos_resolver_path = macos_resolver_path.display(),
-        macos_resolver_content = macos_resolver_content,
     );
 
     DnsSetupInstructions {

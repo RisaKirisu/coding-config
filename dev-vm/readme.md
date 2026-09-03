@@ -61,7 +61,7 @@ devvm-daemon service status
 ### Accessing the Web UI
 
 - **Locally**: Open `http://127.0.0.1:8100` (or `http://localhost:8100`).
-- **Over Tailscale**: Open `http://<tailscale-ip>:8100`.
+- **Over Tailscale**: Open `http://<tailscale-ip>:8100`. Under WSL2 mirrored networking with Tailscale running on Windows, the daemon detects the mirrored address through `tailscale.exe`.
 
 The Web UI allows you to:
 1. Browse directories beneath `$HOME` and register Projects (creating or reading `.devvm-id`).
@@ -75,15 +75,9 @@ The log viewer merges the three files into one time-ordered list. Each row shows
 
 ## Wildcard Private DNS (Tailscale)
 
-To resolve `*.<project-host>.devvm.internal` from any device on your Tailnet:
+On Linux/WSL, `./setup-devvm.sh --service` installs and starts the wildcard DNS service on the detected Tailscale IP. One tailnet-admin action remains: in Tailscale Admin Console, add that IP as a nameserver restricted to `devvm.internal`. No local resolver files or manual DNS process are required.
 
-```sh
-# Generate split DNS setup instructions
-devvm-daemon dns setup
-
-# Run DNS server (default on port 53 or custom port)
-devvm-daemon dns --bind 0.0.0.0:53
-```
+`devvm-daemon dns setup` prints this remaining action and the detected nameserver IP.
 
 ## CLI Usage
 
