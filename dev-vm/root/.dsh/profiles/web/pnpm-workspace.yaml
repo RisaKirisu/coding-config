@@ -1,7 +1,13 @@
 packages:
   - .
+overrides:
+  node-pty: 1.2.0-beta.15
 
 nodeLinker: hoisted
 autoInstallPeers: false
 allowBuilds:
+  protobufjs: true
   node-pty: true
+
+minimumReleaseAgeExclude:
+  - dsh-better-sidebar

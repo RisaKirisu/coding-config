@@ -17,6 +17,9 @@ importers:
       '@devvm/dsh-remote-sync':
         specifier: file:/root/.dsh/plugins/remote-sync
         version: file:../../../../root/.dsh/plugins/remote-sync
+      '@devvm/dsh-style-control':
+        specifier: link:/root/.dsh/plugins/style-control
+        version: link:../../plugins/style-control
       '@devvm/dsh-subagent-manager':
         specifier: file:/root/.dsh/plugins/subagent-manager
         version: file:../../../../root/.dsh/plugins/subagent-manager(@deepseek-ai/schemastery@3.18.1)

@@ -1,6 +1,6 @@
 --- a/lib/client.js
 +++ b/lib/client.js
-@@ -10244,10 +10244,10 @@
+@@ -4680,10 +4680,10 @@
  		/**
  		* Whether a normalized URL hostname names the local loopback authority.
  		* @param hostname - WHATWG URL hostname (IPv6 literals retain brackets).
@@ -15,7 +15,7 @@
  		}
 --- a/lib/index.js
 +++ b/lib/index.js
-@@ -95,10 +95,10 @@
+@@ -89,10 +89,10 @@
  /**
  * Whether a normalized URL hostname names the local loopback authority.
  * @param hostname - WHATWG URL hostname (IPv6 literals retain brackets).

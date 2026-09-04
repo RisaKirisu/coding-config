@@ -1,0 +1,4 @@
+# @devvm/dsh-style-control bundle patch: style control plugin
+- insert:
+    - id: style-control
+      name: '@devvm/dsh-style-control'

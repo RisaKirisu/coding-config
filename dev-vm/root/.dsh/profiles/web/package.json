@@ -5,10 +5,11 @@
     "@deepseek-ai/dsh-web-fetch-http": "0.1.1-rc.2",
     "@devvm/dsh-build-loop": "link:/root/.dsh/plugins/build-loop",
     "@devvm/dsh-remote-sync": "file:/root/.dsh/plugins/remote-sync",
+    "@devvm/dsh-style-control": "link:/root/.dsh/plugins/style-control",
     "@devvm/dsh-subagent-manager": "file:/root/.dsh/plugins/subagent-manager",
     "@devvm/dsh-voice-input": "file:/root/.dsh/plugins/voice-input",
     "@hytime/dsh-thinking-effort": "github:hytime/dsh-thinking-effort",
-    "dsh-better-sidebar": "^0.16.1",
+    "dsh-better-sidebar": "latest",
     "dsh-skill-mcp-panel": "file:/root/.dsh/plugins/dsh-skill-mcp-panel"
   },
   "dsh": {
@@ -22,7 +23,8 @@
         "@devvm/dsh-remote-sync",
         "@devvm/dsh-subagent-manager",
         "@devvm/dsh-voice-input",
-        "@devvm/dsh-build-loop"
+        "@devvm/dsh-build-loop",
+        "@devvm/dsh-style-control"
       ]
     }
   }

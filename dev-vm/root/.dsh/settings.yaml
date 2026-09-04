@@ -1,8 +1,8 @@
 ui-onboarding:
   welcomeNoticeVersion: 2026-08-13.1
 agent-default-model:
-  provider: amazon-bedrock
-  model: arn:aws:bedrock:us-west-2:233532778289:application-inference-profile/zcsopmpsss4d
+  provider: proxy-cli
+  model: "gpt-5.6-sol"
   reasoningEffort: high
 llm-pi-ai:
   providers:
@@ -179,7 +179,7 @@ llm-pi-ai:
             max: max
           compat:
             chatTemplateKwargs: {}
-        - id: gemini-3.7-flash-high
+        - id: " gemini-3.8-flash-high"
           contextWindow: 1000000
           input:
             - text
@@ -290,8 +290,7 @@ ui-theme:
   preference: system
 
 subagent-model:
-  provider: "amazon-bedrock"
-  model: "arn:aws:bedrock:us-west-2:233532778289:application-inference-profile/zc\
-    sopmpsss4d"
-  reasoningEffort: "low"
+  provider: "proxy-cli"
+  model: " gemini-3.8-flash-high"
+  reasoningEffort: "high"
 build-loop: {}

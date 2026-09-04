@@ -5,14 +5,7 @@ ARG NODE_VERSION=24.19.0
 ARG NVM_VERSION=0.40.6
 ARG FRP_VERSION=0.71.0
 ARG CADDY_VERSION=2.11.4
-
-COPY tmp/zscaler-root.crt /usr/local/share/ca-certificates/zscaler-root.crt
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
- && update-ca-certificates \
- && rm -rf /var/lib/apt/lists/*
-
-# helps npm and any Node tooling later in the build
-ENV NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/zscaler-root.crt
+ARG DSH_VERSION=0.1.2-rc.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_HOME=/root/.cargo \
@@ -168,15 +161,15 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 # Install Deepseek Harness
 # Extra heap space needed for dsh installation
 ENV NODE_OPTIONS='--max-old-space-size=8192'
-RUN npm install -g @deepseek-ai/dsh@latest
+RUN npm install -g "@deepseek-ai/dsh@${DSH_VERSION}"
 # Patch to allow dsh web to be accessed by host
 COPY patches/deepseek-harness-localhost-subdomains.patch /tmp/deepseek-harness-localhost-subdomains.patch
 RUN set -eux; \
     package_dir=/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-connection; \
     client_target="$package_dir/lib/client.js"; \
     server_target="$package_dir/lib/index.js"; \
-    printf '%s  %s\n' '0735d9af8a012d1edb19a02c4cef50903a783cdb28eac8b62fe9141625592845' "$client_target" | sha256sum --check -; \
-    printf '%s  %s\n' '450888f220a348190f3043986737ed2ea04a39f11e67e2d16abb26c2f96f8815' "$server_target" | sha256sum --check -; \
+    printf '%s  %s\n' '1b8e76d7fb14c9305e6d43ab03bd908328341537af05c4159747d6da33308257' "$client_target" | sha256sum --check -; \
+    printf '%s  %s\n' '91b8e7b90c5189a5dc0f4eafc4a62494eef9b5a28ded0715146ddf1a31126c8e' "$server_target" | sha256sum --check -; \
     patch --batch --forward --strip=1 --directory="$package_dir" < /tmp/deepseek-harness-localhost-subdomains.patch; \
     grep -Fq 'hostname.endsWith(".localhost")' "$client_target"; \
     grep -Fq 'hostname.endsWith(".localhost")' "$server_target"; \

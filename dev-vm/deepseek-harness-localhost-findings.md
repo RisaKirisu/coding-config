@@ -13,6 +13,19 @@ Related upstream discussion: <https://github.com/deepseek-ai/deepseek-harness/di
 The live test machine was `dev-xiaobright-modeltest-3f4561e7`. The resulting
 patch is applied during the `devvm` image build.
 
+## DSH 0.1.2-rc.1 update
+
+The published `@deepseek-ai/dsh-client-connection@0.1.2-rc.1` bundles still
+classify only exact `localhost`, `[::1]`, and IPv4 addresses in `127/8` as
+loopback. Localhost subdomains therefore still need the patch on both the
+browser and server bundles.
+
+The implementation itself is unchanged, but the browser bundle moved the
+predicate from line 10244 to line 4685. The patch hunk locations and Dockerfile
+pre-patch SHA-256 checksums were updated for `0.1.2-rc.1`, and the root DSH
+install was pinned to that release. The content checks still fail safely if npm
+resolves changed transitive bundle content in a later build.
+
 ## Findings
 
 Harness has separate browser-side and server-side loopback checks.
@@ -54,10 +67,11 @@ This proves the browser patch passed and exposed the independent server check.
 ### General classification
 
 The narrow initial workaround accepted only `.devvm.localhost`. The more general
-patch accepts any hostname ending in `.localhost` on both sides:
+patch accepts any hostname ending in `.localhost` on both sides, plus the
+private `.devvm.internal` alias used by DevVM:
 
 ```js
-hostname === "localhost" || hostname.endsWith(".localhost")
+hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".devvm.internal")
 ```
 
 This matches the special-use `localhost` namespace rather than coupling Harness
@@ -78,12 +92,12 @@ Sec-Fetch-Site: same-origin
 
 ## Patch
 
-This patch targets built files from DSH `0.1.1-rc.2`:
+This patch targets built files from DSH `0.1.2-rc.1`:
 
 ```diff
 --- a/lib/client.js
 +++ b/lib/client.js
-@@ -10244,10 +10244,10 @@
+@@ -4680,10 +4680,10 @@
  		/**
  		* Whether a normalized URL hostname names the local loopback authority.
  		* @param hostname - WHATWG URL hostname (IPv6 literals retain brackets).
@@ -92,13 +106,13 @@ This patch targets built files from DSH `0.1.1-rc.2`:
  		*/
  		function isLoopbackHostname(hostname) {
 -			if (hostname === "localhost" || hostname === "[::1]") return true;
-+			if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname === "[::1]") return true;
++			if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".devvm.internal") || hostname === "[::1]") return true;
  			const parts = hostname.split(".");
  			return parts.length === 4 && parts[0] === "127" && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
  		}
 --- a/lib/index.js
 +++ b/lib/index.js
-@@ -95,10 +95,10 @@
+@@ -89,10 +89,10 @@
  /**
  * Whether a normalized URL hostname names the local loopback authority.
  * @param hostname - WHATWG URL hostname (IPv6 literals retain brackets).
@@ -107,7 +121,7 @@ This patch targets built files from DSH `0.1.1-rc.2`:
  */
  function isLoopbackHostname(hostname) {
 -	if (hostname === "localhost" || hostname === "[::1]") return true;
-+	if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname === "[::1]") return true;
++	if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".devvm.internal") || hostname === "[::1]") return true;
  	const parts = hostname.split(".");
  	return parts.length === 4 && parts[0] === "127" && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
  }
