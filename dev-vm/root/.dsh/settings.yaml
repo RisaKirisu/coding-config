@@ -1,8 +1,9 @@
 ui-onboarding:
   welcomeNoticeVersion: 2026-08-13.1
 agent-default-model:
-  provider: proxy-cli
-  model: "gpt-5.6-sol"
+  provider: amazon-bedrock
+  model: "arn:aws:bedrock:us-west-2:233532778289:application-inference-profile/gb\
+    b5tf1qqz2r"
   reasoningEffort: high
 llm-pi-ai:
   providers:
