@@ -4,10 +4,12 @@ smolvm.toml
 root/.pnpm-store/
 tmp/
 target/
+root/.config/devvm
 
 # api keys
 .api-keys
 .credentials.yaml
+.ssh
 
 # Node.js
 node_modules/
