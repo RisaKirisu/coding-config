@@ -156,6 +156,13 @@ start_ingress() {
     smolvm machine exec --name "$NAME" -- /usr/local/bin/devvm-ingress
 }
 
+clear_crane() {
+    smolvm machine exec \
+        --name "$NAME" \
+        -- /bin/bash \
+        -c "rm -rf /storage/tmp/* && fstrim /storage"
+}
+
 start() {
     if running; then
         return
@@ -165,6 +172,7 @@ start() {
     smolvm machine start --name "$NAME"
     start_ingress
     link_root
+    clear_crane
 }
 
 case "${1:-shell}" in

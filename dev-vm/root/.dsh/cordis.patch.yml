@@ -48,6 +48,3 @@
 
     - id: fs-local
       name: '@deepseek-ai/dsh-fs-local'
-
-    - id: web-fetch-http
-      name: '@deepseek-ai/dsh-web-fetch-http'
