@@ -19,9 +19,11 @@ PROJECT_DIR="$(realpath "$PWD")"
 PROJECT_NAME="$(printf '%s' "$(basename "$PROJECT_DIR")" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-')"
 PROJECT_NAME="${PROJECT_NAME#-}"
 PROJECT_NAME="${PROJECT_NAME%-}"
+[[ -z "$PROJECT_NAME" ]] && PROJECT_NAME="project"
 if command -v sha256sum >/dev/null 2>&1; then sha256() { sha256sum; }; else sha256() { shasum -a 256; }; fi
 PROJECT_HASH="$(printf '%s' "$PROJECT_DIR" | sha256 | cut -c1-8)"
 PROJECT_HOST="${PROJECT_NAME}-${PROJECT_HASH}"
+if [[ ${#PROJECT_HOST} -gt 57 ]]; then PROJECT_HOST="$PROJECT_HASH"; fi
 NAME="dev-${PROJECT_NAME}-${PROJECT_HASH}"
 
 IMAGE="$DEVVM_HOME/rust-dev-opencode-$ARCH.tar"
@@ -38,6 +40,7 @@ ensure_ingress() {
         "$FRPS_BIN"
         --bind-addr 127.0.0.1
         --bind-port "$INGRESS_PORT"
+        --proxy-bind-addr 127.0.0.1
         --vhost-http-port "$HTTP_PORT"
         --vhost-http-timeout "$FRPS_TIMEOUT"
     )
@@ -74,11 +77,15 @@ ensure_project_id() {
 }
 
 exists() {
-    smolvm machine status --name "$NAME" >/dev/null 2>&1
+    smolvm machine ls --json |
+        jq -e --arg name "$NAME" \
+        'any(.[]; .name == $name)' >/dev/null
 }
 
 running() {
-    smolvm machine status --name "$NAME" 2>/dev/null | grep -qw running
+    smolvm machine ls --json |
+        jq -e --arg name "$NAME" \
+        'any(.[]; .name == $name and .state == "running")' >/dev/null
 }
 
 create() {
