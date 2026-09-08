@@ -1,7 +1,7 @@
 ui-onboarding:
   welcomeNoticeVersion: 2026-08-13.1
 agent-default-model:
-  provider: krill-codex
+  provider: proxy-cli
   model: "gpt-6-astra"
   reasoningEffort: medium
 llm-pi-ai:
