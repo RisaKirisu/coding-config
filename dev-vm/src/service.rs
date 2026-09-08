@@ -520,80 +520,6 @@ impl Default for ServiceManager {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsSetupInstructions {
-    pub domain: String,
-    pub port: u16,
-    pub tailscale_ip: Option<String>,
-    pub bin_path: PathBuf,
-    pub linux_setcap_cmd: String,
-    pub linux_resolved_path: PathBuf,
-    pub linux_resolved_content: String,
-    pub macos_resolver_path: PathBuf,
-    pub macos_resolver_content: String,
-    pub full_instructions: String,
-}
-
-pub fn generate_dns_setup_instructions(
-    domain: &str,
-    port: u16,
-    tailscale_ip: Option<&str>,
-    bin_path: Option<&Path>,
-) -> DnsSetupInstructions {
-    let resolved_bin = bin_path
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| default_home_dir().join(".local/bin/devvm-daemon"));
-
-    let target_ip = tailscale_ip.unwrap_or("127.0.0.1");
-
-    let linux_setcap_cmd = format!(
-        "sudo setcap 'cap_net_bind_service=+ep' {}",
-        resolved_bin.display()
-    );
-    let linux_resolved_path = PathBuf::from("/etc/systemd/resolved.conf.d/devvm.conf");
-    let linux_resolved_content = format!(
-        "[Resolve]\nDNS={}:{}\nDomains=~{}\n",
-        target_ip, port, domain
-    );
-
-    let macos_resolver_path = PathBuf::from(format!("/etc/resolver/{}", domain));
-    let macos_resolver_content = if port == 53 {
-        format!("nameserver {}\n", target_ip)
-    } else {
-        format!("nameserver {}\nport {}\n", target_ip, port)
-    };
-
-    let full_instructions = format!(
-        r#"=== DevVM Wildcard DNS Setup ===
-
-Domain: *.{domain}
-Target IP: {target_ip}
-
-Local host setup is automated by setup-devvm.sh --service.
-
-One tailnet-admin action remains:
-  Tailscale Admin Console -> DNS -> Add nameserver
-  Nameserver: {target_ip}
-  Restrict to domain: {domain}
-"#,
-        domain = domain,
-        target_ip = target_ip,
-    );
-
-    DnsSetupInstructions {
-        domain: domain.to_string(),
-        port,
-        tailscale_ip: tailscale_ip.map(|s| s.to_string()),
-        bin_path: resolved_bin,
-        linux_setcap_cmd,
-        linux_resolved_path,
-        linux_resolved_content,
-        macos_resolver_path,
-        macos_resolver_content,
-        full_instructions,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,7 +554,7 @@ mod tests {
             path_env: "/usr/bin:/bin".to_string(),
             args: vec![
                 "serve".to_string(),
-                "--tailnet-domain".to_string(),
+                "--config".to_string(),
                 "my host.internal".to_string(),
                 "--custom-arg".to_string(),
                 "foo \"bar\" \\baz".to_string(),
@@ -638,7 +564,7 @@ mod tests {
         };
 
         let unit = generate_systemd_unit(&config);
-        assert!(unit.contains("ExecStart=\"/home/user with spaces/.local/bin/devvm-daemon\" serve --tailnet-domain \"my host.internal\" --custom-arg \"foo \\\"bar\\\" \\\\baz\""));
+        assert!(unit.contains("ExecStart=\"/home/user with spaces/.local/bin/devvm-daemon\" serve --config \"my host.internal\" --custom-arg \"foo \\\"bar\\\" \\\\baz\""));
         assert!(unit.contains("WorkingDirectory=/home/user with spaces"));
     }
 
@@ -766,34 +692,5 @@ mod tests {
 
         let status = manager.status().unwrap();
         assert!(!status.installed);
-    }
-
-    #[test]
-    fn test_dns_setup_instructions_generation() {
-        let instructions = generate_dns_setup_instructions(
-            "devvm.internal",
-            53,
-            Some("100.64.0.5"),
-            Some(Path::new("/custom/bin/devvm-daemon")),
-        );
-
-        assert_eq!(instructions.domain, "devvm.internal");
-        assert_eq!(instructions.port, 53);
-        assert_eq!(instructions.tailscale_ip, Some("100.64.0.5".to_string()));
-        assert!(instructions
-            .linux_setcap_cmd
-            .contains("/custom/bin/devvm-daemon"));
-        assert!(instructions
-            .linux_resolved_content
-            .contains("DNS=100.64.0.5:53"));
-        assert!(instructions
-            .linux_resolved_content
-            .contains("Domains=~devvm.internal"));
-        assert!(instructions
-            .macos_resolver_content
-            .contains("nameserver 100.64.0.5"));
-        assert!(instructions
-            .full_instructions
-            .contains("Tailscale Admin Console"));
     }
 }

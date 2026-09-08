@@ -48,7 +48,7 @@ fn test_frpc_config_structure_and_domains() {
         .expect("proxy localPort must be an integer");
     assert_eq!(local_port, 10080);
 
-    // Custom domains: Must include both .devvm.localhost and .devvm.internal
+    // Custom domains: Must include .devvm.localhost and must not include obsolete .devvm.internal
     let custom_domains = proxy
         .get("customDomains")
         .and_then(|cd| cd.as_array())
@@ -63,8 +63,8 @@ fn test_frpc_config_structure_and_domains() {
         "customDomains must contain .devvm.localhost wildcard"
     );
     assert!(
-        domain_strings.iter().any(|d| d.contains(".devvm.internal")),
-        "customDomains must contain .devvm.internal wildcard"
+        !domain_strings.iter().any(|d| d.contains(".devvm.internal")),
+        "customDomains must not contain obsolete .devvm.internal wildcard"
     );
 }
 

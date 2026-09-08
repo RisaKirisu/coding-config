@@ -1,28 +1,38 @@
-import { defineTool } from '@deepseek-ai/dsh-tools'
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises'
-import path from 'node:path'
+import {
+  DEFAULT_FILE_PATH,
+  archiveVoiceInput,
+  countLines,
+  removeVoiceInputRecord,
+  resolveVoiceInputFile,
+} from './handlers.mjs'
+
+let defineTool
+try {
+  const mod = await import('@deepseek-ai/dsh-tools')
+  defineTool = mod.defineTool
+} catch {
+  const { createRequire } = await import('node:module')
+  const dshReq = createRequire(
+    process.env.DSH_PACKAGE_ENTRY ||
+    '/usr/local/lib/node_modules/@deepseek-ai/dsh/package.json',
+  )
+  const mod = await import(dshReq.resolve('@deepseek-ai/dsh-tools'))
+  defineTool = mod.defineTool
+}
 
 export const name = 'tool-voice-input'
 export const inject = ['tools']
 
-const DEFAULT_FILE_PATH = '/root/voice-dictation-cleanup/data/archive_voice_input.jsonl'
-
-async function countLines(filePath) {
-  try {
-    const text = await readFile(filePath, 'utf8')
-    return text.split('\n').filter(Boolean).length
-  } catch {
-    return 0
-  }
+export {
+  DEFAULT_FILE_PATH,
+  archiveVoiceInput,
+  countLines,
+  removeVoiceInputRecord,
+  resolveVoiceInputFile,
 }
 
 export function apply(ctx, config) {
-  const filePath =
-    (typeof config?.file === 'string' && config.file.length > 0)
-      ? config.file
-      : (typeof config?.filePath === 'string' && config.filePath.length > 0)
-      ? config.filePath
-      : (process.env.VOICE_DICTATION_DATA_FILE || process.env.VOICE_DICTATION_FILE || DEFAULT_FILE_PATH)
+  const filePath = resolveVoiceInputFile(config)
 
   ctx.tools.register(
     defineTool({
@@ -56,23 +66,7 @@ export function apply(ctx, config) {
         render: (_args, value) => [{ type: 'text', text: value.text }],
       },
       async execute(args) {
-        if (!args.raw || typeof args.raw !== 'string' || args.raw.trim().length === 0) {
-          throw new Error('invalid arguments: `raw` must be a non-empty string')
-        }
-        if (!args.cleaned || typeof args.cleaned !== 'string' || args.cleaned.trim().length === 0) {
-          throw new Error('invalid arguments: `cleaned` must be a non-empty string')
-        }
-
-        await mkdir(path.dirname(filePath), { recursive: true })
-        const index = await countLines(filePath)
-        await appendFile(
-          filePath,
-          `${JSON.stringify({ raw: args.raw, cleaned: args.cleaned })}\n`,
-          'utf8',
-        )
-        return {
-          text: `Voice input archived successfully at index ${index}.`,
-        }
+        return archiveVoiceInput(filePath, args)
       },
       presentCall: (args) => ({
         card: 'generic',
@@ -108,24 +102,7 @@ export function apply(ctx, config) {
         render: (_args, value) => [{ type: 'text', text: value.text }],
       },
       async execute(args) {
-        if (typeof args.index !== 'number' || !Number.isInteger(args.index) || args.index < 0) {
-          throw new Error('invalid arguments: `index` must be a non-negative integer')
-        }
-
-        const text = await readFile(filePath, 'utf8').catch(() => '')
-        const lines = text.split('\n').filter(Boolean)
-        if (args.index >= lines.length) {
-          return {
-            text: `No voice input record exists at index ${args.index}.`,
-          }
-        }
-
-        lines.splice(args.index, 1)
-        await mkdir(path.dirname(filePath), { recursive: true })
-        await writeFile(filePath, lines.length ? `${lines.join('\n')}\n` : '', 'utf8')
-        return {
-          text: `Voice input record ${args.index} removed successfully.`,
-        }
+        return removeVoiceInputRecord(filePath, args)
       },
       presentCall: (args) => ({
         card: 'generic',

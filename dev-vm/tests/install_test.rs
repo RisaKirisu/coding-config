@@ -1,7 +1,6 @@
 use devvm_daemon::{
-    generate_dns_setup_instructions, generate_launchd_plist, generate_systemd_unit,
-    get_launchd_plist_path, get_systemd_service_path, Platform, ServiceManager, ServicePlistConfig,
-    ServiceUnitConfig,
+    generate_launchd_plist, generate_systemd_unit, get_launchd_plist_path,
+    get_systemd_service_path, Platform, ServiceManager, ServicePlistConfig, ServiceUnitConfig,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,14 +9,17 @@ use tempfile::tempdir;
 
 #[test]
 fn test_web_profile_links_first_party_plugins_to_their_sources() {
-    let profile_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("root/.dsh/profiles/web/package.json");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let profile_path = manifest_dir.join("root/.dsh/profiles/web/package.json");
     let profile: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(profile_path).unwrap()).unwrap();
+        serde_json::from_str(&fs::read_to_string(&profile_path).unwrap()).unwrap();
     let dependencies = profile["dependencies"].as_object().unwrap();
+    let node_modules = manifest_dir.join("root/.dsh/profiles/web/node_modules");
 
     for (package, source) in [
+        ("@devvm/dsh-build-loop", "build-loop"),
         ("@devvm/dsh-remote-sync", "remote-sync"),
+        ("@devvm/dsh-style-control", "style-control"),
         ("@devvm/dsh-subagent-manager", "subagent-manager"),
         ("@devvm/dsh-voice-input", "voice-input"),
         ("dsh-skill-mcp-panel", "dsh-skill-mcp-panel"),
@@ -25,9 +27,159 @@ fn test_web_profile_links_first_party_plugins_to_their_sources() {
         assert_eq!(
             dependencies.get(package).and_then(|value| value.as_str()),
             Some(format!("link:/root/.dsh/plugins/{source}").as_str()),
-            "{package} must resolve directly to its shared source directory"
+            "{package} manifest spec must be link:/root/.dsh/plugins/{source}"
+        );
+
+        let installed_path = node_modules.join(package);
+        let metadata = fs::symlink_metadata(&installed_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to read metadata for {}: {e}",
+                installed_path.display()
+            )
+        });
+        assert!(
+            metadata.file_type().is_symlink(),
+            "{package} at {} must be a symbolic link rather than a hardlinked directory",
+            installed_path.display()
+        );
+
+        let target = fs::canonicalize(&installed_path)
+            .unwrap_or_else(|e| panic!("failed to canonicalize {}: {e}", installed_path.display()));
+        let expected_target = fs::canonicalize(manifest_dir.join("root/.dsh/plugins").join(source))
+            .unwrap_or_else(|e| panic!("failed to canonicalize source for {source}: {e}"));
+        assert_eq!(
+            target, expected_target,
+            "{package} symlink must resolve to its source directory"
         );
     }
+}
+
+#[test]
+fn test_profiles_do_not_declare_duplicate_web_fetch() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for profile in ["web", "headless"] {
+        let profile_path = repo_root.join(format!("root/.dsh/profiles/{profile}/package.json"));
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&profile_path).unwrap()).unwrap();
+        if let Some(deps) = manifest.get("dependencies").and_then(|d| d.as_object()) {
+            assert!(
+                !deps.contains_key("@deepseek-ai/dsh-web-fetch-http"),
+                "{profile} profile must not declare @deepseek-ai/dsh-web-fetch-http because DSH base includes it"
+            );
+        }
+        if let Some(bundles) = manifest
+            .get("dsh")
+            .and_then(|d| d.get("profile"))
+            .and_then(|p| p.get("bundles"))
+            .and_then(|b| b.as_array())
+        {
+            assert!(
+                !bundles
+                    .iter()
+                    .any(|b| b.as_str() == Some("@deepseek-ai/dsh-web-fetch-http")),
+                "{profile} profile must not declare @deepseek-ai/dsh-web-fetch-http in bundles"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_web_profile_third_party_plugin_pins() {
+    let profile_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("root/.dsh/profiles/web/package.json");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&profile_path).unwrap()).unwrap();
+    let deps = manifest["dependencies"].as_object().unwrap();
+    assert_eq!(
+        deps.get("@hytime/dsh-thinking-effort")
+            .and_then(|v| v.as_str()),
+        Some("^0.2.0")
+    );
+    assert_eq!(
+        deps.get("dsh-better-sidebar").and_then(|v| v.as_str()),
+        Some("^0.18.0")
+    );
+}
+
+#[test]
+fn test_web_profile_lockfile_has_no_file_links_for_local_plugins() {
+    let lockfile_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("root/.dsh/profiles/web/pnpm-lock.yaml");
+    let lockfile_content = fs::read_to_string(&lockfile_path).unwrap();
+    for plugin in [
+        "build-loop",
+        "remote-sync",
+        "style-control",
+        "subagent-manager",
+        "voice-input",
+        "dsh-skill-mcp-panel",
+    ] {
+        assert!(
+            !lockfile_content.contains(&format!("file:/root/.dsh/plugins/{plugin}")),
+            "lockfile must not contain file: specifier for {plugin}"
+        );
+        assert!(
+            !lockfile_content.contains(&format!("file:../../../../root/.dsh/plugins/{plugin}")),
+            "lockfile must not contain file: version for {plugin}"
+        );
+        assert!(
+            lockfile_content.contains(&format!("specifier: link:/root/.dsh/plugins/{plugin}")),
+            "lockfile must contain link: specifier for {plugin}"
+        );
+        assert!(
+            lockfile_content.contains(&format!("version: link:../../plugins/{plugin}")),
+            "lockfile must contain link: version for {plugin}"
+        );
+    }
+
+    assert!(
+        lockfile_content.contains("'@hytime/dsh-thinking-effort@0.2.0':"),
+        "lockfile must contain @hytime/dsh-thinking-effort locked at 0.2.0"
+    );
+    assert!(
+        !lockfile_content.contains("38f541073e7193d940a9ab5295cf8eb1e5ad5d6d"),
+        "lockfile must not contain obsolete GitHub commit for thinking effort"
+    );
+}
+
+#[test]
+fn test_headless_profile_lockfile_does_not_contain_duplicate_web_fetch() {
+    let lockfile_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("root/.dsh/profiles/headless/pnpm-lock.yaml");
+    let lockfile_content = fs::read_to_string(&lockfile_path).unwrap();
+    assert!(
+        !lockfile_content.contains("@deepseek-ai/dsh-web-fetch-http"),
+        "headless lockfile must not contain @deepseek-ai/dsh-web-fetch-http"
+    );
+}
+
+#[test]
+fn test_plugins_directory_has_fallback_node_modules_symlink() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let link_path = manifest_dir.join("root/.dsh/plugins/node_modules");
+    let metadata = fs::symlink_metadata(&link_path)
+        .unwrap_or_else(|e| panic!("failed to read metadata for {}: {e}", link_path.display()));
+    assert!(
+        metadata.file_type().is_symlink(),
+        "{} must be a symbolic link",
+        link_path.display()
+    );
+    let target = fs::read_link(&link_path).unwrap_or_else(|e| {
+        panic!(
+            "failed to read link target for {}: {e}",
+            link_path.display()
+        )
+    });
+    assert_eq!(
+        target,
+        Path::new("../profiles/node_modules"),
+        "plugins/node_modules must point to ../profiles/node_modules"
+    );
+    let canonical = fs::canonicalize(&link_path)
+        .unwrap_or_else(|e| panic!("failed to canonicalize {}: {e}", link_path.display()));
+    let expected = fs::canonicalize(manifest_dir.join("root/.dsh/profiles/node_modules"))
+        .unwrap_or_else(|e| panic!("failed to canonicalize profiles/node_modules: {e}"));
+    assert_eq!(canonical, expected);
 }
 
 #[test]
@@ -243,109 +395,6 @@ fn test_service_manager_macos_fixture() {
 }
 
 #[test]
-fn test_dns_setup_helper_generation() {
-    let instructions = generate_dns_setup_instructions(
-        "devvm.internal",
-        53,
-        Some("100.64.0.42"),
-        Some(Path::new("/home/user/.local/bin/devvm-daemon")),
-    );
-
-    assert_eq!(instructions.domain, "devvm.internal");
-    assert_eq!(instructions.port, 53);
-    assert_eq!(instructions.tailscale_ip.as_deref(), Some("100.64.0.42"));
-    assert_eq!(
-        instructions.bin_path,
-        PathBuf::from("/home/user/.local/bin/devvm-daemon")
-    );
-
-    // Linux setcap command
-    assert_eq!(
-        instructions.linux_setcap_cmd,
-        "sudo setcap 'cap_net_bind_service=+ep' /home/user/.local/bin/devvm-daemon"
-    );
-
-    // Linux resolved config
-    assert_eq!(
-        instructions.linux_resolved_content,
-        "[Resolve]\nDNS=100.64.0.42:53\nDomains=~devvm.internal\n"
-    );
-
-    // macOS resolver config
-    assert_eq!(
-        instructions.macos_resolver_content,
-        "nameserver 100.64.0.42\n"
-    );
-
-    assert!(instructions
-        .full_instructions
-        .contains("=== DevVM Wildcard DNS Setup ==="));
-    assert!(instructions
-        .full_instructions
-        .contains("Local host setup is automated by setup-devvm.sh --service."));
-    assert!(instructions
-        .full_instructions
-        .contains("One tailnet-admin action remains:"));
-    assert!(instructions
-        .full_instructions
-        .contains("Nameserver: 100.64.0.42"));
-    assert!(instructions
-        .full_instructions
-        .contains("Restrict to domain: devvm.internal"));
-    assert!(!instructions.full_instructions.contains("macOS"));
-    assert!(!instructions.full_instructions.contains("systemd-resolved"));
-}
-
-#[test]
-fn test_dns_setup_uses_windows_tailscale_without_false_error() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let temp = tempdir().unwrap();
-    let windows_cli = temp.path().join("tailscale.exe");
-    fs::write(
-        &windows_cli,
-        "#!/usr/bin/env bash\nprintf '100.67.154.69\\n'\n",
-    )
-    .unwrap();
-    fs::set_permissions(&windows_cli, fs::Permissions::from_mode(0o755)).unwrap();
-
-    let path = format!("{}:/usr/bin:/bin", temp.path().display());
-    let output = Command::new(env!("CARGO_BIN_EXE_devvm-daemon"))
-        .args(["dns", "setup"])
-        .env("PATH", path)
-        .output()
-        .unwrap();
-
-    assert!(output.status.success(), "dns setup failed: {output:?}");
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(combined.contains("Target IP: 100.67.154.69"));
-    assert!(
-        !combined.contains("ERROR") && !combined.contains("No such file or directory"),
-        "a successful fallback must not log the missing Linux CLI as an error: {combined}"
-    );
-}
-
-#[test]
-fn test_dns_setup_helper_non_standard_port() {
-    let instructions =
-        generate_dns_setup_instructions("devvm.internal", 1053, Some("127.0.0.1"), None);
-
-    assert_eq!(instructions.port, 1053);
-    assert_eq!(
-        instructions.macos_resolver_content,
-        "nameserver 127.0.0.1\nport 1053\n"
-    );
-    assert_eq!(
-        instructions.linux_resolved_content,
-        "[Resolve]\nDNS=127.0.0.1:1053\nDomains=~devvm.internal\n"
-    );
-}
-
-#[test]
 fn test_script_syntax_and_dry_run() {
     // 1. Verify syntax of setup-devvm.sh
     let status = Command::new("bash")
@@ -363,35 +412,34 @@ fn test_script_syntax_and_dry_run() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Usage:"));
     assert!(stdout.contains("--service"));
+    assert!(stdout.contains("--remote"));
+    assert!(stdout.contains("--remote-domain"));
+    assert!(stdout.contains("--remote-ip"));
     assert!(stdout.contains("--skip-image"));
 
-    // 3. Verify syntax of scripts/setup-dns.sh
-    let status = Command::new("bash")
-        .args(["-n", "scripts/setup-dns.sh"])
-        .status()
-        .expect("Failed to run bash syntax check on scripts/setup-dns.sh");
-    assert!(
-        status.success(),
-        "scripts/setup-dns.sh has bash syntax errors"
-    );
-
-    // 4. Verify scripts/setup-dns.sh --dry-run
-    let output = Command::new("bash")
-        .args([
-            "scripts/setup-dns.sh",
-            "--dry-run",
-            "--tailscale-ip",
-            "100.67.154.69",
-            "--bin",
-            "/bin/true",
-        ])
+    // 3. Verify override flags without --remote are rejected
+    let override_err = Command::new("bash")
+        .args(["setup-devvm.sh", "--remote-domain", "custom.dev"])
         .output()
-        .expect("Failed to run scripts/setup-dns.sh --dry-run");
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("=== DevVM One-Time DNS Setup ==="));
-    assert!(stdout.contains("devvm-daemon-dns.service"));
-    assert!(stdout.contains("One tailnet-admin action remains"));
+        .expect("Failed to run setup-devvm.sh with invalid flags");
+    assert!(!override_err.status.success());
+    let stderr = String::from_utf8_lossy(&override_err.stderr);
+    assert!(stderr.contains("require --remote"));
+
+    let ip_override_err = Command::new("bash")
+        .args(["setup-devvm.sh", "--remote-ip", "100.64.0.1"])
+        .output()
+        .expect("Failed to run setup-devvm.sh with invalid flags");
+    assert!(!ip_override_err.status.success());
+    let stderr = String::from_utf8_lossy(&ip_override_err.stderr);
+    assert!(stderr.contains("require --remote"));
+
+    // 4. Verify scripts/Caddyfile.host exists and contains expected directives
+    let host_caddyfile =
+        fs::read_to_string("scripts/Caddyfile.host").expect("scripts/Caddyfile.host must exist");
+    assert!(host_caddyfile.contains("devvm.{$REMOTE_DOMAIN:risak.dev}"));
+    assert!(host_caddyfile.contains("bind {$REMOTE_IP:100.67.154.69}"));
+    assert!(host_caddyfile.contains("dns cloudflare {env.CLOUDFLARE_API_TOKEN}"));
 }
 
 #[test]
@@ -626,8 +674,8 @@ fn test_setup_installs_upgrades_and_skips_current_versions() {
     .unwrap();
     fs::create_dir_all(devvm_home.join("scripts")).unwrap();
     fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/setup-dns.sh"),
-        devvm_home.join("scripts/setup-dns.sh"),
+        "scripts/Caddyfile.host",
+        devvm_home.join("scripts/Caddyfile.host"),
     )
     .unwrap();
     fs::write(devvm_home.join("smolvm.toml"), "# test\n").unwrap();
@@ -738,17 +786,9 @@ chmod +x "$DEVVM_HOME/target/release/devvm-daemon"
         "daemon-v2"
     );
 
-    // Service setup also provisions the wildcard DNS service when Windows Tailscale is visible.
+    // Service setup: ordinary --service is local-only; --remote opts into remote HTTPS
     let command_log = temp.path().join("service-commands.log");
     for (name, body) in [
-        (
-            "tailscale.exe",
-            "#!/usr/bin/env bash\nprintf '100.67.154.69\\n'\n",
-        ),
-        (
-            "setcap",
-            "#!/usr/bin/env bash\nprintf 'setcap %s\\n' \"$*\" >> \"$FAKE_SERVICE_COMMAND_LOG\"\n",
-        ),
         (
             "systemctl",
             "#!/usr/bin/env bash\nprintf 'systemctl %s\\n' \"$*\" >> \"$FAKE_SERVICE_COMMAND_LOG\"\n",
@@ -763,7 +803,9 @@ chmod +x "$DEVVM_HOME/target/release/devvm-daemon"
         "#!/usr/bin/env bash\nprintf 'daemon %s\\n' \"$*\" >> '{}'\n",
         command_log.display()
     );
-    let serviced = Command::new(&setup)
+
+    // 1. Local-only service setup
+    let serviced_local = Command::new(&setup)
         .args(["--skip-image", "--service"])
         .current_dir(&devvm_home)
         .env("HOME", &home)
@@ -775,20 +817,138 @@ chmod +x "$DEVVM_HOME/target/release/devvm-daemon"
         .output()
         .unwrap();
     assert!(
-        serviced.status.success(),
-        "service setup failed: {serviced:?}"
+        serviced_local.status.success(),
+        "local service setup failed: {serviced_local:?}"
     );
 
-    let dns_unit = fs::read_to_string(home.join(".config/systemd/user/devvm-daemon-dns.service"))
-        .expect("setup --service must install the wildcard DNS service");
-    assert!(dns_unit.contains("ExecStart="));
-    assert!(dns_unit
-        .contains(" dns --bind 100.67.154.69:53 --ip 100.67.154.69 --domain devvm.internal"));
-    let commands = fs::read_to_string(&command_log).unwrap();
-    assert!(commands.contains("daemon service install --enable"));
-    assert!(!commands.contains("daemon service install --enable --start"));
-    assert!(commands.contains("systemctl --user restart devvm-daemon.service"));
-    assert!(commands.contains("setcap cap_net_bind_service=+ep"));
-    assert!(commands.contains("systemctl --user enable devvm-daemon-dns.service"));
-    assert!(commands.contains("systemctl --user restart devvm-daemon-dns.service"));
+    let commands_local = fs::read_to_string(&command_log).unwrap();
+    assert!(commands_local.contains("daemon service install --enable"));
+    assert!(!commands_local.contains("--remote-domain"));
+    assert!(commands_local.contains("systemctl --user restart devvm-daemon.service"));
+    assert!(!home
+        .join(".config/systemd/user/devvm-daemon-dns.service")
+        .exists());
+    assert!(!devvm_home
+        .join("root/.config/devvm/Caddyfile.host")
+        .exists());
+
+    // Clear command log for next run
+    fs::write(&command_log, "").unwrap();
+
+    // 2. Opt-in remote service setup with defaults (risak.dev, 100.67.154.69)
+    let serviced_remote = Command::new(&setup)
+        .args(["--skip-image", "--service", "--remote"])
+        .current_dir(&devvm_home)
+        .env("HOME", &home)
+        .env("DEVVM_HOME", &devvm_home)
+        .env("PATH", &path)
+        .env("FAKE_SMOLVM_INSTALL_LOG", &install_log)
+        .env("FAKE_DAEMON_BUILD", &daemon_script)
+        .env("FAKE_SERVICE_COMMAND_LOG", &command_log)
+        .output()
+        .unwrap();
+    assert!(
+        serviced_remote.status.success(),
+        "remote service setup failed: {serviced_remote:?}"
+    );
+
+    let commands_remote = fs::read_to_string(&command_log).unwrap();
+    assert!(commands_remote.contains("daemon service install --enable --remote-domain risak.dev"));
+    let output = String::from_utf8_lossy(&serviced_remote.stdout);
+    assert!(output.contains(&fs::read_to_string("scripts/Caddyfile.host").unwrap()));
+    assert!(output.contains("REMOTE_DOMAIN=risak.dev REMOTE_IP=100.67.154.69"));
+    assert!(!devvm_home
+        .join("root/.config/devvm/Caddyfile.host")
+        .exists());
+
+    // 3. Remote service setup with overrides
+    fs::write(&command_log, "").unwrap();
+    let serviced_override = Command::new(&setup)
+        .args([
+            "--skip-image",
+            "--service",
+            "--remote",
+            "--remote-domain",
+            "custom.org",
+            "--remote-ip",
+            "100.64.0.1",
+        ])
+        .current_dir(&devvm_home)
+        .env("HOME", &home)
+        .env("DEVVM_HOME", &devvm_home)
+        .env("PATH", &path)
+        .env("FAKE_SMOLVM_INSTALL_LOG", &install_log)
+        .env("FAKE_DAEMON_BUILD", &daemon_script)
+        .env("FAKE_SERVICE_COMMAND_LOG", &command_log)
+        .output()
+        .unwrap();
+    assert!(
+        serviced_override.status.success(),
+        "remote override setup failed: {serviced_override:?}"
+    );
+
+    let commands_override = fs::read_to_string(&command_log).unwrap();
+    assert!(
+        commands_override.contains("daemon service install --enable --remote-domain custom.org")
+    );
+    let output = String::from_utf8_lossy(&serviced_override.stdout);
+    assert!(output.contains(
+        "REMOTE_DOMAIN=custom.org REMOTE_IP=100.64.0.1 REMOTE_DOMAIN_REGEXP=custom\\.org"
+    ));
+    assert!(!devvm_home
+        .join("root/.config/devvm/Caddyfile.host")
+        .exists());
+
+    // 4. Remote setup without --service prints config without touching system service
+    fs::write(&command_log, "").unwrap();
+    let setup_remote_only = Command::new(&setup)
+        .args(["--skip-image", "--remote"])
+        .current_dir(&devvm_home)
+        .env("HOME", &home)
+        .env("DEVVM_HOME", &devvm_home)
+        .env("PATH", &path)
+        .env("FAKE_SMOLVM_INSTALL_LOG", &install_log)
+        .env("FAKE_DAEMON_BUILD", &daemon_script)
+        .env("FAKE_SERVICE_COMMAND_LOG", &command_log)
+        .output()
+        .unwrap();
+    assert!(setup_remote_only.status.success());
+    assert!(!devvm_home
+        .join("root/.config/devvm/Caddyfile.host")
+        .exists());
+    assert!(String::from_utf8_lossy(&setup_remote_only.stdout)
+        .contains(&fs::read_to_string("scripts/Caddyfile.host").unwrap()));
+    let commands_remote_only = fs::read_to_string(&command_log).unwrap();
+    assert!(
+        !commands_remote_only.contains("daemon service install"),
+        "must not install service without --service"
+    );
+}
+
+#[test]
+fn test_devvm_project_name_truncation() {
+    let temp = tempdir().unwrap();
+    let devvm_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("devvm");
+
+    let long_name = "extremely-long-project-directory-name-that-exceeds-forty-eight-chars-by-far";
+    let project_dir = temp.path().join(long_name);
+    fs::create_dir_all(&project_dir).unwrap();
+
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            "source \"$1\" name >/dev/null; printf '%s' \"$PROJECT_HOST\"",
+            "test",
+        ])
+        .arg(&devvm_bin)
+        .current_dir(&project_dir)
+        .output()
+        .expect("Failed to compute devvm project host");
+    assert!(output.status.success());
+    let host = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(host.len(), 8);
+    assert_eq!(
+        host,
+        devvm_daemon::models::compute_project_host(&project_dir)
+    );
 }

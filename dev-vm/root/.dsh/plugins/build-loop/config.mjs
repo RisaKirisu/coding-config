@@ -16,6 +16,13 @@ export const DEFAULTS = Object.freeze({
   deniedTools: DEFAULT_DENIED_TOOLS,
 })
 
+/** Keep only denylist names present in the global tool surface inherited by children. */
+export function filterDeniedTools(deniedTools, globalSchemas) {
+  const globalNames = new Set((globalSchemas ?? []).map((schema) => schema?.name).filter(Boolean))
+  globalNames.delete('run_code')
+  return (deniedTools ?? []).filter((tool) => globalNames.has(tool))
+}
+
 /** Reject a saved section the loop could not run with. */
 export function validateConfig(value) {
   for (const key of ['buildPersona', 'reviewPersona', 'testPersona']) {

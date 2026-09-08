@@ -6,6 +6,9 @@ FRP_VERSION=0.71.0
 FRPS_BIN="$HOME/.local/bin/frps"
 INSTALL_SERVICE=0
 SKIP_IMAGE=0
+REMOTE=0
+REMOTE_DOMAIN=""
+REMOTE_IP=""
 SMOLVM_INSTALLER_URL="https://smolmachines.com/install.sh"
 SMOLVM_RELEASE_URL="https://github.com/smol-machines/smolvm/releases/latest"
 
@@ -25,22 +28,24 @@ latest_smolvm_version() {
         | sed -nE 's#.*/releases/tag/v?([^/]+)$#\1#p'
 }
 
-detect_tailscale_ipv4() {
-    local cli
-    for cli in tailscale tailscale.exe; do
-        if command -v "$cli" >/dev/null 2>&1; then
-            "$cli" ip -4 2>/dev/null && return 0
-        fi
-    done
-    return 1
-}
-
 # Parse command-line flags
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --service|--install-service)
             INSTALL_SERVICE=1
             shift
+            ;;
+        --remote)
+            REMOTE=1
+            shift
+            ;;
+        --remote-domain)
+            REMOTE_DOMAIN="$2"
+            shift 2
+            ;;
+        --remote-ip)
+            REMOTE_IP="$2"
+            shift 2
             ;;
         --skip-image|--no-image-build)
             SKIP_IMAGE=1
@@ -50,7 +55,10 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --service, --install-service   Install and start services (Control Daemon plus tailnet DNS on Linux)"
+            echo "  --service, --install-service   Install and start services"
+            echo "  --remote                       Opt-in to host HTTPS remote access"
+            echo "  --remote-domain <domain>       Override remote domain (requires --remote, default: risak.dev)"
+            echo "  --remote-ip <ip>               Override remote host IP (requires --remote, default: 100.67.154.69)"
             echo "  --skip-image, --no-image-build Skip building microVM machine image"
             echo "  -h, --help                     Show this help message"
             exit 0
@@ -61,6 +69,16 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ "$REMOTE" != "1" && (-n "$REMOTE_DOMAIN" || -n "$REMOTE_IP") ]]; then
+    echo "Error: --remote-domain and --remote-ip require --remote" >&2
+    exit 1
+fi
+
+if [[ "$REMOTE" == "1" ]]; then
+    REMOTE_DOMAIN="${REMOTE_DOMAIN:-risak.dev}"
+    REMOTE_IP="${REMOTE_IP:-100.67.154.69}"
+fi
 
 if [[ "$(realpath "$PWD")" != "$(realpath "$DEVVM_HOME")" ]]; then
     cd "$DEVVM_HOME"
@@ -166,23 +184,25 @@ fi
 if [[ "$INSTALL_SERVICE" == "1" ]]; then
     echo "=== Installing user service ==="
     if [[ -x "$HOME/.local/bin/devvm-daemon" ]]; then
+        local_service_args=(service install --enable)
+        if [[ "$REMOTE" == "1" ]]; then
+            local_service_args+=(--remote-domain "$REMOTE_DOMAIN")
+        fi
         if [[ "$(uname -s)" == "Linux" ]]; then
-            "$HOME/.local/bin/devvm-daemon" service install --enable
+            "$HOME/.local/bin/devvm-daemon" "${local_service_args[@]}"
             systemctl --user restart devvm-daemon.service
         else
-            "$HOME/.local/bin/devvm-daemon" service install --enable --start
+            "$HOME/.local/bin/devvm-daemon" "${local_service_args[@]}" --start
         fi
     fi
+fi
 
-    TAILSCALE_IP="$(detect_tailscale_ipv4 || true)"
-    if [[ "$(uname -s)" == "Linux" && -n "$TAILSCALE_IP" ]]; then
-        echo "=== Installing tailnet wildcard DNS service ==="
-        "$DEVVM_HOME/scripts/setup-dns.sh" \
-            --tailscale-ip "$TAILSCALE_IP" \
-            --bin "$HOME/.local/bin/devvm-daemon"
-    elif [[ "$(uname -s)" == "Linux" ]]; then
-        echo "Tailscale not connected; skipping tailnet wildcard DNS service."
-    fi
+if [[ "$REMOTE" == "1" ]]; then
+    echo "=== Host Caddy configuration (no file written) ==="
+    # Caddy expands these environment variables in the single shipped configuration.
+    printf 'Caddy service environment: REMOTE_DOMAIN=%s REMOTE_IP=%s REMOTE_DOMAIN_REGEXP=%s\n' \
+        "$REMOTE_DOMAIN" "$REMOTE_IP" "${REMOTE_DOMAIN//./\\.}"
+    cat "$DEVVM_HOME/scripts/Caddyfile.host"
 fi
 
 echo ""
@@ -197,27 +217,22 @@ echo "  - Run in foreground:    devvm-daemon serve"
 echo "  - Manage user service:  devvm-daemon service {install|status|uninstall}"
 echo ""
 echo "• Local Access:"
-echo "  - Control Daemon UI:    http://127.0.0.1:8100"
+echo "  - Control Daemon UI:    http://control.devvm.localhost:8100"
 echo "  - Project Ingress URLs: http://<port>.<project-host>.devvm.localhost:8102"
 echo ""
-TAILSCALE_IP="$(detect_tailscale_ipv4 || true)"
-if [[ -n "$TAILSCALE_IP" ]]; then
-    echo "• Tailnet Access (Tailscale IP: $TAILSCALE_IP):"
-    echo "  - Remote Control UI:    http://${TAILSCALE_IP}:8100"
-    echo "  - Remote Project URLs:  http://<port>.<project-host>.devvm.internal:8102"
+if [[ "$REMOTE" == "1" ]]; then
+    echo "• Remote HTTPS Access (Domain: $REMOTE_DOMAIN, Host IP: $REMOTE_IP):"
+    echo "  - Remote Control UI:    https://devvm.$REMOTE_DOMAIN"
+    echo "  - Remote Project URLs:  https://<project-host>-<port>.$REMOTE_DOMAIN"
+    echo "  - Host Caddy config:    $DEVVM_HOME/scripts/Caddyfile.host (printed above; no file generated)"
+    echo ""
+    echo "• Host Caddy Setup:"
+    echo "  - Install Caddy with Cloudflare DNS module on host"
+    echo "  - Configure CLOUDFLARE_API_TOKEN in environment file"
+    echo "  - Add the printed site block to your host Caddy configuration"
 else
-    echo "• Tailnet Access:"
-    echo "  - Tailscale not detected or not connected. Once connected:"
-    echo "  - Remote Control UI:    http://<tailscale-ip>:8100"
-    echo "  - Remote Project URLs:  http://<port>.<project-host>.devvm.internal:8102"
-fi
-echo ""
-if [[ "$INSTALL_SERVICE" == "1" && -n "$TAILSCALE_IP" && "$(uname -s)" == "Linux" ]]; then
-    echo "• Tailnet wildcard DNS service: installed"
-    echo "  - One admin action: Tailscale Admin Console -> DNS -> Add nameserver"
-    echo "  - Nameserver: $TAILSCALE_IP; restrict to domain: devvm.internal"
-else
-    echo "• Tailnet wildcard DNS: run setup again with --service while Tailscale is connected"
+    echo "• Remote Access:"
+    echo "  - Run setup again with --remote to configure host HTTPS routing"
 fi
 echo ""
 echo "• Sync Store Setup (Optional for portable DSH state sync to VPS):"

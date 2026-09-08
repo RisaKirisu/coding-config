@@ -320,6 +320,17 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
             flex: 1;
         }
 
+        #logs-modal .modal {
+            height: 80vh;
+        }
+
+        #logs-modal .modal-body {
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+            overflow: hidden;
+        }
+
         .modal-footer {
             padding: 16px 20px;
             border-top: 1px solid var(--card-border);
@@ -396,7 +407,8 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
             border-radius: 9px;
             font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
             font-size: 0.8125rem;
-            height: 70vh;
+            flex: 1;
+            min-height: 0;
             overflow-y: auto;
         }
 
@@ -698,7 +710,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
                     ? `<a href="${localDshUrl}" target="_blank" class="btn btn-sm btn-success">Open DSH (Local)</a>`
                     : '';
                 const tailnetDshLink = tailnetDshUrl && dshReady
-                    ? `<a href="${tailnetDshUrl}" target="_blank" class="btn btn-secondary btn-sm">Open DSH (Tailnet)</a>`
+                    ? `<a href="${tailnetDshUrl}" target="_blank" class="btn btn-secondary btn-sm">Open DSH (Remote)</a>`
                     : '';
 
                 const vmActionBtn = vmStatus.loading
@@ -777,9 +789,12 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
                     throw new Error(err.error || 'Failed to open port');
                 }
                 const data = await res.json();
+                const remoteLink = data.tailnet_url
+                    ? `<a href="${data.tailnet_url}" target="_blank" class="btn btn-secondary btn-sm">Remote :${port}</a>`
+                    : '';
                 linksContainer.innerHTML = `
                     <a href="${data.local_url}" target="_blank" class="btn btn-sm" style="background-color: var(--accent); color: #0f172a;">Local :${port}</a>
-                    <a href="${data.tailnet_url}" target="_blank" class="btn btn-secondary btn-sm">Tailnet :${port}</a>
+                    ${remoteLink}
                 `;
             } catch (err) {
                 alert('Error opening port: ' + err.message);
@@ -1035,7 +1050,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
             return `${pad(date.getHours(), 2)}:${pad(date.getMinutes(), 2)}:${pad(date.getSeconds(), 2)}.${pad(date.getMilliseconds(), 3)}`;
         }
 
-        function renderLogEntries() {
+        function renderLogEntries(appendFrom = null) {
             const el = document.getElementById('logs-content');
             const previousScroll = el.scrollTop;
             const rows = logEntries.filter(entry =>
@@ -1046,7 +1061,10 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
                 return;
             }
 
-            el.innerHTML = rows.map(entry => {
+            const append = appendFrom !== null && el.querySelector('.log-row') !== null;
+            const renderedRows = append ? logEntries.slice(appendFrom).filter(entry =>
+                logSources[entry.source] !== false && (!logErrorsOnly || entry.level === 'error')) : rows;
+            const html = renderedRows.map(entry => {
                 const source = ['daemon', 'dsh', 'ingress'].includes(entry.source) ? entry.source : 'daemon';
                 const level = ['info', 'warn', 'error'].includes(entry.level) ? entry.level : 'info';
                 return `<div class="log-row log-${level}">` +
@@ -1056,6 +1074,8 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
                     `</div>`;
             }).join('');
 
+            if (append) el.insertAdjacentHTML('beforeend', html);
+            else el.innerHTML = html;
             el.scrollTop = logFollow ? el.scrollHeight : previousScroll;
         }
 
@@ -1066,8 +1086,15 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
                 const res = await fetch(`/api/projects/${activeLogProjectId}/logs`);
                 if (!res.ok) throw new Error('Failed to fetch logs');
                 const data = await res.json();
-                logEntries = data.entries || [];
-                renderLogEntries();
+                const nextEntries = data.entries || [];
+                const appendFrom = logEntries.length > 0 && logEntries.length <= nextEntries.length &&
+                    logEntries.every((entry, index) => {
+                        const next = nextEntries[index];
+                        return entry.ts === next.ts && entry.source === next.source &&
+                            entry.level === next.level && entry.message === next.message;
+                    }) ? logEntries.length : null;
+                logEntries = nextEntries;
+                renderLogEntries(appendFrom);
             } catch (err) {
                 logsEl.innerHTML = `<div class="log-empty">Error loading logs: ${escapeHtml(err.message)}</div>`;
             }

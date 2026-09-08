@@ -52,7 +52,8 @@ pub struct ProjectLinks {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dsh_url: Option<String>,
     pub local_port_template: String,
-    pub tailnet_port_template: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailnet_port_template: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_url_template: Option<String>,
 }
@@ -110,7 +111,8 @@ pub struct OpenPortRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenPortResponse {
     pub local_url: String,
-    pub tailnet_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailnet_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -183,7 +185,12 @@ pub fn compute_project_host(project_path: &Path) -> String {
     let hash_hex = format!("{:x}", hash_result);
     let project_hash = &hash_hex[..8];
 
-    format!("{}-{}", project_name, project_hash)
+    // Leave room for the dash and five-digit port in a 63-character DNS label.
+    if project_name.len() > 48 {
+        project_hash.to_string()
+    } else {
+        format!("{}-{}", project_name, project_hash)
+    }
 }
 
 #[cfg(test)]
@@ -196,5 +203,18 @@ mod tests {
         let host = compute_project_host(path);
         assert!(host.starts_with("dev-vm-"));
         assert_eq!(host.len(), "dev-vm-".len() + 8);
+    }
+
+    #[test]
+    fn test_long_project_name_uses_path_hash() {
+        let long_name = "a".repeat(100);
+        let path = PathBuf::from(format!("/root/{}", long_name));
+        let host = compute_project_host(&path);
+        assert_eq!(host.len(), 8);
+        assert!(host.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(
+            host,
+            compute_project_host(&PathBuf::from(format!("/other/{}", long_name)))
+        );
     }
 }

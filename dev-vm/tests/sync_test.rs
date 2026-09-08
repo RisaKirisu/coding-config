@@ -72,7 +72,7 @@ async fn setup_sync_test_server() -> SyncTestContext {
         home_dir,
         devvm_bin: devvm_bin.clone(),
         ingress_port: 8102,
-        tailnet_domain: "devvm.internal".to_string(),
+        remote_domain: None,
     };
 
     let state = AppState {

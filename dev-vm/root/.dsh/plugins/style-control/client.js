@@ -564,7 +564,7 @@ window.__ModuleLoader__.load({
      * and cannot be overridden or broken by missing stylesheets.
      */
     function StyleChatDropdown(props) {
-      const sessionId = props?.session?.id;
+      const sessionId = props?.sessionId;
       const [data, setData] = React.useState(null);
       const [open, setOpen] = React.useState(false);
       const [hovered, setHovered] = React.useState(false);

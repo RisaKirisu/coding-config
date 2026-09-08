@@ -1,17 +1,15 @@
 use clap::{Parser, Subcommand};
 use devvm_daemon::{
-    create_router, default_home_dir, detect_tailscale_ipv4, determine_bind_addresses,
-    generate_dns_setup_instructions, provision_sync_setup, AppState, DaemonConfig, DnsConfig,
-    DnsServer, DshRuntimeManager, Platform, ServiceManager, SyncConfig, SyncManager,
+    create_router, default_home_dir, determine_bind_address, provision_sync_setup, AppState,
+    DaemonConfig, DshRuntimeManager, Platform, ServiceManager, SyncConfig, SyncManager,
 };
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "devvm-daemon",
-    about = "DevVM Workspace Supervision Control Daemon & DNS Server"
+    about = "DevVM Workspace Supervision Control Daemon"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -27,8 +25,6 @@ pub enum Commands {
     Serve(ServeArgs),
     /// Manage user service (systemd on Linux, launchd on macOS)
     Service(ServiceArgs),
-    /// Run or configure the wildcard DNS server for devvm.internal
-    Dns(DnsArgs),
     /// Manage Portable DSH State synchronization
     Sync(SyncArgs),
 }
@@ -73,7 +69,7 @@ pub struct ServiceInstallArgs {
     pub ingress_port: Option<u16>,
 
     #[arg(long)]
-    pub tailnet_domain: Option<String>,
+    pub remote_domain: Option<String>,
 }
 
 #[derive(clap::Args, Debug, Clone, PartialEq, Eq)]
@@ -154,60 +150,8 @@ pub struct ServeArgs {
     #[arg(long, env = "DEVVM_INGRESS_PORT", default_value_t = 8102)]
     pub ingress_port: u16,
 
-    #[arg(long, env = "DEVVM_TAILNET_DOMAIN", default_value = "devvm.internal")]
-    pub tailnet_domain: String,
-}
-
-#[derive(clap::Args, Debug, Clone, PartialEq, Eq)]
-pub struct DnsArgs {
-    #[command(subcommand)]
-    pub command: Option<DnsCommands>,
-
-    #[arg(
-        long,
-        short = 'b',
-        env = "DEVVM_DNS_BIND",
-        default_value = "0.0.0.0:53"
-    )]
-    pub bind: String,
-
-    #[arg(long, short = 'i', env = "DEVVM_DNS_IP")]
-    pub ip: Option<String>,
-
-    #[arg(
-        long,
-        short = 'd',
-        env = "DEVVM_DNS_DOMAIN",
-        default_value = "devvm.internal"
-    )]
-    pub domain: String,
-
-    #[arg(long, env = "DEVVM_DNS_IPV6")]
-    pub ipv6: Option<String>,
-
-    #[arg(long, env = "DEVVM_DNS_TTL", default_value_t = 60)]
-    pub ttl: u32,
-}
-
-#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
-pub enum DnsCommands {
-    /// Configure and generate wildcard DNS setup instructions
-    Setup(DnsSetupArgs),
-}
-
-#[derive(clap::Args, Debug, Clone, PartialEq, Eq)]
-pub struct DnsSetupArgs {
-    #[arg(long, default_value_t = 53)]
-    pub port: u16,
-
-    #[arg(long, env = "DEVVM_TAILSCALE_IP")]
-    pub tailscale_ip: Option<String>,
-
-    #[arg(long, default_value = "devvm.internal")]
-    pub domain: String,
-
-    #[arg(long)]
-    pub bin_path: Option<PathBuf>,
+    #[arg(long, env = "DEVVM_REMOTE_DOMAIN")]
+    pub remote_domain: Option<String>,
 }
 
 #[tokio::main]
@@ -226,30 +170,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Service(service_args)) => {
             run_service_command(service_args)?;
         }
-        Some(Commands::Dns(dns_args)) => match dns_args.command {
-            Some(DnsCommands::Setup(setup_args)) => {
-                run_dns_setup(setup_args)?;
-            }
-            None => {
-                let target_ip: Ipv4Addr = match dns_args.ip {
-                    Some(ref ip_str) => ip_str.parse()?,
-                    None => detect_tailscale_ipv4().unwrap_or_else(|| Ipv4Addr::new(127, 0, 0, 1)),
-                };
-                let target_ipv6 = match dns_args.ipv6 {
-                    Some(s) => Some(s.parse::<Ipv6Addr>()?),
-                    None => None,
-                };
-                let dns_config = DnsConfig {
-                    bind_addr: dns_args.bind,
-                    target_ip,
-                    domain: dns_args.domain,
-                    target_ipv6,
-                    ttl: dns_args.ttl,
-                };
-                let server = DnsServer::new(dns_config);
-                server.run().await?;
-            }
-        },
         Some(Commands::Sync(sync_args)) => match sync_args.command {
             SyncCommands::Setup(setup_args) => {
                 run_sync_setup(setup_args).await?;
@@ -291,8 +211,9 @@ fn run_service_command(args: ServiceArgs) -> Result<(), Box<dyn std::error::Erro
                 extra_args.push("--ingress-port".to_string());
                 extra_args.push(ingress_port.to_string());
             }
-            if let Some(domain) = install_args.tailnet_domain {
-                extra_args.push("--tailnet-domain".to_string());
+            if let Some(domain) = install_args.remote_domain {
+                devvm_daemon::validate_domain(&domain)?;
+                extra_args.push("--remote-domain".to_string());
                 extra_args.push(domain);
             }
 
@@ -339,19 +260,6 @@ fn run_service_command(args: ServiceArgs) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-fn run_dns_setup(args: DnsSetupArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let detected_ip = detect_tailscale_ipv4().map(|ip| ip.to_string());
-    let tailscale_ip = args.tailscale_ip.as_deref().or(detected_ip.as_deref());
-    let instructions = generate_dns_setup_instructions(
-        &args.domain,
-        args.port,
-        tailscale_ip,
-        args.bin_path.as_deref(),
-    );
-    println!("{}", instructions.full_instructions);
-    Ok(())
-}
-
 async fn run_sync_setup(args: SyncSetupArgs) -> Result<(), Box<dyn std::error::Error>> {
     let sync_config = SyncConfig {
         ssh_user: args.ssh_user,
@@ -394,7 +302,9 @@ async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     config.host = args.host.clone().unwrap_or_default();
     config.port = args.port;
     config.ingress_port = args.ingress_port;
-    config.tailnet_domain = args.tailnet_domain;
+    if let Some(ref d) = args.remote_domain {
+        config.remote_domain = Some(d.clone());
+    }
     if let Some(c) = args.config {
         config.config_path = c;
     }
@@ -408,6 +318,9 @@ async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         config.devvm_bin = d;
     }
 
+    if let Some(domain) = &config.remote_domain {
+        devvm_daemon::validate_domain(domain)?;
+    }
     let dsh_runtime_manager = DshRuntimeManager::new();
     let sync_manager = SyncManager::with_devvm_bin(config.devvm_bin.clone());
     let state = AppState {
@@ -418,42 +331,10 @@ async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let app = create_router(state);
 
-    let ts_ip = detect_tailscale_ipv4();
-    let bind_addrs = determine_bind_addresses(args.host.as_deref(), config.port, ts_ip);
-
-    let mut listeners = Vec::new();
-    for addr in bind_addrs {
-        tracing::info!("Starting DevVM Control Daemon on http://{}", addr);
-        match tokio::net::TcpListener::bind(addr).await {
-            Ok(listener) => listeners.push((addr, listener)),
-            Err(e) => {
-                if addr.ip().is_loopback() || listeners.is_empty() {
-                    return Err(format!("Failed to bind to {}: {}", addr, e).into());
-                } else {
-                    tracing::warn!("Failed to bind to secondary address {}: {}", addr, e);
-                }
-            }
-        }
-    }
-
-    if listeners.len() == 1 {
-        let (_, listener) = listeners.into_iter().next().unwrap();
-        axum::serve(listener, app).await?;
-    } else {
-        let mut set = tokio::task::JoinSet::new();
-        for (addr, listener) in listeners {
-            let app_clone = app.clone();
-            set.spawn(async move {
-                tracing::info!("DevVM Control Daemon listening on http://{}", addr);
-                if let Err(e) = axum::serve(listener, app_clone).await {
-                    tracing::error!("Server on {} failed: {}", addr, e);
-                }
-            });
-        }
-        while let Some(res) = set.join_next().await {
-            res?;
-        }
-    }
+    let addr = determine_bind_address(args.host.as_deref(), config.port)?;
+    tracing::info!("Starting DevVM Control Daemon on http://{}", addr);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
@@ -469,7 +350,7 @@ mod tests {
         assert_eq!(cli.serve_args.port, 8100);
         assert_eq!(cli.serve_args.host, None);
         assert_eq!(cli.serve_args.ingress_port, 8102);
-        assert_eq!(cli.serve_args.tailnet_domain, "devvm.internal");
+        assert_eq!(cli.serve_args.remote_domain, None);
     }
 
     #[test]
@@ -488,6 +369,19 @@ mod tests {
                 assert_eq!(args.port, 9100);
                 assert_eq!(args.host, None);
                 assert_eq!(args.ingress_port, 9102);
+                assert_eq!(args.remote_domain, None);
+            }
+            _ => panic!("Expected Serve subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_subcommand_with_remote_domain() {
+        let cli =
+            Cli::try_parse_from(["devvm-daemon", "serve", "--remote-domain", "risak.dev"]).unwrap();
+        match cli.command {
+            Some(Commands::Serve(args)) => {
+                assert_eq!(args.remote_domain, Some("risak.dev".to_string()));
             }
             _ => panic!("Expected Serve subcommand"),
         }
@@ -527,6 +421,8 @@ mod tests {
             "127.0.0.1",
             "--ingress-port",
             "8102",
+            "--remote-domain",
+            "risak.dev",
         ])
         .unwrap();
 
@@ -539,9 +435,45 @@ mod tests {
                 assert_eq!(args.port, Some(8100));
                 assert_eq!(args.host, Some("127.0.0.1".to_string()));
                 assert_eq!(args.ingress_port, Some(8102));
+                assert_eq!(args.remote_domain, Some("risak.dev".to_string()));
             }
             _ => panic!("Expected Service Install subcommand"),
         }
+    }
+
+    #[test]
+    fn test_run_service_command_install_with_remote_domain() {
+        let temp = tempfile::tempdir().unwrap();
+        let home_dir = temp.path().to_path_buf();
+        let bin_path = home_dir.join(".local/bin/devvm-daemon");
+
+        let args = ServiceArgs {
+            command: ServiceCommands::Install(ServiceInstallArgs {
+                enable: false,
+                start: false,
+                bin_path: Some(bin_path),
+                home_dir: Some(home_dir.clone()),
+                port: Some(8100),
+                host: Some("127.0.0.1".to_string()),
+                ingress_port: Some(8102),
+                remote_domain: Some("risak.dev".to_string()),
+            }),
+        };
+
+        run_service_command(args).unwrap();
+
+        let unit_file = home_dir.join(".config/systemd/user/devvm-daemon.service");
+        let plist_file = home_dir.join("Library/LaunchAgents/com.devvm.daemon.plist");
+        let content = if unit_file.exists() {
+            std::fs::read_to_string(unit_file).unwrap()
+        } else if plist_file.exists() {
+            std::fs::read_to_string(plist_file).unwrap()
+        } else {
+            panic!("Service file not created");
+        };
+
+        assert!(content.contains("--remote-domain"));
+        assert!(content.contains("risak.dev"));
     }
 
     #[test]
@@ -563,77 +495,6 @@ mod tests {
                 command: ServiceCommands::Status(_),
             })) => {}
             _ => panic!("Expected Service Status subcommand"),
-        }
-    }
-
-    #[test]
-    fn test_cli_dns_subcommand_serve() {
-        let cli = Cli::try_parse_from([
-            "devvm-daemon",
-            "dns",
-            "--bind",
-            "127.0.0.1:1053",
-            "--ip",
-            "100.64.0.10",
-            "--domain",
-            "devvm.internal",
-            "--ttl",
-            "300",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Some(Commands::Dns(args)) => {
-                assert!(args.command.is_none());
-                assert_eq!(args.bind, "127.0.0.1:1053");
-                assert_eq!(args.ip, Some("100.64.0.10".to_string()));
-                assert_eq!(args.domain, "devvm.internal");
-                assert_eq!(args.ttl, 300);
-            }
-            _ => panic!("Expected Dns subcommand"),
-        }
-    }
-
-    #[test]
-    fn test_cli_dns_subcommand_default_args() {
-        let cli = Cli::try_parse_from(["devvm-daemon", "dns"]).unwrap();
-        match cli.command {
-            Some(Commands::Dns(args)) => {
-                assert!(args.command.is_none());
-                assert_eq!(args.bind, "0.0.0.0:53");
-                assert_eq!(args.ip, None);
-                assert_eq!(args.domain, "devvm.internal");
-                assert_eq!(args.ttl, 60);
-            }
-            _ => panic!("Expected Dns subcommand"),
-        }
-    }
-
-    #[test]
-    fn test_cli_dns_subcommand_setup() {
-        let cli = Cli::try_parse_from([
-            "devvm-daemon",
-            "dns",
-            "setup",
-            "--port",
-            "53",
-            "--tailscale-ip",
-            "100.64.0.10",
-            "--domain",
-            "devvm.internal",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Some(Commands::Dns(args)) => match args.command {
-                Some(DnsCommands::Setup(setup_args)) => {
-                    assert_eq!(setup_args.port, 53);
-                    assert_eq!(setup_args.tailscale_ip, Some("100.64.0.10".to_string()));
-                    assert_eq!(setup_args.domain, "devvm.internal");
-                }
-                None => panic!("Expected Dns setup subcommand"),
-            },
-            _ => panic!("Expected Dns subcommand"),
         }
     }
 

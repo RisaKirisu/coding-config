@@ -1,7 +1,12 @@
 mod common;
 
-use common::{create_mock_devvm, log_entries_text, mock_dsh_pid_file, mock_dsh_start_count};
-use devvm_daemon::{create_router, AppState, DaemonConfig, DshRuntimeManager, SyncManager};
+use common::{
+    create_mock_devvm, log_entries_text, mock_dsh_pid_file, mock_dsh_start_count,
+    mock_dsh_token_file,
+};
+use devvm_daemon::{
+    create_router, logs::dsh_token_path, AppState, DaemonConfig, DshRuntimeManager, SyncManager,
+};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use std::fs;
@@ -70,6 +75,39 @@ async fn wait_for_dsh_status(ctx: &TestContext, proj_url: &str, expected: &str) 
     panic!("DSH never reached status {expected}");
 }
 
+async fn wait_for_dsh_token(project_dir: &std::path::Path) -> String {
+    let token_file = mock_dsh_token_file(project_dir);
+    for _ in 0..100 {
+        if let Ok(token) = fs::read_to_string(&token_file) {
+            let trimmed = token.trim().to_string();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("token file never appeared at {token_file:?}");
+}
+
+async fn wait_for_dsh_link(ctx: &TestContext, proj_url: &str) -> Value {
+    for _ in 0..100 {
+        let data: Value = ctx
+            .client
+            .get(proj_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if data["dsh_status"] == "running" && !data["links"]["local_dsh_url"].is_null() {
+            return data;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("DSH link never appeared for {proj_url}");
+}
+
 async fn wait_for_dsh_log(ctx: &TestContext, project_id: Uuid) -> String {
     let path = ctx
         .config
@@ -127,7 +165,7 @@ async fn setup_test_server() -> TestContext {
         home_dir: home_dir.clone(),
         devvm_bin: devvm_bin.clone(),
         ingress_port: 8102,
-        tailnet_domain: "devvm.internal".to_string(),
+        remote_domain: Some("risak.dev".to_string()),
     };
 
     let sync_manager = SyncManager::new();
@@ -183,6 +221,54 @@ async fn test_embedded_ui_served() {
     assert!(body.contains("Follow"));
     assert!(body.contains("scrollTop"));
     assert!(body.contains("<= 24"));
+}
+
+#[tokio::test]
+async fn test_project_logs_never_return_the_dsh_token_file() {
+    let ctx = setup_test_server().await;
+    let project_dir = ctx.home_dir.join("token-log-proj");
+    fs::create_dir_all(&project_dir).unwrap();
+    let project_id = register(&ctx, &project_dir).await;
+
+    let log_dir = ctx
+        ._temp_dir
+        .path()
+        .join("logs")
+        .join(project_id.to_string());
+    fs::create_dir_all(&log_dir).unwrap();
+    fs::write(
+        log_dir.join("dsh.log"),
+        "[2026-03-03T01:15:17.000Z] dsh web: http://127.0.0.1:3080/?token=mock-token-redacted-1-base64url-auth-token00\n",
+    )
+    .unwrap();
+    fs::write(
+        log_dir.join("dsh.token"),
+        "mock-token-redacted-1-base64url-auth-token00\n",
+    )
+    .unwrap();
+
+    let logs: Value = ctx
+        .client
+        .get(format!(
+            "http://{}/api/projects/{}/logs",
+            ctx.server_addr, project_id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let entries = logs["entries"].as_array().unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry["message"].as_str().unwrap_or_default().contains("mock-token-redacted"))
+            .count(),
+        1,
+        "the dsh.log startup line is a log entry, but the token file must never be read into the Project Log: {entries:?}"
+    );
 }
 
 #[tokio::test]
@@ -374,7 +460,7 @@ async fn test_project_registration_and_id_lifecycle() {
     assert_eq!(
         list[0]["links"]["tailnet_port_template"],
         format!(
-            "http://{{port}}.{}.devvm.internal:8102",
+            "https://{}-{{port}}.risak.dev",
             list[0]["project_host"].as_str().unwrap()
         )
     );
@@ -488,29 +574,63 @@ async fn test_dsh_status_is_read_from_the_devvm_and_survives_a_daemon_restart() 
     assert_eq!(res.status(), StatusCode::OK);
 
     wait_for_dsh_status(&ctx, &proj_url, "running").await;
-    let data: Value = ctx
-        .client
-        .get(&proj_url)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let data = wait_for_dsh_link(&ctx, &proj_url).await;
     assert_eq!(data["vm_status"], "running");
+    let expected_token = "mock-token-redacted-1-base64url-auth-token00";
+    let expected_local_url = format!(
+        "http://3080.{}.devvm.localhost:8102?token={}",
+        data["project_host"].as_str().unwrap(),
+        expected_token
+    );
+    let expected_tailnet_url = format!(
+        "https://{}-3080.risak.dev?token={}",
+        data["project_host"].as_str().unwrap(),
+        expected_token
+    );
+    // The links must carry the token emitted by the running DSH's startup URL, not a
+    // placeholder or an unauthenticated URL.
+    assert!(data["links"]["local_dsh_url"]
+        .as_str()
+        .unwrap()
+        .contains(expected_token));
+    assert!(data["links"]["tailnet_dsh_url"]
+        .as_str()
+        .unwrap()
+        .contains(expected_token));
+    assert!(data["links"]["dsh_url"]
+        .as_str()
+        .unwrap()
+        .contains(expected_token));
     assert_eq!(
         data["links"]["local_dsh_url"].as_str().unwrap(),
-        format!(
-            "http://3080.{}.devvm.localhost:8102",
-            data["project_host"].as_str().unwrap()
-        )
+        expected_local_url
+    );
+    assert_eq!(
+        data["links"]["tailnet_dsh_url"].as_str().unwrap(),
+        expected_tailnet_url
+    );
+    assert_eq!(
+        data["links"]["dsh_url"].as_str().unwrap(),
+        expected_local_url
     );
 
-    // 2. A fresh manager over the same config reads the running DSH out of the DevVM.
-    let fresh_status = DshRuntimeManager::new()
+    // A fresh manager over the same config reads the running DSH and the same token.
+    let fresh_manager = DshRuntimeManager::new();
+    let fresh_status = fresh_manager
         .get_status(&ctx.config, project_id, &project_dir)
         .await;
     assert_eq!(format!("{:?}", fresh_status), "Running");
+    assert_eq!(
+        fresh_manager.get_token(&ctx.config, project_id).as_deref(),
+        Some(expected_token)
+    );
+    assert_eq!(
+        fs::read_to_string(dsh_token_path(&ctx.config.log_dir, project_id))
+            .unwrap()
+            .trim(),
+        expected_token,
+        "the daemon must persist the token in the Project runtime directory, not only in guest /tmp"
+    );
 
     // 3. Same through the HTTP API served by a restarted daemon.
     let restarted_addr = spawn_daemon(&ctx.config).await;
@@ -527,6 +647,18 @@ async fn test_dsh_status_is_read_from_the_devvm_and_survives_a_daemon_restart() 
         .await
         .unwrap();
     assert_eq!(restarted["dsh_status"], "running");
+    assert_eq!(
+        restarted["links"]["local_dsh_url"].as_str().unwrap(),
+        expected_local_url
+    );
+    assert_eq!(
+        restarted["links"]["tailnet_dsh_url"].as_str().unwrap(),
+        expected_tailnet_url
+    );
+    assert_eq!(
+        restarted["links"]["dsh_url"].as_str().unwrap(),
+        expected_local_url
+    );
 
     // 4. dsh.log is written inside the DevVM with the ISO-8601 line prefix.
     let dsh_log = wait_for_dsh_log(&ctx, project_id).await;
@@ -585,6 +717,8 @@ async fn test_dsh_status_is_read_from_the_devvm_and_survives_a_daemon_restart() 
         .await;
     assert_eq!(format!("{:?}", fresh_status), "Stopped");
     assert!(!mock_dsh_pid_file(&project_dir).exists());
+    assert!(!mock_dsh_token_file(&project_dir).exists());
+    assert!(!dsh_token_path(&ctx.config.log_dir, project_id).exists());
 }
 
 #[tokio::test]
@@ -606,6 +740,7 @@ async fn test_second_launch_does_not_spawn_a_second_dsh_process() {
     );
     wait_for_dsh_status(&ctx, &proj_url, "running").await;
     let pid_after_first = fs::read_to_string(mock_dsh_pid_file(&project_dir)).unwrap();
+    let token_after_first = wait_for_dsh_token(&project_dir).await;
 
     assert_eq!(
         ctx.client.post(&launch_url).send().await.unwrap().status(),
@@ -629,6 +764,20 @@ async fn test_second_launch_does_not_spawn_a_second_dsh_process() {
     assert_eq!(
         fs::read_to_string(mock_dsh_pid_file(&project_dir)).unwrap(),
         pid_after_first
+    );
+    assert_eq!(
+        fs::read_to_string(mock_dsh_token_file(&project_dir))
+            .unwrap()
+            .trim(),
+        token_after_first,
+        "an idempotent launch must not replace the token"
+    );
+    assert_eq!(
+        fs::read_to_string(dsh_token_path(&ctx.config.log_dir, project_id))
+            .unwrap()
+            .trim(),
+        token_after_first,
+        "a redundant launch must not wipe the host token copy while DSH is alive"
     );
 
     assert_eq!(
@@ -672,6 +821,8 @@ async fn test_dsh_restart_replaces_the_running_process() {
         .trim()
         .to_string();
     assert!(!pid_before.is_empty());
+    let token_before = wait_for_dsh_token(&project_dir).await;
+    assert!(!token_before.is_empty());
 
     let restart_res = ctx
         .client
@@ -693,6 +844,18 @@ async fn test_dsh_restart_replaces_the_running_process() {
         pid_before, pid_after,
         "restart must run a new DSH process, not reuse the old one"
     );
+    let token_after = wait_for_dsh_token(&project_dir).await;
+    assert_ne!(
+        token_before, token_after,
+        "restart must replace the token, not reuse the old one"
+    );
+    assert_eq!(
+        fs::read_to_string(dsh_token_path(&ctx.config.log_dir, project_id))
+            .unwrap()
+            .trim(),
+        token_after,
+        "restart must persist the new token in the Project runtime directory"
+    );
     assert_eq!(mock_dsh_start_count(&project_dir), 2);
 
     let stop_res = ctx
@@ -705,6 +868,222 @@ async fn test_dsh_restart_replaces_the_running_process() {
         .await
         .unwrap();
     assert_eq!(stop_res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_dsh_link_is_omitted_when_token_is_missing() {
+    let ctx = setup_test_server().await;
+
+    let project_dir = ctx.home_dir.join("dsh-missing-token-proj");
+    fs::create_dir_all(&project_dir).unwrap();
+    let project_id = register(&ctx, &project_dir).await;
+    let proj_url = format!("http://{}/api/projects/{}", ctx.server_addr, project_id);
+
+    let launch_url = format!(
+        "http://{}/api/projects/{}/dsh/launch",
+        ctx.server_addr, project_id
+    );
+    assert_eq!(
+        ctx.client.post(&launch_url).send().await.unwrap().status(),
+        StatusCode::OK
+    );
+    wait_for_dsh_status(&ctx, &proj_url, "running").await;
+    let expected_token = wait_for_dsh_token(&project_dir).await;
+    let token_path = dsh_token_path(&ctx.config.log_dir, project_id);
+
+    // A blank host token copy must omit links even when the guest has emitted its token.
+    fs::write(&token_path, "   \n").unwrap();
+    let data: Value = ctx
+        .client
+        .get(&proj_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(data["dsh_status"], "running");
+    assert!(
+        data["links"]["local_dsh_url"].is_null(),
+        "a blank token file must omit the local link"
+    );
+    assert!(
+        data["links"]["tailnet_dsh_url"].is_null(),
+        "a blank token file must omit the tailnet link"
+    );
+    assert!(
+        data["links"]["dsh_url"].is_null(),
+        "a blank token file must omit the compatibility link"
+    );
+
+    // Remove token file to simulate interval before token is emitted or a missing token.
+    fs::remove_file(&token_path).unwrap();
+    let _ = fs::remove_file(mock_dsh_token_file(&project_dir));
+    wait_for_dsh_status(&ctx, &proj_url, "starting").await;
+
+    // Readiness comes from guest state, including after the daemon loses its memory.
+    let restarted_addr = spawn_daemon(&ctx.config).await;
+    let restarted: Value = ctx
+        .client
+        .get(format!("http://{restarted_addr}/api/projects/{project_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(restarted["dsh_status"], "starting");
+    assert!(restarted["links"]["dsh_url"].is_null());
+
+    let data: Value = ctx
+        .client
+        .get(&proj_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(data["dsh_status"], "starting");
+    assert!(
+        data["links"]["local_dsh_url"].is_null(),
+        "local_dsh_url must be omitted when token is missing"
+    );
+    assert!(
+        data["links"]["tailnet_dsh_url"].is_null(),
+        "tailnet_dsh_url must be omitted when token is missing"
+    );
+    assert!(
+        data["links"]["dsh_url"].is_null(),
+        "dsh_url must be omitted when token is missing"
+    );
+
+    // Capturing the URL token promotes the same live process to running.
+    fs::write(mock_dsh_token_file(&project_dir), &expected_token).unwrap();
+    fs::write(&token_path, &expected_token).unwrap();
+    wait_for_dsh_status(&ctx, &proj_url, "running").await;
+    let ready = wait_for_dsh_link(&ctx, &proj_url).await;
+    assert_eq!(ready["dsh_status"], "running");
+
+    // A stopped runtime must never present a stale token, whether or not the token file
+    // lingered: the stop removes daemon token state with the guest process.
+    let stop_res = ctx
+        .client
+        .post(format!(
+            "http://{}/api/projects/{}/dsh/stop",
+            ctx.server_addr, project_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stop_res.status(), StatusCode::OK);
+    assert!(
+        !dsh_token_path(&ctx.config.log_dir, project_id).exists(),
+        "stopping DSH must remove the daemon's token copy right away"
+    );
+
+    // Simulate stale daemon state surviving a guest-side DSH crash: the token file is
+    // written back on the host, and the next status probe must drop it.
+    fs::write(
+        dsh_token_path(&ctx.config.log_dir, project_id),
+        format!("{expected_token}\n"),
+    )
+    .unwrap();
+
+    let data: Value = ctx
+        .client
+        .get(&proj_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(data["dsh_status"], "stopped");
+    assert!(
+        data["links"]["local_dsh_url"].is_null(),
+        "a stopped runtime must never present an authenticated link"
+    );
+    assert!(
+        data["links"]["tailnet_dsh_url"].is_null(),
+        "a stopped runtime must never present an authenticated link"
+    );
+    assert!(
+        data["links"]["dsh_url"].is_null(),
+        "a stopped runtime must never present an authenticated link"
+    );
+    assert!(
+        !dsh_token_path(&ctx.config.log_dir, project_id).exists(),
+        "a fresh probe of a stopped runtime must remove the stale token copy"
+    );
+}
+
+#[tokio::test]
+async fn test_disconnect_during_vm_boot_does_not_leak_dsh_operation() {
+    use tokio::io::AsyncWriteExt;
+    let ctx = setup_test_server().await;
+    let project_dir = ctx.home_dir.join("cancelled-launch");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::write(project_dir.join(".vm_start_slow"), "1").unwrap();
+    let project_id = register(&ctx, &project_dir).await;
+    let mut socket = tokio::net::TcpStream::connect(ctx.server_addr).await.unwrap();
+    socket.write_all(format!(
+        "POST /api/projects/{project_id}/dsh/launch HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+    ).as_bytes()).await.unwrap();
+    let log = ctx.config.log_dir.join(project_id.to_string()).join("daemon.log");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if fs::read_to_string(&log).unwrap_or_default().contains("Invoking `devvm start`") { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    drop(socket);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let view: Value = ctx.client.get(format!("http://{}/api/projects/{project_id}", ctx.server_addr))
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(view["dsh_status"], "stopped", "a disconnected launch must release its operation");
+    assert!(!project_dir.join(".vm_running").exists(), "cancelled VM start must not keep executing");
+    assert!(fs::read_to_string(log).unwrap().contains("cancelled"));
+}
+
+#[tokio::test]
+async fn test_two_clients_coordinate_vm_start_and_stop() {
+    let ctx = setup_test_server().await;
+    let project_dir = ctx.home_dir.join("two-clients");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::write(project_dir.join(".vm_start_slow"), "1").unwrap();
+    let project_id = register(&ctx, &project_dir).await;
+    let base = format!("http://{}/api/projects/{project_id}", ctx.server_addr);
+    let other = reqwest::Client::new();
+    for action in ["vm/start", "dsh/launch"] {
+        let log = ctx.config.log_dir.join(project_id.to_string()).join("daemon.log");
+        let before = fs::read_to_string(&log).unwrap_or_default().matches("Invoking `devvm start`").count();
+        let (client, url) = (ctx.client.clone(), format!("{base}/{action}"));
+        let start = tokio::spawn(async move { client.post(url).send().await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if fs::read_to_string(&log).unwrap_or_default().matches("Invoking `devvm start`").count() > before { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        // UI B reads observed status, not UI A's pending action.
+        let view: Value = other.get(&base).send().await.unwrap().json().await.unwrap();
+        assert_eq!(view["vm_status"], "stopped");
+        assert_eq!(view["dsh_status"], "stopped");
+        for duplicate in ["vm/start", "dsh/launch", "dsh/restart"] {
+            assert_eq!(other.post(format!("{base}/{duplicate}")).send().await.unwrap().status(), StatusCode::CONFLICT);
+        }
+        assert_eq!(other.post(format!("{base}/vm/stop")).send().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(start.await.unwrap().status(), StatusCode::CONFLICT);
+        assert!(!project_dir.join(".vm_running").exists());
+        assert_eq!(mock_dsh_start_count(&project_dir), 0);
+        // Re-registering preserves identity but cannot preserve an abandoned lock.
+        assert_eq!(other.post(format!("{base}/unregister")).send().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(register(&ctx, &project_dir).await, project_id);
+    }
+    fs::remove_file(project_dir.join(".vm_start_slow")).unwrap();
+    assert_eq!(other.post(format!("{base}/vm/start")).send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(other.post(format!("{base}/vm/stop")).send().await.unwrap().status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -802,7 +1181,7 @@ async fn test_open_port_endpoint() {
     );
     assert_eq!(
         data["tailnet_url"],
-        format!("http://3000.{}.devvm.internal:8102", project_host)
+        format!("https://{}-3000.risak.dev", project_host)
     );
 
     // 2. Open port with port 0 -> 400 Bad Request
@@ -1181,28 +1560,7 @@ async fn test_ongoing_ingress_log_capture_persists_after_vm_deletion() {
 }
 
 #[tokio::test]
-async fn test_multiple_listeners_serving_and_tailnet_boundary() {
-    use devvm_daemon::determine_bind_addresses;
-    use std::net::Ipv4Addr;
-
-    // Verify determine_bind_addresses never produces 0.0.0.0 by default
-    let default_addrs = determine_bind_addresses(None, 8100, None);
-    assert_eq!(
-        default_addrs,
-        vec![SocketAddr::from(([127, 0, 0, 1], 8100))]
-    );
-
-    let ts_ip: Ipv4Addr = "100.64.0.42".parse().unwrap();
-    let dual_addrs = determine_bind_addresses(None, 8100, Some(ts_ip));
-    assert_eq!(
-        dual_addrs,
-        vec![
-            SocketAddr::from(([127, 0, 0, 1], 8100)),
-            SocketAddr::from(([100, 64, 0, 42], 8100)),
-        ]
-    );
-
-    // Verify dual listener serving works concurrently
+async fn test_local_only_mode_omits_remote_links() {
     let temp_dir = tempdir().unwrap();
     let home_dir = temp_dir.path().join("home");
     fs::create_dir_all(&home_dir).unwrap();
@@ -1216,59 +1574,214 @@ async fn test_multiple_listeners_serving_and_tailnet_boundary() {
     let devvm_bin = temp_dir.path().join("mock_devvm");
     create_mock_devvm(&devvm_bin, &log_dir);
 
+    // Explicitly local-only configuration: remote_domain is None
     let config = DaemonConfig {
-        host: String::new(),
+        host: "127.0.0.1".to_string(),
         port: 0,
         config_path: config_dir.join("projects.json"),
         sync_config_path: config_dir.join("sync.json"),
-        log_dir,
-        home_dir,
-        devvm_bin,
+        log_dir: log_dir.clone(),
+        home_dir: home_dir.clone(),
+        devvm_bin: devvm_bin.clone(),
         ingress_port: 8102,
-        tailnet_domain: "devvm.internal".to_string(),
+        remote_domain: None,
     };
 
-    let dsh_runtime_manager = DshRuntimeManager::new();
-    let sync_manager = SyncManager::new();
-    let state = AppState {
-        config: config.clone(),
-        dsh_runtime_manager,
-        sync_manager,
-    };
-
-    let router = create_router(state);
-
-    let listener_1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr_1 = listener_1.local_addr().unwrap();
-
-    let listener_2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr_2 = listener_2.local_addr().unwrap();
-
-    let r1 = router.clone();
-    tokio::spawn(async move {
-        axum::serve(listener_1, r1).await.unwrap();
-    });
-
-    let r2 = router;
-    tokio::spawn(async move {
-        axum::serve(listener_2, r2).await.unwrap();
-    });
-
+    let server_addr = spawn_daemon(&config).await;
     let client = reqwest::Client::new();
 
-    // Query listener 1
-    let res_1 = client
-        .get(format!("http://{}/api/projects", addr_1))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res_1.status(), StatusCode::OK);
+    let project_dir = home_dir.join("local-only-proj");
+    fs::create_dir_all(&project_dir).unwrap();
 
-    // Query listener 2
-    let res_2 = client
-        .get(format!("http://{}/api/projects", addr_2))
+    let reg_res: Value = client
+        .post(format!("http://{}/api/projects/register", server_addr))
+        .json(&json!({ "path": project_dir.to_str().unwrap() }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let project_id = reg_res["id"].as_str().unwrap();
+
+    // 1. Projects listing: remote templates and URLs must be omitted/null
+    let list_res: Value = client
+        .get(format!("http://{}/api/projects", server_addr))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let proj = &list_res[0];
+    assert!(
+        proj["links"]["tailnet_dsh_url"].is_null(),
+        "tailnet_dsh_url must be null in local-only mode"
+    );
+    assert!(
+        proj["links"]["tailnet_port_template"].is_null(),
+        "tailnet_port_template must be null in local-only mode"
+    );
+    assert!(
+        proj["links"]["local_port_template"]
+            .as_str()
+            .unwrap()
+            .contains(".devvm.localhost:8102"),
+        "local_port_template must be preserved"
+    );
+
+    // 2. Open port: remote tailnet_url must be omitted/null
+    let port_res: Value = client
+        .post(format!(
+            "http://{}/api/projects/{}/open-port",
+            server_addr, project_id
+        ))
+        .json(&json!({ "port": 3000 }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        port_res["tailnet_url"].is_null(),
+        "tailnet_url must be null in local-only mode"
+    );
+    assert!(
+        port_res["local_url"].as_str().unwrap().contains("3000.")
+            && port_res["local_url"]
+                .as_str()
+                .unwrap()
+                .contains(".devvm.localhost:8102"),
+        "local_url must be preserved"
+    );
+
+    // 3. Launch DSH: local_dsh_url gets populated with token, but tailnet_dsh_url remains null
+    let launch_res = client
+        .post(format!(
+            "http://{}/api/projects/{}/dsh/launch",
+            server_addr, project_id
+        ))
         .send()
         .await
         .unwrap();
-    assert_eq!(res_2.status(), StatusCode::OK);
+    assert_eq!(launch_res.status(), StatusCode::OK);
+
+    let proj_url = format!("http://{}/api/projects/{}", server_addr, project_id);
+    let mut saw_running = false;
+    for _ in 0..100 {
+        let p: Value = client
+            .get(&proj_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if p["dsh_status"] == "running" && !p["links"]["local_dsh_url"].is_null() {
+            assert!(
+                p["links"]["tailnet_dsh_url"].is_null(),
+                "running DSH must omit tailnet link in local-only mode"
+            );
+            assert!(p["links"]["local_dsh_url"]
+                .as_str()
+                .unwrap()
+                .contains("?token="));
+            saw_running = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(saw_running, "DSH never reached running with local link");
+    assert_eq!(client.post(format!("{proj_url}/dsh/stop")).send().await.unwrap().status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_remote_url_dns_label_limit_handling() {
+    let ctx = setup_test_server().await;
+
+    // Create project with a very long directory name (over 70 characters)
+    let long_name = "extremely-long-project-directory-name-that-exceeds-dns-label-limit-by-a-lot";
+    let project_dir = ctx.home_dir.join(long_name);
+    fs::create_dir_all(&project_dir).unwrap();
+
+    let reg_res: Value = ctx
+        .client
+        .post(format!("http://{}/api/projects/register", ctx.server_addr))
+        .json(&json!({ "path": project_dir.to_str().unwrap() }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let project_id = reg_res["id"].as_str().unwrap();
+
+    // Verify port template label is within 63 chars when rendered with a 5-digit port
+    let list_res: Value = ctx
+        .client
+        .get(format!("http://{}/api/projects", ctx.server_addr))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let proj = list_res
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == project_id)
+        .unwrap();
+    let tailnet_tmpl = proj["links"]["tailnet_port_template"].as_str().unwrap();
+    assert!(tailnet_tmpl.starts_with("https://"));
+    assert!(tailnet_tmpl.ends_with(".risak.dev"));
+
+    let rendered_tmpl = tailnet_tmpl.replace("{port}", "65535");
+    let tmpl_host_part = rendered_tmpl
+        .strip_prefix("https://")
+        .unwrap()
+        .strip_suffix(".risak.dev")
+        .unwrap();
+    assert!(
+        tmpl_host_part.len() <= 63,
+        "Template label length {} with 5-digit port exceeds 63 chars",
+        tmpl_host_part.len()
+    );
+    let project_host = proj["project_host"].as_str().unwrap();
+    assert_eq!(
+        project_host.len(),
+        8,
+        "Long names use their existing hash only"
+    );
+    assert_eq!(tmpl_host_part, format!("{project_host}-65535"));
+    assert!(tmpl_host_part.ends_with("-65535"));
+
+    // Verify open port label is within 63 chars and valid
+    let port_res: Value = ctx
+        .client
+        .post(format!(
+            "http://{}/api/projects/{}/open-port",
+            ctx.server_addr, project_id
+        ))
+        .json(&json!({ "port": 8080 }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let remote_url = port_res["tailnet_url"].as_str().unwrap();
+    assert!(remote_url.starts_with("https://"));
+    let host_part = remote_url
+        .strip_prefix("https://")
+        .unwrap()
+        .strip_suffix(".risak.dev")
+        .unwrap();
+    assert!(
+        host_part.len() <= 63,
+        "Host label length {} exceeds 63 chars",
+        host_part.len()
+    );
+    assert!(host_part.ends_with("-8080"), "Must end with port");
 }

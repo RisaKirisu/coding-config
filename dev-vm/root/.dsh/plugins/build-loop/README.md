@@ -5,11 +5,11 @@ DSH bundle providing the `build_ticket` tool and a web settings page for it.
 ## Flow
 
 1. A **build** child (persona: autonomous-building-protocol without the self-review step) implements the ticket and returns a report.
-2. A **review** child (spec + repository standards + ponytail simplicity + correctness) and a **test** child (behavior-over-implementation, spec-over-pass-rate, no hand-rolled mocks, mutation testing) audit the result in parallel. Each returns a structured `{clean, findings, report}` verdict via `structured_output`.
+2. A **review** child (spec + repository standards + ponytail simplicity + correctness) and a **test** child (behavior-over-implementation, spec-over-pass-rate, no hand-rolled mocks, mutation testing) audit the result in parallel. Each returns a structured `{clean, findings, report}` verdict via `structured_output` or falls back to normally finished non-empty plain text as `clean: false` (retaining findings and report). Each auditor retries up to three launch attempts with fresh children on failure (start, execution, disposal errors, empty output); retries never consume build fix rounds. If any auditor exhausts attempts, the loop returns `failed` with all failed phases, attempt counts, last causes, exact instruction to notify the user immediately, and all latest reports preserved.
 3. Both clean → the tool returns all three reports verbatim with status `clean`. Otherwise the findings are sent to the **same** build child as a fix turn, and step 2 repeats.
 4. After `maxFixRounds` (default 3) fix rounds the latest state is returned as `unresolved`. A child that ends abnormally returns `failed` with whatever reports exist. Nothing is summarized or softened.
 
-Children are one-shot spawn children of the calling agent; they inherit its workspace, sandbox policy, and preset tool catalog minus the configured denylist (delegation, goals, plan mode, user questions). The build child stays live between fix rounds so it keeps its own context.
+Children are one-shot spawn children of the calling agent; they inherit its workspace, sandbox policy, and preset tool catalog minus the configured denylist filtered against global tools inherited by children (delegation, goals, plan mode, user questions; parent-only and obsolete tool names are ignored safely). The build child stays live between fix rounds so it keeps its own context. Fix turns read new events through DSH 0.1.2's public `session.seq` and `session.snapshotEvents()` APIs.
 
 ## Settings
 
@@ -22,7 +22,7 @@ Personas must not contain `{{...}}` groups: the prompt assembler interpolates th
 - `index.mjs` — host plugin: tool, settings namespace, `/api/build-loop/config` routes, system-prompt section.
 - `loop.mjs` — pure prompt composition and report rendering (unit-tested).
 - `prompts.mjs` — default personas and flow constants.
-- `config.mjs` — settings defaults and validation.
+- `config.mjs` — settings defaults, denylist filtering against global schemas, and validation.
 - `client.js` — web settings page.
 
 ## Tests

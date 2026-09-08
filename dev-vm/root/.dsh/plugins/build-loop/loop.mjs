@@ -1,5 +1,5 @@
 /**
- * Pure pieces of the build loop: prompt composition and report rendering.
+ * Pure pieces of the build loop: prompt composition, retry logic, and report rendering.
  * No runtime dependencies so they are testable with plain `node --test`.
  */
 
@@ -62,12 +62,17 @@ export function isClean(review, test) {
   return review.clean && test.clean
 }
 
+/** Extract text content from ContentBlock[] or pass through a string. */
+export function textOf(blocks) {
+  if (typeof blocks === 'string') return blocks
+  return (blocks ?? []).filter((block) => block?.type === 'text').map((block) => block.text).join('')
+}
+
 /**
- * Coerce a child's structured value into a verdict. A missing or malformed
- * value is a non-clean verdict carrying the child's text, so a broken audit
- * blocks acceptance instead of silently passing.
+ * Validate and extract a child's structured verdict.
+ * Returns the parsed verdict if valid, or undefined if missing/malformed.
  */
-export function toVerdict(structured, fallbackText) {
+export function toVerdict(structured) {
   if (structured && typeof structured === 'object'
     && typeof structured.clean === 'boolean'
     && Array.isArray(structured.findings)
@@ -79,19 +84,94 @@ export function toVerdict(structured, fallbackText) {
       report: structured.report,
     }
   }
-  return {
-    clean: false,
-    findings: ['audit returned no valid structured verdict; treat as unresolved'],
-    report: fallbackText || '(no output)',
+  return undefined
+}
+
+/**
+ * Evaluate an audit attempt's result.
+ * Accepts valid structured verdict, or falls back to normally finished non-empty plain text.
+ * Rejects failed execution, partial output from failures, or empty output.
+ */
+export function evaluateAuditOutcome(result, turnReason) {
+  const structured = toVerdict(result?.structured)
+  if (structured) {
+    return { ok: true, verdict: structured }
   }
+
+  const completedNormally = turnReason !== undefined
+    ? turnReason === 'completed'
+    : result?.stopReason === 'completed'
+
+  if (completedNormally) {
+    const text = textOf(result?.output).trim()
+    if (text.length > 0) {
+      return {
+        ok: true,
+        verdict: {
+          clean: false,
+          findings: [text],
+          report: text,
+        },
+      }
+    }
+    return { ok: false, cause: 'audit produced empty output' }
+  }
+
+  const cause = result?.diagnostic
+    ? `audit ended with ${result?.stopReason ?? 'error'} (${result.diagnostic})`
+    : (turnReason && turnReason !== 'completed')
+      ? `audit turn ended with ${turnReason}`
+      : `audit ended with stopReason=${result?.stopReason ?? 'unknown'}`
+
+  return { ok: false, cause }
+}
+
+/** Format failures from exhausted auditors with exact notification instruction. */
+export function formatAuditFailure(failures) {
+  const parts = failures.map((f) => `${f.phase} failed after ${f.attempts} attempt(s) (last cause: ${f.lastCause})`)
+  return `${parts.join('; ')}. Notify the user immediately. Do not retry build_ticket.`
+}
+
+/**
+ * Run an async attempt function with bounded retries.
+ * Cancellation halts immediately.
+ */
+export async function runWithRetries(attemptFn, { maxAttempts = 3, signal } = {}) {
+  let attempts = 0
+  let lastCause = 'unknown failure'
+
+  while (attempts < maxAttempts) {
+    if (signal?.aborted) {
+      throw new Error('build_ticket was cancelled')
+    }
+    attempts += 1
+    try {
+      const outcome = await attemptFn(attempts)
+      if (signal?.aborted) {
+        throw new Error('build_ticket was cancelled')
+      }
+      if (outcome.ok) {
+        return { ok: true, verdict: outcome.verdict, attempts }
+      }
+      lastCause = outcome.cause || 'attempt failed'
+    } catch (error) {
+      if (signal?.aborted || error?.name === 'AbortError' || error?.message === 'build_ticket was cancelled') {
+        throw error
+      }
+      lastCause = error?.message || String(error)
+    }
+  }
+
+  return { ok: false, attempts, lastCause }
 }
 
 /** Final text returned to the orchestrator. Faithful: no summarizing of child reports. */
 export function renderOutcome({ ticket, status, rounds, maxRounds, build, review, test, failure }) {
+  const failureText = failure ? (failure.endsWith('.') ? failure : `${failure}.`) : ''
   const head = {
     clean: `Ticket \`${ticket}\`: build accepted — review and test audits clean after ${rounds} fix round(s).`,
     unresolved: `Ticket \`${ticket}\`: NOT clean after ${maxRounds} fix round(s). Findings below remain open; do not treat the build as done.`,
-    failed: `Ticket \`${ticket}\`: loop stopped early — ${failure}. Reports below are the latest available state.`,
+    failed: `Ticket \`${ticket}\`: loop stopped early — ${failureText} Reports below are the latest available state.`,
   }[status]
   const section = (title, body) => `## ${title}\n\n${body ?? '(none)'}`
   return [

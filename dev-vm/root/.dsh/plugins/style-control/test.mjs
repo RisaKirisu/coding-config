@@ -1,5 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtemp, rm } from 'node:fs/promises'
+import path from 'node:path'
+import { Context } from '/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/cordis/lib/index.js'
+import { WebServer } from '/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-host-webserver/lib/index.js'
+import { SystemPrompt } from '/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js'
 import {
   DEFAULT_PRESETS,
   defaultStore,
@@ -8,6 +13,8 @@ import {
   normalizeStore,
   resolvePreset,
   apply,
+  inject,
+  name,
 } from './index.mjs'
 
 test('formatPromptTag encloses non-empty text in <formatting_and_tone> tag', () => {
@@ -82,42 +89,55 @@ test('normalizeStore cleans and validates presets and selection pointers', () =>
   assert.equal(clean.sessionPresets.s2, undefined)
 })
 
-test('apply registers systemPrompt section at exact order 1 with <formatting_and_tone> tag', () => {
-  let registeredSection = null
-  const registeredRoutes = []
-
-  const mockCtx = {
-    systemPrompt: {
-      section: (section) => {
-        registeredSection = section
-      },
-    },
-    webServer: {
-      register: (route) => {
-        registeredRoutes.push(route)
-        return () => {}
-      },
-    },
-  }
-
-  const dispose = apply(mockCtx, { filePath: '/tmp/test-style-presets.json' })
-  assert.equal(typeof dispose, 'function')
-
-  // Verify section registration
-  assert.ok(registeredSection, 'section should be registered')
-  assert.equal(registeredSection.name, 'style:formatting-and-tone')
-  assert.equal(registeredSection.order, 1, 'order must be strictly 1')
-  assert.equal(typeof registeredSection.text, 'function')
-
-  // Verify prompt generation through section.text
-  const textOutput = registeredSection.text({
-    agent: { session: { id: 'test-session-1' } },
+test('session selections stay independent without changing the global default', async () => {
+  const fixture = await mkdtemp('/root/.dsh/.agents/exploration/style-selection/fixture-')
+  const ctx = new Context()
+  const webServerFiber = ctx.plugin(WebServer, {
+    host: '127.0.0.1',
+    port: 0,
+    compression: 'none',
   })
-  assert.match(textOutput, /^<formatting_and_tone>\n[\s\S]+\n<\/formatting_and_tone>$/)
+  const systemPromptFiber = ctx.plugin(SystemPrompt, {
+    includeHarnessIdentity: false,
+    includeRuntimeContext: false,
+    persona: '',
+  })
+  let pluginFiber
 
-  // Verify routes registered
-  assert.ok(registeredRoutes.length >= 2)
-  const paths = registeredRoutes.map((r) => r.path)
-  assert.ok(paths.includes('/api/style-control/presets'))
-  assert.ok(paths.includes('/api/style-control/session'))
+  try {
+    await Promise.all([webServerFiber, systemPromptFiber])
+    pluginFiber = ctx.plugin({ name, inject, apply }, {
+      filePath: path.join(fixture, 'style-presets.json'),
+    })
+    await pluginFiber
+
+    const baseUrl = `http://127.0.0.1:${ctx.webServer.port}`
+    for (const [sessionId, presetId] of [['first-session', 'professional'], ['second-session', 'creative']]) {
+      const response = await (await fetch(`${baseUrl}/api/style-control/session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId, presetId }),
+      })).json()
+      assert.deepEqual(response, { ok: true, sessionId, presetId, activePresetId: 'default' })
+    }
+
+    const state = await (await fetch(`${baseUrl}/api/style-control/presets`)).json()
+    assert.equal(state.activePresetId, 'default')
+    assert.deepEqual(state.sessionPresets, {
+      'first-session': 'professional',
+      'second-session': 'creative',
+    })
+
+    const styleFor = async (sessionId) => {
+      const assembly = await ctx.systemPrompt.assemble({ agent: { session: { id: sessionId } } })
+      return assembly.sections.find((entry) => entry.name === 'style:formatting-and-tone')?.text
+    }
+    assert.match(await styleFor('first-session'), /Maintain a professional, formal/)
+    assert.match(await styleFor('second-session'), /Adopt an engaging, vivid/)
+  } finally {
+    await pluginFiber?.dispose()
+    await systemPromptFiber.dispose()
+    await webServerFiber.dispose()
+    await rm(fixture, { recursive: true, force: true })
+  }
 })

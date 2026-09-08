@@ -1,0 +1,24 @@
+https://devvm.{$REMOTE_DOMAIN:risak.dev}, https://*.{$REMOTE_DOMAIN:risak.dev} {
+	bind {$REMOTE_IP:100.67.154.69}
+
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+
+	@control host devvm.{$REMOTE_DOMAIN:risak.dev}
+	handle @control {
+		reverse_proxy 127.0.0.1:8100
+	}
+
+	@project header_regexp project Host ^([a-z0-9-]+)-([0-9]{1,5})\.{$REMOTE_DOMAIN_REGEXP:risak\.dev}(:[0-9]+)?$
+	handle @project {
+		reverse_proxy 127.0.0.1:8102 {
+			header_up Host {re.project.2}.{re.project.1}.devvm.localhost
+			header_up Origin ^https?://{re.project.1}-{re.project.2}\.{$REMOTE_DOMAIN_REGEXP:risak\.dev}(:[0-9]+)?$ "http://{re.project.2}.{re.project.1}.devvm.localhost:8102"
+		}
+	}
+
+	handle {
+		respond "Invalid devvm hostname" 400
+	}
+}

@@ -1,9 +1,11 @@
 use crate::config::DaemonConfig;
+use crate::lifecycle::command_output;
 use crate::logs::append_log_logged;
 use crate::models::VmStatus;
 use std::path::Path;
 use std::process::Stdio;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub fn log_command_failure(program: &str, args: &[String], output: &std::process::Output) {
@@ -27,6 +29,14 @@ pub fn log_command_spawn_failure(program: &str, args: &[String], error: &std::io
 }
 
 pub async fn check_vm_status(config: &DaemonConfig, project_path: &Path) -> VmStatus {
+    check_vm_status_with_cancel(config, project_path, &CancellationToken::new()).await
+}
+
+pub(crate) async fn check_vm_status_with_cancel(
+    config: &DaemonConfig,
+    project_path: &Path,
+    cancel: &CancellationToken,
+) -> VmStatus {
     let program = config.devvm_bin.display().to_string();
     let args = vec!["status".to_string()];
     let mut cmd = Command::new(&config.devvm_bin);
@@ -34,22 +44,34 @@ pub async fn check_vm_status(config: &DaemonConfig, project_path: &Path) -> VmSt
         .current_dir(project_path)
         .stdin(Stdio::null());
 
-    match cmd.output().await {
+    match command_output(cmd, cancel).await {
         Ok(output) => {
             if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
-                if stdout.contains("running") || stdout.is_empty() {
-                    VmStatus::Running
-                } else if stdout.contains("stopped") {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let line = stdout.trim();
+
+                if line.is_empty() {
                     VmStatus::Stopped
                 } else {
-                    tracing::warn!(
-                        program,
-                        args = ?args,
-                        stdout = %stdout,
-                        "devvm status reported neither running nor stopped"
-                    );
-                    VmStatus::Running
+                    let state = line
+                        .strip_prefix("Machine '")
+                        .and_then(|rest| rest.rsplit_once("': "))
+                        .map(|(_, status)| status.split_whitespace().next().unwrap_or(""));
+
+                    match state {
+                        Some("running") => VmStatus::Running,
+                        Some("created" | "stopped") => VmStatus::Stopped,
+                        Some("failed" | "unreachable" | "frozen") => VmStatus::Failed,
+                        _ => {
+                            tracing::warn!(
+                                program,
+                                args = ?args,
+                                stdout = %stdout,
+                                "unexpected devvm status output"
+                            );
+                            VmStatus::Failed
+                        }
+                    }
                 }
             } else {
                 log_command_failure(&program, &args, &output);
@@ -58,7 +80,7 @@ pub async fn check_vm_status(config: &DaemonConfig, project_path: &Path) -> VmSt
         }
         Err(e) => {
             log_command_spawn_failure(&program, &args, &e);
-            VmStatus::Stopped
+            VmStatus::Failed
         }
     }
 }
@@ -68,6 +90,7 @@ async fn run_devvm_command(
     project_id: Uuid,
     project_path: &Path,
     subcmd: &str,
+    cancel: &CancellationToken,
 ) -> Result<(), String> {
     let cmd_desc = format!("devvm {}", subcmd);
     append_log_logged(
@@ -83,7 +106,7 @@ async fn run_devvm_command(
         .current_dir(project_path)
         .stdin(Stdio::null());
 
-    match cmd.output().await {
+    match command_output(cmd, cancel).await {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -124,22 +147,25 @@ pub async fn run_vm_start(
     config: &DaemonConfig,
     project_id: Uuid,
     project_path: &Path,
+    cancel: &CancellationToken,
 ) -> Result<(), String> {
-    run_devvm_command(config, project_id, project_path, "start").await
+    run_devvm_command(config, project_id, project_path, "start", cancel).await
 }
 
 pub async fn run_vm_stop(
     config: &DaemonConfig,
     project_id: Uuid,
     project_path: &Path,
+    cancel: &CancellationToken,
 ) -> Result<(), String> {
-    run_devvm_command(config, project_id, project_path, "stop").await
+    run_devvm_command(config, project_id, project_path, "stop", cancel).await
 }
 
 pub async fn run_vm_delete(
     config: &DaemonConfig,
     project_id: Uuid,
     project_path: &Path,
+    cancel: &CancellationToken,
 ) -> Result<(), String> {
-    run_devvm_command(config, project_id, project_path, "rm").await
+    run_devvm_command(config, project_id, project_path, "rm", cancel).await
 }

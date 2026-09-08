@@ -1,5 +1,6 @@
 use crate::browser::{browse_directory, BrowserError};
 use crate::config::DaemonConfig;
+use crate::lifecycle::LifecycleError;
 use crate::logs::{append_log_logged, read_recent_logs};
 use crate::models::{
     compute_project_host, ActionResponse, DshStatus, LogsResponse, OpenPortRequest,
@@ -9,10 +10,14 @@ use crate::models::{
 use crate::registry::{
     get_project, load_projects, register_project, unregister_project, RegistryError,
 };
-use crate::runner::{check_vm_status, run_vm_delete, run_vm_start, run_vm_stop};
-use crate::runtime::DshRuntimeManager;
+use crate::runner::check_vm_status;
+use crate::runtime::{DshRuntimeManager, LifecycleAction};
 use crate::sync::{load_sync_config, provision_sync_setup, SyncConfig, SyncManager};
 use crate::ui::INDEX_HTML;
+use crate::urls::{
+    build_local_port_template, build_local_project_url, build_remote_port_template,
+    build_remote_project_url,
+};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -100,7 +105,7 @@ async fn build_project_view(state: &AppState, record: &ProjectRecord) -> Project
     let vm_status = check_vm_status(&state.config, &record.path).await;
     let dsh_status = state
         .dsh_runtime_manager
-        .get_status(&state.config, record.id, &record.path)
+        .get_status_for_vm(&state.config, record.id, &record.path, vm_status)
         .await;
 
     let is_configured = load_sync_config(&state.config.sync_config_path)
@@ -115,28 +120,34 @@ async fn build_project_view(state: &AppState, record: &ProjectRecord) -> Project
     };
 
     let (local_dsh_url, tailnet_dsh_url) = if dsh_status == DshStatus::Running {
-        (
-            Some(format!(
-                "http://3080.{}.devvm.localhost:{}",
-                project_host, state.config.ingress_port
-            )),
-            Some(format!(
-                "http://3080.{}.{}:{}",
-                project_host, state.config.tailnet_domain, state.config.ingress_port
-            )),
-        )
+        if let Some(token) = state
+            .dsh_runtime_manager
+            .get_token(&state.config, record.id)
+        {
+            let local = Some(build_local_project_url(
+                &project_host,
+                3080,
+                state.config.ingress_port,
+                Some(&token),
+            ));
+            let remote =
+                state.config.remote_domain.as_deref().and_then(|d| {
+                    build_remote_project_url(&project_host, 3080, d, Some(&token)).ok()
+                });
+            (local, remote)
+        } else {
+            (None, None)
+        }
     } else {
         (None, None)
     };
 
-    let local_port_template = format!(
-        "http://{{port}}.{}.devvm.localhost:{}",
-        project_host, state.config.ingress_port
-    );
-    let tailnet_port_template = format!(
-        "http://{{port}}.{}.{}:{}",
-        project_host, state.config.tailnet_domain, state.config.ingress_port
-    );
+    let local_port_template = build_local_port_template(&project_host, state.config.ingress_port);
+    let tailnet_port_template = state
+        .config
+        .remote_domain
+        .as_deref()
+        .and_then(|d| build_remote_port_template(&project_host, d).ok());
 
     ProjectView {
         id: record.id,
@@ -277,147 +288,49 @@ async fn get_logs_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uui
     .into_response()
 }
 
-async fn start_vm_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
+async fn lifecycle_response(state: Arc<AppState>, id: Uuid, action: LifecycleAction) -> Response {
     let project = match get_project_or_response(&state, id) {
         Ok(p) => p,
         Err(resp) => return *resp,
     };
-
-    match run_vm_start(&state.config, id, &project.path).await {
+    match state
+        .dsh_runtime_manager
+        .execute(&state.config, id, &project.path, action)
+        .await
+    {
         Ok(()) => Json(ActionResponse {
             status: "ok".to_string(),
-            message: Some("DevVM started".to_string()),
+            message: Some(action.message().to_string()),
         })
         .into_response(),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &state.config.log_dir,
-            Some(id),
-            "start_vm",
-            e,
-        ),
+        Err(error) => {
+            let status = match error {
+                LifecycleError::Busy | LifecycleError::Cancelled => StatusCode::CONFLICT,
+                LifecycleError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            api_error(status, &state.config.log_dir, Some(id), "lifecycle", error)
+        }
     }
+}
+
+async fn start_vm_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
+    lifecycle_response(state, id, LifecycleAction::StartVm).await
 }
 
 async fn stop_vm_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
-    let project = match get_project_or_response(&state, id) {
-        Ok(p) => p,
-        Err(resp) => return *resp,
-    };
-
-    state
-        .dsh_runtime_manager
-        .handle_vm_stopped(&state.config, id, &project.path)
-        .await;
-
-    match run_vm_stop(&state.config, id, &project.path).await {
-        Ok(()) => Json(ActionResponse {
-            status: "ok".to_string(),
-            message: Some("DevVM stopped".to_string()),
-        })
-        .into_response(),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &state.config.log_dir,
-            Some(id),
-            "stop_vm",
-            e,
-        ),
-    }
+    lifecycle_response(state, id, LifecycleAction::StopVm).await
 }
 
 async fn delete_vm_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
-    let project = match get_project_or_response(&state, id) {
-        Ok(p) => p,
-        Err(resp) => return *resp,
-    };
-
-    state
-        .dsh_runtime_manager
-        .handle_vm_stopped(&state.config, id, &project.path)
-        .await;
-
-    match run_vm_delete(&state.config, id, &project.path).await {
-        Ok(()) => Json(ActionResponse {
-            status: "ok".to_string(),
-            message: Some("DevVM deleted".to_string()),
-        })
-        .into_response(),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &state.config.log_dir,
-            Some(id),
-            "delete_vm",
-            e,
-        ),
-    }
+    lifecycle_response(state, id, LifecycleAction::DeleteVm).await
 }
 
 async fn launch_dsh_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
-    let project = match get_project_or_response(&state, id) {
-        Ok(p) => p,
-        Err(resp) => return *resp,
-    };
-
-    match state
-        .dsh_runtime_manager
-        .launch_dsh(&state.config, id, &project.path)
-        .await
-    {
-        Ok(()) => Json(ActionResponse {
-            status: "ok".to_string(),
-            message: Some("DSH launched".to_string()),
-        })
-        .into_response(),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &state.config.log_dir,
-            Some(id),
-            "launch_dsh",
-            e,
-        ),
-    }
+    lifecycle_response(state, id, LifecycleAction::LaunchDsh).await
 }
 
 async fn restart_dsh_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
-    let project = match get_project_or_response(&state, id) {
-        Ok(p) => p,
-        Err(resp) => return *resp,
-    };
-
-    // `stop_dsh` already reports an absent or stopped runtime as `Ok(())`.
-    if let Err(e) = state
-        .dsh_runtime_manager
-        .stop_dsh(&state.config, id, &project.path)
-        .await
-    {
-        return api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &state.config.log_dir,
-            Some(id),
-            "restart_dsh",
-            e,
-        );
-    }
-
-    match state
-        .dsh_runtime_manager
-        .launch_dsh(&state.config, id, &project.path)
-        .await
-    {
-        Ok(()) => Json(ActionResponse {
-            status: "ok".to_string(),
-            message: Some("DSH restarted".to_string()),
-        })
-        .into_response(),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &state.config.log_dir,
-            Some(id),
-            "restart_dsh",
-            e,
-        ),
-    }
+    lifecycle_response(state, id, LifecycleAction::RestartDsh).await
 }
 
 async fn delete_sync_handler(
@@ -529,29 +442,7 @@ async fn setup_sync_handler(
 }
 
 async fn stop_dsh_handler(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
-    let project = match get_project_or_response(&state, id) {
-        Ok(p) => p,
-        Err(resp) => return *resp,
-    };
-
-    match state
-        .dsh_runtime_manager
-        .stop_dsh(&state.config, id, &project.path)
-        .await
-    {
-        Ok(()) => Json(ActionResponse {
-            status: "ok".to_string(),
-            message: Some("DSH stopped".to_string()),
-        })
-        .into_response(),
-        Err(e) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &state.config.log_dir,
-            Some(id),
-            "stop_dsh",
-            e,
-        ),
-    }
+    lifecycle_response(state, id, LifecycleAction::StopDsh).await
 }
 
 async fn open_port_handler(
@@ -575,14 +466,13 @@ async fn open_port_handler(
     };
 
     let project_host = compute_project_host(&project.path);
-    let local_url = format!(
-        "http://{}.{}.devvm.localhost:{}",
-        payload.port, project_host, state.config.ingress_port
-    );
-    let tailnet_url = format!(
-        "http://{}.{}.{}:{}",
-        payload.port, project_host, state.config.tailnet_domain, state.config.ingress_port
-    );
+    let local_url =
+        build_local_project_url(&project_host, payload.port, state.config.ingress_port, None);
+    let tailnet_url = state
+        .config
+        .remote_domain
+        .as_deref()
+        .and_then(|d| build_remote_project_url(&project_host, payload.port, d, None).ok());
 
     Json(OpenPortResponse {
         local_url,

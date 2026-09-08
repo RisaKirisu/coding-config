@@ -12,15 +12,18 @@ import { finalAssistantOutput } from '@deepseek-ai/dsh-subagent'
 import { foldConsumedWork } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import z from '@deepseek-ai/schemastery'
-import { DEFAULTS, validateConfig } from './config.mjs'
+import { DEFAULTS, filterDeniedTools, validateConfig } from './config.mjs'
 import {
   VERDICT_SCHEMA,
   auditPrompt,
   buildPrompt,
+  evaluateAuditOutcome,
   fixPrompt,
+  formatAuditFailure,
   isClean,
   renderOutcome,
-  toVerdict,
+  runWithRetries,
+  textOf,
 } from './loop.mjs'
 
 export const name = 'build-loop'
@@ -36,10 +39,6 @@ const ConfigSchema = z.object({
   testPersona: z.string().default(DEFAULTS.testPersona),
   deniedTools: z.array(z.string()).default(DEFAULTS.deniedTools),
 })
-
-function textOf(blocks) {
-  return (blocks ?? []).filter((block) => block.type === 'text').map((block) => block.text).join('')
-}
 
 function json(res, status, value) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
@@ -84,45 +83,62 @@ function registerRoutes(ctx, scope) {
 }
 
 /**
- * The child denylist may only name tools the child would otherwise see;
- * `tools.restrict()` throws on unknown names, and the catalog differs per preset.
+ * Child restrictions can name only global tools inherited by the child.
+ * Parent-scoped and removed names are not restrictable and must be ignored.
  */
-function childToolFilter(ctx, parent, denied) {
-  const visible = new Set(ctx.tools.schemas(parent).map((schema) => schema.name))
-  const deny = denied.filter((tool) => visible.has(tool))
+function childToolFilter(ctx, denied) {
+  const deny = filterDeniedTools(denied, ctx.tools.schemas())
   return deny.length === 0 ? undefined : { deny }
 }
 
-/** Run one one-shot audit child to completion and dispose it. */
-async function runAudit(ctx, base, label, persona, prompt) {
-  const run = await ctx.subagents.start(base.provider, {
-    ...base.request,
-    label,
-    persona,
-    prompt: [{ type: 'text', text: prompt }],
-    outputSchema: VERDICT_SCHEMA,
-  })
+function getTurnReason(agent) {
+  if (!agent?.session) return undefined
   try {
-    const result = await run.result
-    return toVerdict(result.structured, `${label} ended with stopReason=${result.stopReason}.\n${textOf(result.output)}`)
-  } finally {
-    await run.dispose()
+    const own = agent.session.snapshotEvents()
+    return foldConsumedWork(own).end?.data.reason?.kind
+  } catch {
+    return undefined
   }
+}
+
+/** Run one audit phase with up to three launch attempts. */
+async function runAudit(ctx, base, phase, label, persona, prompt) {
+  const res = await runWithRetries(async () => {
+    const run = await ctx.subagents.start(base.provider, {
+      ...base.request,
+      label,
+      persona,
+      prompt: [{ type: 'text', text: prompt }],
+      outputSchema: VERDICT_SCHEMA,
+    })
+    try {
+      const result = await run.result
+      const turnReason = getTurnReason(run.localAgent)
+      return evaluateAuditOutcome(result, turnReason)
+    } finally {
+      await run.dispose()
+    }
+  }, { maxAttempts: 3, signal: base.request.signal })
+
+  if (res.ok) {
+    return { ok: true, phase, verdict: res.verdict }
+  }
+  return { ok: false, phase, attempts: res.attempts, lastCause: res.lastCause }
 }
 
 /** One more turn on the live build child; returns its new final text or throws on an abnormal end. */
 async function fixTurn(agent, text) {
-  const boundary = agent.session.events.length
+  const boundary = agent.session.seq
   agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
   await agent.whenIdle()
-  const own = agent.session.events.slice(boundary)
+  const own = agent.session.snapshotEvents(boundary)
   const reason = foldConsumedWork(own).end?.data.reason?.kind
   if (reason !== 'completed') throw new Error(`build agent fix turn ended with ${reason ?? 'no turn/end'}`)
   return textOf(finalAssistantOutput(own))
 }
 
 async function runLoop(ctx, config, { ticket, constraints, parent, signal }) {
-  const toolFilter = childToolFilter(ctx, parent, config.deniedTools)
+  const toolFilter = childToolFilter(ctx, config.deniedTools)
   const base = { provider: config.provider, request: { parent, signal, ...(toolFilter ? { toolFilter } : {}) } }
   const maxRounds = config.maxFixRounds
   const state = { ticket, maxRounds, rounds: 0, build: undefined, review: undefined, test: undefined }
@@ -148,18 +164,37 @@ async function runLoop(ctx, config, { ticket, constraints, parent, signal }) {
     for (;;) {
       if (signal.aborted) throw new Error('build_ticket was cancelled')
       const audit = { ticket, constraints, buildReport: state.build, round: state.rounds + 1 }
-      const [review, test] = await Promise.all([
-        runAudit(ctx, base, `review ${ticket}`, config.reviewPersona, auditPrompt(audit)),
-        runAudit(ctx, base, `test-audit ${ticket}`, config.testPersona, auditPrompt(audit)),
+      const [reviewOutcome, testOutcome] = await Promise.all([
+        runAudit(ctx, base, 'review', `review ${ticket}`, config.reviewPersona, auditPrompt(audit)),
+        runAudit(ctx, base, 'test-audit', `test-audit ${ticket}`, config.testPersona, auditPrompt(audit)),
       ])
-      state.review = review
-      state.test = test
       if (signal.aborted) throw new Error('build_ticket was cancelled')
-      if (isClean(review, test)) return renderOutcome({ ...state, status: 'clean' })
+
+      const failures = []
+      if (reviewOutcome.ok) {
+        state.review = reviewOutcome.verdict
+      } else {
+        failures.push(reviewOutcome)
+      }
+      if (testOutcome.ok) {
+        state.test = testOutcome.verdict
+      } else {
+        failures.push(testOutcome)
+      }
+
+      if (failures.length > 0) {
+        return renderOutcome({
+          ...state,
+          status: 'failed',
+          failure: formatAuditFailure(failures),
+        })
+      }
+
+      if (isClean(state.review, state.test)) return renderOutcome({ ...state, status: 'clean' })
       if (state.rounds >= maxRounds) return renderOutcome({ ...state, status: 'unresolved' })
       state.rounds += 1
       try {
-        state.build = await fixTurn(buildRun.localAgent, fixPrompt({ review, test, round: state.rounds, maxRounds }))
+        state.build = await fixTurn(buildRun.localAgent, fixPrompt({ review: state.review, test: state.test, round: state.rounds, maxRounds }))
       } catch (error) {
         return renderOutcome({ ...state, status: 'failed', failure: error.message })
       }
@@ -170,7 +205,7 @@ async function runLoop(ctx, config, { ticket, constraints, parent, signal }) {
   }
 }
 
-const DESCRIPTION = 'Implement one ticket end to end: a build agent implements it, then a code-review agent and a test-quality agent audit the result in parallel; their findings go back to the same build agent for fixing, up to the configured fix budget. Returns the build report, review report, and test report verbatim, with a clean/unresolved/failed status. Use this instead of a plain subagent whenever the task is "implement this ticket". This call waits for the whole loop by default; set run_in_background to get a job id.'
+const DESCRIPTION = 'Implement one ticket end to end: a build agent implements it, then a code-review agent and a test-quality agent audit the result in parallel; their findings go back to the same build agent for fixing, up to the configured fix budget. Returns the build report, review report, and test report verbatim, with a clean/unresolved/failed status. Use for ticket implementation with delegated build and independent audits. This call waits for the whole loop by default; set run_in_background to get a job id.'
 
 export function apply(ctx) {
   const scope = ctx.settings.register(SETTINGS_NS, ConfigSchema, { base: {}, validate: validateConfig })
@@ -181,7 +216,7 @@ export function apply(ctx) {
     order: 116.7,
     text: (context) => ctx.tools.get('build_ticket', context.scope) === undefined
       ? ''
-      : 'When dispatching implementation of a defined ticket, use build_ticket rather than a plain subagent: it runs the build, independent review, and test audit loop and returns all reports. Independent tickets may be dispatched together in parallel build_ticket calls. Read the returned status: an unresolved or failed loop is not a finished ticket.',
+      : 'Use build_ticket when the user requests a build loop or when a ticket needs to be implemented. An unresolved or failed loop is not a finished ticket.',
   })
 
   ctx.tools.register(defineTool({

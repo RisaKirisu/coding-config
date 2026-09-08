@@ -2,22 +2,18 @@ mod common;
 
 use axum::Router;
 use common::{
-    build_dns_query, create_mock_devvm, create_mock_ssh, echo_headers_handler, log_entries_text,
-    parse_dns_response, CaddyGuard,
+    create_mock_devvm, create_mock_ssh, echo_headers_handler, log_entries_text, CaddyGuard,
 };
-use devvm_daemon::{
-    create_router, AppState, DaemonConfig, DnsConfig, DnsServer, DshRuntimeManager, SyncManager,
-};
+use devvm_daemon::{create_router, AppState, DaemonConfig, DshRuntimeManager, SyncManager};
 use reqwest::StatusCode as ReqwestStatusCode;
 use serde_json::{json, Value};
 use std::fs;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use tempfile::tempdir;
-use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::watch;
+use tokio::net::TcpListener;
 use uuid::Uuid;
 
 struct AcceptanceContext {
@@ -25,10 +21,8 @@ struct AcceptanceContext {
     home_dir: PathBuf,
     server_addr: SocketAddr,
     caddy_port: u16,
-    dns_addr: SocketAddr,
     echo_port: u16,
     client: reqwest::Client,
-    _dns_shutdown_tx: watch::Sender<bool>,
     _caddy_guard: CaddyGuard,
 }
 
@@ -95,26 +89,7 @@ async fn setup_acceptance_system() -> AcceptanceContext {
 
     let caddy_guard = CaddyGuard(Some(caddy_child));
 
-    // 3. Start Real Wildcard DNS Server
-    let dns_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let dns_addr = dns_socket.local_addr().unwrap();
-
-    let dns_config = DnsConfig {
-        bind_addr: dns_addr.to_string(),
-        target_ip: Ipv4Addr::new(100, 64, 0, 42),
-        domain: "devvm.internal".to_string(),
-        target_ipv6: None,
-        ttl: 60,
-    };
-
-    let (dns_shutdown_tx, dns_shutdown_rx) = watch::channel(false);
-    tokio::spawn(async move {
-        DnsServer::run_with_socket(dns_socket, dns_config, Some(dns_shutdown_rx))
-            .await
-            .unwrap();
-    });
-
-    // 4. Start Control Daemon HTTP API
+    // 3. Start Control Daemon HTTP API
     let config = DaemonConfig {
         host: "127.0.0.1".to_string(),
         port: 0,
@@ -124,7 +99,7 @@ async fn setup_acceptance_system() -> AcceptanceContext {
         home_dir: home_dir.clone(),
         devvm_bin,
         ingress_port: caddy_port,
-        tailnet_domain: "devvm.internal".to_string(),
+        remote_domain: Some("risak.dev".to_string()),
     };
 
     let sync_manager = SyncManager::with_devvm_bin(config.devvm_bin.clone());
@@ -146,7 +121,7 @@ async fn setup_acceptance_system() -> AcceptanceContext {
 
     let client = reqwest::Client::builder().build().unwrap();
 
-    // Wait for Caddy to be ready
+    // Wait for Guest Caddy to be ready
     let test_url = format!("http://127.0.0.1:{}/ready-check", caddy_port);
     let mut caddy_ready = false;
     for _ in 0..40 {
@@ -166,17 +141,18 @@ async fn setup_acceptance_system() -> AcceptanceContext {
             }
         }
     }
-    assert!(caddy_ready, "Caddy failed to become ready within timeout");
+    assert!(
+        caddy_ready,
+        "Guest Caddy failed to become ready within timeout"
+    );
 
     AcceptanceContext {
         _temp_dir: temp_dir,
         home_dir,
         server_addr,
         caddy_port,
-        dns_addr,
         echo_port,
         client,
-        _dns_shutdown_tx: dns_shutdown_tx,
         _caddy_guard: caddy_guard,
     }
 }
@@ -377,13 +353,14 @@ async fn assert_step_3_vm_and_dsh_lifecycle(ctx: &AcceptanceContext, project: &R
     assert_eq!(status_json2["vm_status"], "running");
     assert_eq!(status_json2["dsh_status"], "running");
 
+    let expected_token = "mock-token-redacted-1-base64url-auth-token00";
     let expected_local_dsh_url = format!(
-        "http://3080.{}.devvm.localhost:{}",
-        project.host, ctx.caddy_port
+        "http://3080.{}.devvm.localhost:{}?token={}",
+        project.host, ctx.caddy_port, expected_token
     );
     let expected_tailnet_dsh_url = format!(
-        "http://3080.{}.devvm.internal:{}",
-        project.host, ctx.caddy_port
+        "https://{}-3080.risak.dev?token={}",
+        project.host, expected_token
     );
     assert_eq!(
         status_json2["links"]["local_dsh_url"].as_str().unwrap(),
@@ -485,10 +462,7 @@ async fn assert_step_4_open_port_endpoints(ctx: &AcceptanceContext, project: &Re
         "http://{}.{}.devvm.localhost:{}",
         ctx.echo_port, project.host, ctx.caddy_port
     );
-    let expected_open_tailnet = format!(
-        "http://{}.{}.devvm.internal:{}",
-        ctx.echo_port, project.host, ctx.caddy_port
-    );
+    let expected_open_tailnet = format!("https://{}-{}.risak.dev", project.host, ctx.echo_port);
     assert_eq!(open_port_json["local_url"], expected_open_local);
     assert_eq!(open_port_json["tailnet_url"], expected_open_tailnet);
 
@@ -539,34 +513,19 @@ async fn assert_step_5_caddy_ingress_and_loopback_facade(
         format!("http://localhost:{}", ctx.echo_port)
     );
 
-    // 2. Request via Tailnet Project URL Host & Origin -> rewritten to loopback
+    // 2. Request via obsolete .devvm.internal Host -> rejected with 400 Bad Request
     let tailnet_host_header = format!(
         "{}.{}.devvm.internal:{}",
         ctx.echo_port, project.host, ctx.caddy_port
     );
-    let tailnet_origin_header = format!(
-        "http://{}.{}.devvm.internal:{}",
-        ctx.echo_port, project.host, ctx.caddy_port
-    );
-
     let caddy_tailnet_res = ctx
         .client
         .get(&caddy_base_url)
         .header("Host", &tailnet_host_header)
-        .header("Origin", &tailnet_origin_header)
         .send()
         .await
         .unwrap();
-    assert_eq!(caddy_tailnet_res.status(), ReqwestStatusCode::OK);
-    let echo_tailnet_headers: Value = caddy_tailnet_res.json().await.unwrap();
-    assert_eq!(
-        echo_tailnet_headers["host"],
-        format!("localhost:{}", ctx.echo_port)
-    );
-    assert_eq!(
-        echo_tailnet_headers["origin"],
-        format!("http://localhost:{}", ctx.echo_port)
-    );
+    assert_eq!(caddy_tailnet_res.status(), ReqwestStatusCode::BAD_REQUEST);
 
     // 3. Request without Origin header preserves plain GET behavior
     let caddy_plain_res = ctx
@@ -593,58 +552,6 @@ async fn assert_step_5_caddy_ingress_and_loopback_facade(
         .await
         .unwrap();
     assert_eq!(caddy_bad_res.status(), ReqwestStatusCode::BAD_REQUEST);
-}
-
-/// Sub-step helper for Step 6: Real Wildcard DNS Server Resolution (*.devvm.internal)
-async fn assert_step_6_dns_resolution(ctx: &AcceptanceContext, project: &RegisteredProject) {
-    let dns_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let mut dns_buf = vec![0u8; 1024];
-
-    // Query 1: DSH port subdomain
-    let dsh_dns_qname = format!("3080.{}.devvm.internal", project.host);
-    let query1 = build_dns_query(0x2001, &dsh_dns_qname, 1);
-    dns_client.send_to(&query1, ctx.dns_addr).await.unwrap();
-
-    let (len1, _) =
-        tokio::time::timeout(Duration::from_secs(2), dns_client.recv_from(&mut dns_buf))
-            .await
-            .expect("DNS response timeout")
-            .unwrap();
-    let resp1 = parse_dns_response(&dns_buf[..len1]);
-    assert_eq!(resp1.tx_id, 0x2001);
-    assert_eq!(resp1.rcode, 0); // NoError
-    assert!(resp1.is_authoritative);
-    assert_eq!(resp1.ancount, 1);
-    assert_eq!(resp1.a_records, vec![Ipv4Addr::new(100, 64, 0, 42)]);
-
-    // Query 2: Arbitrary guest port subdomain
-    let guest_dns_qname = format!("{}.{}.devvm.internal", ctx.echo_port, project.host);
-    let query2 = build_dns_query(0x2002, &guest_dns_qname, 1);
-    dns_client.send_to(&query2, ctx.dns_addr).await.unwrap();
-
-    let (len2, _) =
-        tokio::time::timeout(Duration::from_secs(2), dns_client.recv_from(&mut dns_buf))
-            .await
-            .expect("DNS response timeout")
-            .unwrap();
-    let resp2 = parse_dns_response(&dns_buf[..len2]);
-    assert_eq!(resp2.tx_id, 0x2002);
-    assert_eq!(resp2.rcode, 0);
-    assert_eq!(resp2.a_records, vec![Ipv4Addr::new(100, 64, 0, 42)]);
-
-    // Query 3: Non-matching domain -> NXDomain (rcode 3)
-    let query3 = build_dns_query(0x2003, "external.service.com", 1);
-    dns_client.send_to(&query3, ctx.dns_addr).await.unwrap();
-
-    let (len3, _) =
-        tokio::time::timeout(Duration::from_secs(2), dns_client.recv_from(&mut dns_buf))
-            .await
-            .expect("DNS response timeout")
-            .unwrap();
-    let resp3 = parse_dns_response(&dns_buf[..len3]);
-    assert_eq!(resp3.tx_id, 0x2003);
-    assert_eq!(resp3.rcode, 3); // NXDomain
-    assert_eq!(resp3.ancount, 0);
 }
 
 /// Sub-step helper for Step 7: Project Logs Retrieval
@@ -921,9 +828,6 @@ async fn test_acceptance_complete_version_one_workflow() {
 
     // STEP 5: Real Caddy Loopback Facade & Ingress Routing
     assert_step_5_caddy_ingress_and_loopback_facade(&ctx, &project_a).await;
-
-    // STEP 6: Real Wildcard DNS Server Resolution (*.devvm.internal)
-    assert_step_6_dns_resolution(&ctx, &project_a).await;
 
     // STEP 7: Project Logs Retrieval
     assert_step_7_project_logs(&ctx, &project_a).await;

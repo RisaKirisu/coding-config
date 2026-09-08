@@ -6,11 +6,7 @@ use axum::{
     response::{IntoResponse, Json},
     Router,
 };
-use common::{build_dns_query, parse_dns_response};
-use devvm_daemon::{
-    create_router, detect_tailscale_ipv4, AppState, DaemonConfig, DnsConfig, DnsServer,
-    DshRuntimeManager, SyncManager,
-};
+use devvm_daemon::{create_router, AppState, DaemonConfig, DshRuntimeManager, SyncManager};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use std::env;
@@ -20,8 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tempfile::tempdir;
-use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::watch;
+use tokio::net::TcpListener;
 use uuid::Uuid;
 
 /// Helper to check if a CLI tool exists in PATH.
@@ -350,7 +345,10 @@ async fn test_live_complete_version_one_system() {
     let has_tailscale = tool_in_path("tailscale");
     let has_rsync = tool_in_path("rsync");
     let has_ssh = tool_in_path("ssh");
-    let tailscale_ip_opt = detect_tailscale_ipv4();
+    let tailscale_ip: std::net::Ipv4Addr = std::env::var("DEVVM_REMOTE_IP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| "100.67.154.69".parse().unwrap());
 
     println!("Pre-flight checks:");
     println!("  - devvm CLI present: {:?}", devvm_bin_opt);
@@ -358,7 +356,7 @@ async fn test_live_complete_version_one_system() {
     println!("  - frpc binary present: {}", has_frpc);
     println!("  - frps binary present: {:?}", frps_bin_opt);
     println!("  - tailscale present: {}", has_tailscale);
-    println!("  - tailscale IPv4 detected: {:?}", tailscale_ip_opt);
+    println!("  - remote host IP: {}", tailscale_ip);
     println!("  - rsync binary present: {}", has_rsync);
     println!("  - ssh binary present: {}", has_ssh);
 
@@ -381,16 +379,6 @@ async fn test_live_complete_version_one_system() {
         "frps binary is required for live acceptance testing. Ensure frps is installed (e.g. run ./setup-devvm.sh or set FRPS_BIN / DEVVM_FRPS_BIN)."
     );
     let frps_bin_path = frps_bin_opt.unwrap();
-
-    assert!(
-        has_tailscale,
-        "tailscale CLI is required for live acceptance testing. Ensure Tailscale is installed and in PATH."
-    );
-    assert!(
-        tailscale_ip_opt.is_some(),
-        "Tailscale IPv4 address could not be detected. Ensure Tailscale is running, authenticated, and online (`tailscale status`)."
-    );
-    let tailscale_ip = tailscale_ip_opt.unwrap();
 
     assert!(has_rsync, "rsync is required for live acceptance testing.");
     assert!(has_ssh, "ssh is required for live acceptance testing.");
@@ -534,7 +522,7 @@ async fn test_live_complete_version_one_system() {
         home_dir: home_dir.clone(),
         devvm_bin: devvm_bin_path.clone(),
         ingress_port: caddy_port,
-        tailnet_domain: "devvm.internal".to_string(),
+        remote_domain: Some("risak.dev".to_string()),
     };
 
     let dsh_runtime_manager = DshRuntimeManager::new();
@@ -616,8 +604,8 @@ async fn test_live_complete_version_one_system() {
     guard.add_child(frps_child);
 
     let frpc_config = format!(
-        "serverAddr = \"127.0.0.1\"\nserverPort = {}\n\n[[proxies]]\nname = \"{}\"\ntype = \"http\"\nlocalIP = \"127.0.0.1\"\nlocalPort = {}\ncustomDomains = [\n\t\"*.{}.devvm.localhost\",\n\t\"*.{}.devvm.internal\",\n]\n",
-        frps_bind_port, project_host, caddy_port, project_host, project_host
+        "serverAddr = \"127.0.0.1\"\nserverPort = {}\n\n[[proxies]]\nname = \"{}\"\ntype = \"http\"\nlocalIP = \"127.0.0.1\"\nlocalPort = {}\ncustomDomains = [\n\t\"*.{}.devvm.localhost\",\n]\n",
+        frps_bind_port, project_host, caddy_port, project_host
     );
     let frpc_toml_path = temp_config_dir.path().join("frpc.toml");
     fs::write(&frpc_toml_path, frpc_config).unwrap();
@@ -695,7 +683,7 @@ async fn test_live_complete_version_one_system() {
         "FRP + Caddy must rewrite Origin to loopback authority"
     );
 
-    // Exercise FRP transport with Tailnet Project URL
+    // Exercise FRP transport with obsolete Tailnet Project URL -> rejected with 404
     let frp_tailnet_res = client
         .get(format!(
             "http://127.0.0.1:{}/test-frp-tailnet",
@@ -708,22 +696,13 @@ async fn test_live_complete_version_one_system() {
                 echo_port, project_host, frps_vhost_port
             ),
         )
-        .header(
-            "Origin",
-            format!(
-                "http://{}.{}.devvm.internal:{}",
-                echo_port, project_host, frps_vhost_port
-            ),
-        )
         .send()
         .await
         .unwrap();
-    assert_eq!(frp_tailnet_res.status(), StatusCode::OK);
-    let frp_tailnet_json: Value = frp_tailnet_res.json().await.unwrap();
-    assert_eq!(frp_tailnet_json["host"], format!("localhost:{}", echo_port));
     assert_eq!(
-        frp_tailnet_json["origin"],
-        format!("http://localhost:{}", echo_port)
+        frp_tailnet_res.status(),
+        StatusCode::NOT_FOUND,
+        "FRP must reject obsolete devvm.internal hostname with 404"
     );
 
     // Unrouted project host through FRP should not route (404)
@@ -745,80 +724,26 @@ async fn test_live_complete_version_one_system() {
         "FRP must reject unrouted hostnames with 404"
     );
 
-    // 7. Wildcard DNS Resolution & Real Tailnet Interface Traffic
-    println!(">>> Testing Wildcard DNS Resolution and Real Tailnet Interface routing...");
-
-    let dns_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let dns_addr = dns_socket.local_addr().unwrap();
-
-    let dns_config = DnsConfig {
-        bind_addr: dns_addr.to_string(),
-        target_ip: tailscale_ip,
-        domain: "devvm.internal".to_string(),
-        target_ipv6: None,
-        ttl: 60,
-    };
-
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    tokio::spawn(async move {
-        DnsServer::run_with_socket(dns_socket, dns_config, Some(shutdown_rx))
-            .await
-            .unwrap();
-    });
-
-    let dns_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let mut dns_buf = vec![0u8; 512];
-    let qname = format!("3080.{}.devvm.internal", project_host);
-    let full_query = build_dns_query(0x1234, &qname, 1);
-
-    dns_client.send_to(&full_query, dns_addr).await.unwrap();
-    let (len, _) = tokio::time::timeout(Duration::from_secs(2), dns_client.recv_from(&mut dns_buf))
-        .await
-        .expect("DNS response timeout")
-        .unwrap();
-    let resp = parse_dns_response(&dns_buf[..len]);
-    assert_eq!(resp.tx_id, 0x1234);
-    assert_eq!(resp.rcode, 0);
-    assert_eq!(resp.a_records, vec![tailscale_ip]);
-    let _ = shutdown_tx.send(true);
-    println!(
-        "  - DNS wildcard query successfully resolved to Tailscale IP: {}",
-        tailscale_ip
-    );
-
-    // Direct HTTP request to Tailscale IP proving network interface reception
-    let tailnet_req_res = client
-        .get(format!(
-            "http://{}:{}/tailnet-proof",
-            tailscale_ip, caddy_port
+    // 7. Remote HTTPS URL formatting and Host Caddy configuration verification
+    println!(">>> Testing Remote HTTPS URL formatting and Host Caddy configuration...");
+    let open_port_res = client
+        .post(format!(
+            "http://{}/api/projects/{}/open-port",
+            daemon_addr, project_id
         ))
-        .header(
-            "Host",
-            format!(
-                "{}.{}.devvm.internal:{}",
-                echo_port, project_host, caddy_port
-            ),
-        )
-        .header(
-            "Origin",
-            format!(
-                "http://{}.{}.devvm.internal:{}",
-                echo_port, project_host, caddy_port
-            ),
-        )
+        .json(&json!({ "port": echo_port }))
         .send()
         .await
-        .expect("Direct request to Tailscale IP must succeed");
-    assert_eq!(tailnet_req_res.status(), StatusCode::OK);
-    let tailnet_headers: Value = tailnet_req_res.json().await.unwrap();
-    assert_eq!(tailnet_headers["host"], format!("localhost:{}", echo_port));
+        .unwrap();
+    assert_eq!(open_port_res.status(), StatusCode::OK);
+    let open_port_data: Value = open_port_res.json().await.unwrap();
     assert_eq!(
-        tailnet_headers["origin"],
-        format!("http://localhost:{}", echo_port)
+        open_port_data["tailnet_url"],
+        format!("https://{}-{}.risak.dev", project_host, echo_port)
     );
     println!(
-        "  - Verified traffic arrived over Tailscale IP address: {}",
-        tailscale_ip
+        "  - Remote project port URL correctly formatted: {}",
+        open_port_data["tailnet_url"]
     );
 
     // 8. Exercise real DevVM & DSH lifecycle
@@ -876,20 +801,19 @@ async fn test_live_complete_version_one_system() {
     println!("  - VM Status: {}", proj_info["vm_status"]);
     println!("  - DSH Status: {}", proj_info["dsh_status"]);
 
-    let expected_local_dsh_url = format!(
-        "http://3080.{}.devvm.localhost:{}",
+    let expected_local_dsh_prefix = format!(
+        "http://3080.{}.devvm.localhost:{}?token=",
         project_host, caddy_port
     );
-    let expected_tailnet_dsh_url =
-        format!("http://3080.{}.devvm.internal:{}", project_host, caddy_port);
-    assert_eq!(
-        proj_info["links"]["local_dsh_url"].as_str().unwrap(),
-        expected_local_dsh_url
-    );
-    assert_eq!(
-        proj_info["links"]["tailnet_dsh_url"].as_str().unwrap(),
-        expected_tailnet_dsh_url
-    );
+    let expected_tailnet_dsh_prefix = format!("https://{}-3080.risak.dev?token=", project_host);
+    assert!(proj_info["links"]["local_dsh_url"]
+        .as_str()
+        .unwrap()
+        .starts_with(&expected_local_dsh_prefix));
+    assert!(proj_info["links"]["tailnet_dsh_url"]
+        .as_str()
+        .unwrap()
+        .starts_with(&expected_tailnet_dsh_prefix));
 
     // Test Open Port endpoint
     let open_port_res = client
@@ -912,10 +836,7 @@ async fn test_live_complete_version_one_system() {
     );
     assert_eq!(
         open_port_json["tailnet_url"],
-        format!(
-            "http://{}.{}.devvm.internal:{}",
-            echo_port, project_host, caddy_port
-        )
+        format!("https://{}-{}.risak.dev", project_host, echo_port)
     );
 
     // Test Project Logs retrieval

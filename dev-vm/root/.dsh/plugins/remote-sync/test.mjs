@@ -16,6 +16,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   HEAD_MARKER_NAME,
+  PROJECTION_FILTER_ARGS,
   RemoteSyncManager,
   STORAGES_FILTER_ARGS,
   UNION_FILTER_ARGS,
@@ -121,6 +122,42 @@ function setMtime(path, secondsFromEpoch) {
   utimesSync(path, secondsFromEpoch, secondsFromEpoch);
 }
 
+/** Run one `reconcile.mjs` as a fresh child process against the index.mjs on disk. */
+function runReconcileChild(env) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['reconcile.mjs'], {
+      cwd: import.meta.dirname,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on('error', reject);
+    child.on('close', (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+function workspaceTitleOf(path) {
+  const trimmed = path.replace(/[/\\]+$/, '');
+  const separator = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
+  return trimmed.slice(separator + 1);
+}
+
+function displayTitleOf(title, cwd, id) {
+  if (title !== undefined && title !== null && title !== '') return title;
+  if (cwd !== undefined && cwd !== '') {
+    const base = workspaceTitleOf(cwd);
+    if (base !== '') return base;
+  }
+  return id;
+}
+
 test('Session Sync defaults to DSH Home, never the Project directory', () => {
   const projectDir = createTempDir();
   const originalCwd = process.cwd();
@@ -205,7 +242,7 @@ test('head protocol advances the Sync Store marker only from a known head', asyn
   }
 });
 
-test('a Sync Store that moved ahead suspends storage pushes but keeps session pushes', async () => {
+test('a Sync Store that moved ahead suspends storage pushes but keeps session and projection pushes', async () => {
   const fixture = createFixture();
   try {
     writeLocalState(fixture.dshHome);
@@ -213,6 +250,9 @@ test('a Sync Store that moved ahead suspends storage pushes but keeps session pu
     writeMarker(fixture.storeDir, 5);
     mkdirSync(join(fixture.storeDir, 'storages'), { recursive: true });
     writeFileSync(join(fixture.storeDir, 'storages', 'workspace.json'), '{"workspaces":["remote"]}');
+    const projDir = join(fixture.dshHome, 'storages', 'session_projcache', 'sessions');
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(join(projDir, 'session-ahead.json'), '{"title":"Ahead Projection"}');
 
     const manager = fixture.manager();
     assert.equal(manager.headSeq, 0);
@@ -224,6 +264,11 @@ test('a Sync Store that moved ahead suspends storage pushes but keeps session pu
       '{"workspaces":["remote"]}',
     );
     assert.ok(findFile(join(fixture.storeDir, 'sessions'), 'session.jsonl'));
+    assert.equal(
+      existsSync(join(fixture.storeDir, 'storages', 'session_projcache', 'sessions', 'session-ahead.json')),
+      true,
+      'projection documents must still push while the Sync Store is ahead',
+    );
 
     manager._setStatus('synchronized');
     assert.equal(await manager.checkRemoteHead(), 'remote_ahead');
@@ -249,6 +294,29 @@ test('reconciliation at an equal head keeps the newest storage unit and gains Sy
     mkdirSync(storeSession, { recursive: true });
     writeFileSync(join(storeSession, 'session.jsonl'), '{"type":"turn/start"}\n');
 
+    // A projection document newer locally must reach the store (newest-wins),
+    // and a stale store document must never overwrite the newer local one.
+    const projDir = join(fixture.dshHome, 'storages', 'session_projcache', 'sessions');
+    const storeProjDir = join(fixture.storeDir, 'storages', 'session_projcache', 'sessions');
+    mkdirSync(projDir, { recursive: true });
+    mkdirSync(storeProjDir, { recursive: true });
+    writeFileSync(join(projDir, 'newer.json'), '{"title":"Local New"}');
+    setMtime(join(projDir, 'newer.json'), 1600000000);
+    writeFileSync(join(storeProjDir, 'newer.json'), '{"title":"Store Stale"}');
+    setMtime(join(storeProjDir, 'newer.json'), 1000000);
+    writeFileSync(join(storeProjDir, 'store-only.json'), '{"title":"Store Older"}');
+    setMtime(join(storeProjDir, 'store-only.json'), 1000000);
+    writeFileSync(join(projDir, 'local-only.json'), '{"title":"Local Fresh"}');
+    setMtime(join(projDir, 'local-only.json'), 1600000000);
+    // The newest-wins discriminator: the LOCAL checkpoint is OLDER than the
+    // store's. The push must skip it (`--update`) and the pull must deliver the
+    // store's newer whole record; a newest-wins pass without `--update` would
+    // clobber the store with the older local document.
+    writeFileSync(join(projDir, 'clobber.json'), '{"title":"Local Older"}');
+    setMtime(join(projDir, 'clobber.json'), 900000000);
+    writeFileSync(join(storeProjDir, 'clobber.json'), '{"title":"Store Newer"}');
+    setMtime(join(storeProjDir, 'clobber.json'), 1600000000);
+
     const manager = fixture.manager();
     assert.equal(await manager.reconcile(), 'synchronized');
     assert.equal(manager.headSeq, 3);
@@ -256,6 +324,37 @@ test('reconciliation at an equal head keeps the newest storage unit and gains Sy
     assert.equal(
       existsSync(join(fixture.dshHome, 'sessions', 'root', 'project', 'session-store', 'session.jsonl')),
       true,
+    );
+    // The projection pass is newest-wins whole-file in both directions.
+    assert.equal(
+      readFileSync(join(storeProjDir, 'newer.json'), 'utf8'),
+      '{"title":"Local New"}',
+      'the newest projection document must be pushed to the Sync Store',
+    );
+    assert.equal(
+      readFileSync(join(projDir, 'store-only.json'), 'utf8'),
+      '{"title":"Store Older"}',
+      'a projection document absent locally must be pulled from the Sync Store',
+    );
+    assert.equal(
+      readFileSync(join(projDir, 'local-only.json'), 'utf8'),
+      '{"title":"Local Fresh"}',
+      'a projection document only on the local side must survive the reconcile',
+    );
+    assert.equal(
+      readFileSync(join(projDir, 'newer.json'), 'utf8'),
+      '{"title":"Local New"}',
+      'a stale store projection must never overwrite the newer local one',
+    );
+    assert.equal(
+      readFileSync(join(projDir, 'clobber.json'), 'utf8'),
+      '{"title":"Store Newer"}',
+      'a newer store projection must not be clobbered by an older local one (newest wins in both directions)',
+    );
+    assert.equal(
+      readFileSync(join(storeProjDir, 'clobber.json'), 'utf8'),
+      '{"title":"Store Newer"}',
+      'the store must keep its newer projection document',
     );
   } finally {
     fixture.cleanup();
@@ -330,7 +429,8 @@ test('session logs never shrink: pulls skip shorter copies and pushes append', a
 });
 
 test('exactly one follow-up transfer runs after an active transfer fails', async () => {
-  const brokenRoot = join(createTempDir(), 'root-is-a-file');
+  const tempRoot = createTempDir();
+  const brokenRoot = join(tempRoot, 'root-is-a-file');
   writeFileSync(brokenRoot, 'not a directory\n');
 
   async function run({ withFollowUp }) {
@@ -364,7 +464,7 @@ test('exactly one follow-up transfer runs after an active transfer fails', async
     assert.ok(single > 0);
     assert.equal(withFollowUp, single * 2, 'a failed transfer must still run its one queued follow-up');
   } finally {
-    rmSync(brokenRoot, { force: true });
+    rmSync(tempRoot, { recursive: true, force: true });
   }
 });
 
@@ -452,6 +552,8 @@ test('a full push carries portable state only and never workstation-wide categor
     const home = fixture.dshHome;
     writeFileSync(join(home, 'storages', 'message_feedback.json'), '{"feedback":[]}');
     writeFileSync(join(home, 'storages', 'session_projcache.json'), '{"cache":true}');
+    mkdirSync(join(home, 'storages', 'session_projcache', 'sessions'), { recursive: true });
+    writeFileSync(join(home, 'storages', 'session_projcache', 'sessions', 'session-a.json'), '{"title":"Session A"}');
     mkdirSync(join(home, 'attachments', 'v1', 'objects', 'ab'), { recursive: true });
     writeFileSync(join(home, 'attachments', 'v1', 'objects', 'ab', 'abcdef'), 'object-bytes');
     mkdirSync(join(home, 'attachments', 'v1', 'request-images', 'cd'), { recursive: true });
@@ -469,6 +571,11 @@ test('a full push carries portable state only and never workstation-wide categor
     const store = fixture.storeDir;
     assert.equal(existsSync(join(store, 'storages', 'workspace.json')), true);
     assert.equal(existsSync(join(store, 'storages', 'message_feedback.json')), true);
+    assert.equal(
+      existsSync(join(store, 'storages', 'session_projcache', 'sessions', 'session-a.json')),
+      true,
+      'per-session projection documents must transfer as portable state',
+    );
     assert.equal(existsSync(join(store, 'attachments', 'v1', 'objects', 'ab', 'abcdef')), true);
     assert.ok(findFile(join(store, 'sessions'), 'session.jsonl'));
 
@@ -670,13 +777,283 @@ test('reconcile.mjs always exits zero and records the outcome', async () => {
   }
 });
 
-test('filter lists keep the union and storage passes separate', () => {
+test('session projection documents synchronize in the projection pass and preserve cold listing titles', async () => {
+  const dshModules = '/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai';
+  const [
+    { Context },
+    { default: SessionStore },
+    { default: JsonlSessionPersistence },
+    { default: Storage },
+    storageJson,
+    storageDomain,
+    { default: SessionProjection },
+    { default: SessionProjectionCache },
+    { default: SessionTitleService },
+    { default: SessionQuery },
+    { workspaceDomainSpec },
+    { ApiSessionList },
+  ] = await Promise.all([
+    import('/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/cordis/lib/index.js'),
+    import(`${dshModules}/dsh-session/lib/index.js`),
+    import(`${dshModules}/dsh-session-persistence-jsonl/lib/index.js`),
+    import(`${dshModules}/dsh-storage/lib/index.js`),
+    import(`${dshModules}/dsh-storage-json/lib/index.js`),
+    import(`${dshModules}/dsh-storage-domain/lib/index.js`),
+    import(`${dshModules}/dsh-session-projection/lib/index.js`),
+    import(`${dshModules}/dsh-session-projection-cache/lib/index.js`),
+    import(`${dshModules}/dsh-session-title/lib/index.js`),
+    import(`${dshModules}/dsh-session-query/lib/index.js`),
+    import(`${dshModules}/dsh-workspace/lib/index.js`),
+    import(`${dshModules}/dsh-api-session-controller/lib/types/list.js`),
+  ]);
+
+  async function createDshInstance(home) {
+    const ctx = new Context();
+    const forks = [];
+    forks.push(ctx.plugin(SessionStore));
+    forks.push(ctx.plugin(JsonlSessionPersistence, { root: join(home, 'sessions') }));
+    forks.push(ctx.plugin(Storage));
+    forks.push(ctx.plugin(storageJson, { root: join(home, 'storages') }));
+    forks.push(ctx.plugin(storageDomain, { backend: 'json' }));
+    forks.push(ctx.plugin(SessionProjection));
+    forks.push(ctx.plugin(SessionProjectionCache, { writeEveryEvents: 200, writeIntervalMs: 5000 }));
+    forks.push(ctx.plugin(SessionTitleService, { fallbackMaxWords: 10, fallbackMaxBytes: 100, maxTitleBytes: 200 }));
+    forks.push(ctx.plugin(SessionQuery));
+    await waitFor(
+      () => ctx.sessions && ctx.sessionPersistence && ctx.storageDomain && ctx.sessionProjections && ctx.sessionProjectionCache && ctx.sessionTitle && ctx.sessionQuery,
+      'DSH core services activation',
+    );
+    ctx.provide('agents', { get: () => undefined });
+    const listState = new ApiSessionList(ctx, 1024);
+    return {
+      ctx,
+      forks,
+      listState,
+      async close() {
+        for (const f of forks.reverse()) await f.dispose();
+      },
+    };
+  }
+
+  const fixture = createFixture();
+  const workstationBHome = createTempDir();
+  const sessionId = 'session-cold-title-test';
+  const realTitle = 'Add Authentication Middleware';
+  const workspaceCwd = '/root/.dsh';
+
+  try {
+    // 1. In workstation A (fixture.dshHome), create a session whose compressed log is > 1024 bytes
+    const instA = await createDshInstance(fixture.dshHome);
+    const wsDomainA = await instA.ctx.storageDomain.open(workspaceDomainSpec);
+    await wsDomainA.table('workspaces').put('ws-1', {
+      path: workspaceCwd,
+      title: '.dsh',
+      sessionIds: [sessionId],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const sessionA = instA.ctx.sessions.create(sessionId, { meta: { cwd: workspaceCwd } });
+    sessionA.append('turn/start', { turn: 1 });
+    sessionA.append('user/message', {
+      id: 'msg-user-1',
+      role: 'user',
+      source: { kind: 'user' },
+      content: [{ type: 'text', text: 'Please implement authentication middleware for the API router.' }],
+    }, { surfaceOp: 'append' });
+    const userMsgSeq = sessionA.snapshotEvents().at(-1).seq;
+    sessionA.append('session/title', {
+      title: realTitle,
+      source: { kind: 'fallback' },
+      messageSeqs: [userMsgSeq],
+    });
+    let longBody = 'Here is the comprehensive middleware implementation:\n';
+    for (let i = 0; i < 400; i++) {
+      longBody += `Step ${i}: configure route handler authentication with token verification and scope checks ${i * 7919} for endpoint /api/v1/resource/${i * 104729}.\n`;
+    }
+    sessionA.append('assistant/message', {
+      message: {
+        id: 'msg-assistant-1',
+        role: 'assistant',
+        source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' },
+        content: [{ type: 'text', text: longBody }],
+      },
+    }, { surfaceOp: 'append' });
+    sessionA.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
+
+    await instA.ctx.sessions.flush(sessionA);
+    await instA.ctx.sessionProjectionCache.write(sessionA);
+
+    const loc = instA.ctx.sessionPersistence.locate(sessionA.header);
+    const fileSizeA = statSync(loc.path).size;
+    assert.ok(fileSizeA > 1024, `Compressed session log must exceed 1024 bytes (was ${fileSizeA})`);
+
+    const projDocPath = join(fixture.dshHome, 'storages', 'session_projcache', 'sessions', `${sessionId}.json`);
+    assert.ok(existsSync(projDocPath), 'Session projection document must exist in Workstation A');
+
+    await wsDomainA.close();
+    await instA.close();
+
+    // 2. Push from Workstation A to Sync Store using real RemoteSyncManager
+    const managerA = fixture.manager();
+    assert.equal(await managerA.reconcile(), 'synchronized');
+    assert.ok(
+      existsSync(join(fixture.storeDir, 'storages', 'session_projcache', 'sessions', `${sessionId}.json`)),
+      'Projection document must be transferred to Sync Store',
+    );
+
+    // 3. Pull from Sync Store to fresh Workstation B using real RemoteSyncManager
+    const managerB = new RemoteSyncManager({
+      dshHome: workstationBHome,
+      statusFilePath: join(workstationBHome, STATUS_FILE_NAME),
+      projectId: PROJECT_ID,
+      retryDelayMs: 0,
+      syncConfig: { remote_sync_root: fixture.storeRoot, writer_id: 'workstation-b' },
+    });
+    assert.equal(await managerB.reconcile(), 'synchronized');
+    assert.ok(
+      existsSync(join(workstationBHome, 'storages', 'session_projcache', 'sessions', `${sessionId}.json`)),
+      'Projection document must be pulled into Workstation B',
+    );
+
+    // 4. Cold-list sessions in Workstation B without opening the session
+    const instB = await createDshInstance(workstationBHome);
+    const coldSummariesB = await instB.listState.list();
+    const summaryB = coldSummariesB.find((s) => s.sessionId === sessionId);
+    assert.ok(summaryB, 'Session summary must be returned in cold listing');
+
+    const titleProjection = summaryB.projections?.values?.title;
+    const computedDisplayTitle = displayTitleOf(titleProjection, summaryB.cwd, summaryB.sessionId);
+
+    // Assert returned title projection is the real chat title, not the workspace basename
+    assert.equal(titleProjection, realTitle, `Cold title projection must be "${realTitle}", got "${titleProjection}"`);
+    assert.notEqual(computedDisplayTitle, workspaceTitleOf(workspaceCwd), 'Display title must not fall back to workspace basename');
+    assert.equal(computedDisplayTitle, realTitle, `Computed display title must be "${realTitle}"`);
+
+    await instB.close();
+  } finally {
+    fixture.cleanup();
+    rmSync(workstationBHome, { recursive: true, force: true });
+  }
+});
+
+test('filter lists keep the union, projection, and storage passes separate', () => {
   assert.equal(UNION_FILTER_ARGS.at(-1), '--exclude=*');
+  assert.equal(PROJECTION_FILTER_ARGS.at(-1), '--exclude=*');
   assert.equal(STORAGES_FILTER_ARGS.at(-1), '--exclude=*');
   assert.ok(UNION_FILTER_ARGS.includes('--include=sessions/***'));
-  assert.ok(!UNION_FILTER_ARGS.some((arg) => arg.includes('storages')));
-  assert.ok(STORAGES_FILTER_ARGS.includes('--exclude=storages/session_projcache.json'));
-  assert.ok(!STORAGES_FILTER_ARGS.some((arg) => arg.includes('sessions')));
+  assert.ok(PROJECTION_FILTER_ARGS.includes('--include=storages/session_projcache/sessions/***'));
+  assert.ok(!UNION_FILTER_ARGS.some((arg) => arg.includes('session_projcache')), 'projection documents must not ride the append-only union pass');
+  assert.ok(STORAGES_FILTER_ARGS.includes('--exclude=storages/session_projcache/***'));
+  assert.ok(!STORAGES_FILTER_ARGS.some((arg) => arg.includes('sessions/')));
+});
+
+test('projection documents replace whole records: append-only flags are never applied to them', async () => {
+  const fixture = createFixture();
+  const staleHome = createTempDir();
+  try {
+    seedHeadSeq(fixture.dshHome, 2);
+    writeMarker(fixture.storeDir, 2);
+
+    const sessionsDir = join(fixture.dshHome, 'storages', 'session_projcache', 'sessions');
+    const storeProjDir = join(fixture.storeDir, 'storages', 'session_projcache', 'sessions');
+    mkdirSync(sessionsDir, { recursive: true });
+    mkdirSync(storeProjDir, { recursive: true });
+
+    // The authoritative sender document: a whole-record JSON checkpoint.
+    const freshDoc = JSON.stringify({
+      version: 5,
+      record: {
+        identity: { createdAt: 1788000000000, cwd: '/root/.dsh' },
+        rows: { title: { ver: 2, seq: 11, val: 'Add Authentication Middleware' } },
+      },
+    });
+    writeFileSync(join(sessionsDir, 'session-x.json'), freshDoc);
+
+    // The stale receiver document: different content and LONGER than the sender.
+    // Under `--append-verify` a longer receiver is either left with its stale
+    // record or spliced as stale-prefix plus sender suffix; it is never replaced
+    // by the sender's whole record.
+    const staleDoc = JSON.stringify({
+      version: 5,
+      record: {
+        identity: { createdAt: 1788000000000, cwd: '/root/.dsh' },
+        rows: { title: { ver: 1, seq: 9, val: 'OLD' } },
+      },
+      tail: { padding: 'this stale record is written longer than the fresh sender record' },
+    });
+    assert.ok(staleDoc.length > freshDoc.length, 'stale receiver must be longer than the sender');
+    writeFileSync(join(storeProjDir, 'session-x.json'), staleDoc);
+    setMtime(join(storeProjDir, 'session-x.json'), 1000000);
+    setMtime(join(sessionsDir, 'session-x.json'), 1600000000);
+
+    // Mutation: route the projection documents through the append-only union
+    // flags, then reconcile in a fresh child process so the change is loaded
+    // (this test file's own static import is cached before the mutation).
+    const indexPath = join(import.meta.dirname, 'index.mjs');
+    const original = readFileSync(indexPath, 'utf8');
+    const mutated = original.replaceAll(
+      'NEWEST_WINS_FLAGS, PROJECTION_FILTER_ARGS',
+      'UNION_FLAGS, PROJECTION_FILTER_ARGS',
+    );
+    assert.notEqual(mutated, original, 'mutation must change projection transfer sites');
+    writeFileSync(indexPath, mutated);
+    const configPath = join(staleHome, 'sync.json');
+    writeFileSync(configPath, JSON.stringify({ remote_sync_root: fixture.storeRoot, writer_id: 'mutation' }));
+    let mutatedTitle;
+    try {
+      const mutatedResult = await runReconcileChild({
+        DSH_HOME: fixture.dshHome,
+        DEVVM_SYNC_STATUS_PATH: join(fixture.dshHome, STATUS_FILE_NAME),
+        DEVVM_PROJECT_ID: PROJECT_ID,
+        DEVVM_SYNC_CONFIG_PATH: configPath,
+      });
+      assert.equal(mutatedResult.code, 0, mutatedResult.stderr);
+      const mutatedStore = readFileSync(join(storeProjDir, 'session-x.json'), 'utf8');
+      try {
+        mutatedTitle = JSON.parse(mutatedStore).record.rows.title.val;
+      } catch {
+        // Spliced stale-prefix plus sender suffix: also the bug.
+      }
+    } finally {
+      writeFileSync(indexPath, original);
+    }
+    assert.notEqual(
+      mutatedTitle,
+      'Add Authentication Middleware',
+      'the append-only union flags must never deliver the fresh projection record',
+    );
+
+    // Real code path: the dedicated newest-wins projection pass replaces the
+    // whole record with the fresh title.
+    assert.equal(await fixture.manager().reconcile(), 'synchronized');
+    const storeDoc = readFileSync(join(storeProjDir, 'session-x.json'), 'utf8');
+    let storeJson;
+    assert.doesNotThrow(() => {
+      storeJson = JSON.parse(storeDoc);
+    }, `the Sync Store projection document must remain valid JSON, got: ${storeDoc}`);
+    assert.equal(storeJson.record.rows.title.val, 'Add Authentication Middleware');
+
+    // A fresh workstation must never receive a stale checkpoint; the pull
+    // replaces the whole record with the newest one.
+    const managerB = new RemoteSyncManager({
+      dshHome: staleHome,
+      statusFilePath: join(staleHome, STATUS_FILE_NAME),
+      projectId: PROJECT_ID,
+      retryDelayMs: 0,
+      syncConfig: { remote_sync_root: fixture.storeRoot, writer_id: 'workstation-b' },
+    });
+    assert.equal(await managerB.reconcile(), 'synchronized');
+    const pulled = readFileSync(
+      join(staleHome, 'storages', 'session_projcache', 'sessions', 'session-x.json'),
+      'utf8',
+    );
+    const pulledJson = JSON.parse(pulled);
+    assert.equal(pulledJson.record.rows.title.val, 'Add Authentication Middleware');
+  } finally {
+    fixture.cleanup();
+    rmSync(staleHome, { recursive: true, force: true });
+  }
 });
 
 test('manifest, bundle patch, and client resolution contract', async () => {
@@ -730,9 +1107,10 @@ test('web profile integration - dump-config, profile isolation, and sync routes'
   assert.ok(!headlessDump.includes('@devvm/dsh-voice-input'), 'headless profile dump must exclude @devvm/dsh-voice-input');
 
   const testPort = '3599';
+  const statusDir = createTempDir();
   const dshProcess = spawn('dsh', ['--profile', 'web', '--no-open', '--port', testPort], {
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, DEVVM_SYNC_STATUS_PATH: join(createTempDir(), STATUS_FILE_NAME) },
+    env: { ...process.env, DEVVM_SYNC_STATUS_PATH: join(statusDir, STATUS_FILE_NAME) },
   });
 
   let output = '';
@@ -763,8 +1141,23 @@ test('web profile integration - dump-config, profile isolation, and sync routes'
   try {
     await Promise.race([bootPromise, timerPromise]);
 
-    const clientRes = await fetch(`http://127.0.0.1:${testPort}/plugins/@devvm/dsh-remote-sync/client.js`);
-    assert.equal(clientRes.status, 200, 'Client bundle endpoint must return HTTP 200');
+    const directRes = await fetch(`http://127.0.0.1:${testPort}/plugins/@devvm/dsh-remote-sync/client.js`);
+    assert.equal(directRes.status, 404, 'Direct client.js endpoint is removed and must return HTTP 404');
+
+    const tokenMatch = output.match(/\?token=([^\s\r\n]+)/);
+    assert.ok(tokenMatch, 'dsh web output must include launch token');
+    const authRes = await fetch(`http://127.0.0.1:${testPort}/?token=${tokenMatch[1]}`, { redirect: 'manual' });
+    const cookie = authRes.headers.get('set-cookie');
+    const indexRes = await fetch(`http://127.0.0.1:${testPort}/`, {
+      headers: cookie ? { cookie } : {},
+    });
+    assert.equal(indexRes.status, 200, 'Index HTML must return HTTP 200');
+    const indexHtml = await indexRes.text();
+    const comboMatch = indexHtml.match(/\/plugins\/\?\?@devvm\/dsh-remote-sync\/client\.js&rev=[^"'\s\\]+/);
+    assert.ok(comboMatch, 'Combo URL for @devvm/dsh-remote-sync must be present in index HTML');
+
+    const clientRes = await fetch(`http://127.0.0.1:${testPort}${comboMatch[0]}`);
+    assert.equal(clientRes.status, 200, 'Client bundle combo endpoint must return HTTP 200');
     const clientText = await clientRes.text();
     assert.ok(clientText.includes('@devvm/dsh-remote-sync'), 'Client bundle text must include @devvm/dsh-remote-sync');
 
@@ -784,5 +1177,6 @@ test('web profile integration - dump-config, profile isolation, and sync routes'
     assert.notEqual(triggerRes.status, 200, 'the removed /api/sync/trigger route must not answer');
   } finally {
     dshProcess.kill('SIGTERM');
+    rmSync(statusDir, { recursive: true, force: true });
   }
 });

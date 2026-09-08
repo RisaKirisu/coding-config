@@ -26,6 +26,41 @@ pre-patch SHA-256 checksums were updated for `0.1.2-rc.1`, and the root DSH
 install was pinned to that release. The content checks still fail safely if npm
 resolves changed transitive bundle content in a later build.
 
+### DSH 0.1.2-rc.1 token-cookie navigation requirement
+
+DSH `0.1.2-rc.1` also introduces browser authentication. Its launch URL carries
+`?token=<token>`; a valid root request mints an authority-bound, host-only,
+`HttpOnly; SameSite=Strict` cookie and returns a 303 redirect to token-free `/`.
+The token disappearing from the address bar is expected and prevents it from
+remaining in browser history.
+
+A real Chromium test reproduced a version-specific interaction with the Control
+Daemon. Clicking from `http://127.0.0.1:8100` into a
+`*.devvm.localhost:8102` DSH URL keeps both token request and redirect in a
+cross-site navigation chain. Chromium stores the Strict cookie from the first
+response but does not send it on the redirect, so DSH returns HTTP 401 with
+`dsh web authentication required`. Pasting the identical URL succeeds because
+the direct navigation has no cross-site initiator. Same-tab navigation and
+`rel=noopener` do not change the result.
+
+Use same-site named Control Daemon URLs instead:
+
+```text
+Local:   http://control.devvm.localhost:8100
+Remote:  https://devvm.<remote-domain>
+```
+
+The local name is provided by the standard `.localhost` loopback namespace, not
+by Caddy. The remote name is provided by public DNS mapping to the host's
+Tailscale IP where host Caddy terminates HTTPS. Both reach the Control Daemon on
+port 8100 (direct locally or via host Caddy proxy remotely). Their DSH links
+share the same parent site (`devvm.localhost` or `<remote-domain>`), so the
+unmodified Strict cookie is sent on the 303 redirect. Project URLs traverse FRP
+and Caddy.
+
+Recheck this requirement after upgrading beyond DSH `0.1.2-rc.1`; it depends on
+that release's `SameSite=Strict` token-exchange behavior.
+
 ## Findings
 
 Harness has separate browser-side and server-side loopback checks.
@@ -67,11 +102,10 @@ This proves the browser patch passed and exposed the independent server check.
 ### General classification
 
 The narrow initial workaround accepted only `.devvm.localhost`. The more general
-patch accepts any hostname ending in `.localhost` on both sides, plus the
-private `.devvm.internal` alias used by DevVM:
+patch accepts any hostname ending in `.localhost` on both sides:
 
 ```js
-hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".devvm.internal")
+hostname === "localhost" || hostname.endsWith(".localhost") || hostname === "[::1]"
 ```
 
 This matches the special-use `localhost` namespace rather than coupling Harness
@@ -106,7 +140,7 @@ This patch targets built files from DSH `0.1.2-rc.1`:
  		*/
  		function isLoopbackHostname(hostname) {
 -			if (hostname === "localhost" || hostname === "[::1]") return true;
-+			if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".devvm.internal") || hostname === "[::1]") return true;
++			if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname === "[::1]") return true;
  			const parts = hostname.split(".");
  			return parts.length === 4 && parts[0] === "127" && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
  		}
@@ -121,7 +155,7 @@ This patch targets built files from DSH `0.1.2-rc.1`:
  */
  function isLoopbackHostname(hostname) {
 -	if (hostname === "localhost" || hostname === "[::1]") return true;
-+	if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".devvm.internal") || hostname === "[::1]") return true;
++	if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname === "[::1]") return true;
  	const parts = hostname.split(".");
  	return parts.length === 4 && parts[0] === "127" && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
  }

@@ -104,7 +104,7 @@ async fn test_caddy_loopback_facade_and_routing() {
         format!("http://localhost:{}", upstream_port)
     );
 
-    // Case 2: Request with .devvm.internal Host and Origin (Tailnet Project URL)
+    // Case 2: Request with obsolete .devvm.internal Host -> 400 Bad Request
     let tailnet_host = format!("{}.my-proj-12345678.devvm.internal", upstream_port);
     let tailnet_origin = format!("http://{}.my-proj-12345678.devvm.internal", upstream_port);
 
@@ -116,14 +116,9 @@ async fn test_caddy_loopback_facade_and_routing() {
         .await
         .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let headers: serde_json::Value = res.json().await.unwrap();
-
-    assert_eq!(headers["host"], format!("localhost:{}", upstream_port));
-    assert_eq!(
-        headers["origin"],
-        format!("http://localhost:{}", upstream_port)
-    );
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let text = res.text().await.unwrap();
+    assert!(text.contains("Invalid devvm hostname"));
 
     // Case 3: Request without Origin header (plain GET) -> Upstream receives Host, no Origin injected
     let res = client

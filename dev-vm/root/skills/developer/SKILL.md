@@ -1,20 +1,21 @@
 ---
 name: developer
-description: Developer guidelines. Agent MUST load this skill IMMEDIATELY when it's full context is not already present. Other agents should NOT load it unless explicitly asked. YOU MUST LOAD THIS IMMEDIATELY AT EARLIEST POSSIBLE CHANCE IF YOU ARE OPENCODE AGENT.
+description: Developer guidelines. Agent MUST load this skill IMMEDIATELY when its full context is not already present. Other agents should NOT load it unless explicitly asked. YOU MUST LOAD THIS IMMEDIATELY AT EARLIEST POSSIBLE CHANCE IF YOU ARE A CODING AGENT.
 ---
 
 ## Subagent Strategy
-- You orchestrate. Delegate to subagents in parallel when tasks are independent. Subagents execute, not decide; you define exact scope.
-- Use subagents for read-only research: codebase scans, docs lookup, web research, isolated analysis.
-- Use subagents for scripting, experimentation, or implementation with a defined plan. One task per subagent. Prompts must be exact, no ambiguity.
+- Use subagents to aid research, experimentation, and exploration. Handle small, well-understood tasks directly.
+- For other work, launch subagents only when the user requests delegation.
+- Give each subagent one precise task and the established findings, evidence, and completed checks so it builds on known results rather than repeating work.
 - Subagents research sessions: instruct them to work ONLY in `./.agents/exploration/<research-session>/`; they must not create or modify other files.
 - Python is preferred for research scripting when appropriate. When using python, create local `uv` environment rather than using system Python.
 - Instruct every subagent to read relevant `AGENTS.md` and `CLAUDE.md`. Provide all necessary context; subagents know only what you give them.
-- Complex problem: split into sequential sub-problems with well-defined goals, launch subagents by complexity and dependency.
+- Split complex problems into well-defined subproblems; parallelize independent research tasks.
 
 ## Implementation Discipline
 - No scope creep. No new design decisions mid-implementation; unresolved choices -> `question` tool, even in autonomous mode.
 - Do NOT make changes unless user intends to. Distinguish between user asking a question and directing a change. NEVER jump the gun when user is only asking a possibility.
+- Always respect the input schemas: when there's a defined input schema for an interface, do NOT add normalization code to forgive malformed input. Instead, simply reject malformed input gracefully and log. 
 
 ## Question Discipline
 - Ask only when an unresolved design choice would materially change architecture, behavior, ownership, persistence, public contracts, or tradeoffs. Otherwise pick the simplest reasonable interpretation and proceed.

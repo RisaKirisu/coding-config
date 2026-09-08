@@ -1,8 +1,11 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
+import { isSubagent, normalizeConfig } from './helpers.mjs'
+
+export { isSubagent, normalizeConfig }
 
 export const name = 'subagent-manager'
-export const inject = ['settings', 'tools', 'webServer', 'llm']
+export const inject = ['settings', 'tools', 'webServer', 'llm', 'systemPrompt']
 
 const SETTINGS_NS = 'subagent-model'
 const DEFAULT_CONFIG = Object.freeze({
@@ -17,17 +20,6 @@ const ConfigSchema = z.object({
   reasoningEffort: z.string().default(''),
 })
 
-export function normalizeConfig(value) {
-  return {
-    provider: typeof value?.provider === 'string' ? value.provider : '',
-    model: typeof value?.model === 'string' ? value.model : '',
-    reasoningEffort: typeof value?.reasoningEffort === 'string' ? value.reasoningEffort : '',
-  }
-}
-
-export function isSubagent(agent) {
-  return agent?.session?.header?.origin === 'subagent'
-}
 
 function json(res, status, value) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
@@ -115,28 +107,43 @@ function registerRoutes(ctx, scope) {
   return () => routes.forEach((dispose) => dispose())
 }
 
-function waitTimeout(ms, id) {
+export async function waitForIdle(idle, timeout = 300) {
+  if (!Number.isFinite(timeout) || timeout <= 0 || timeout * 1000 > 2147483647) {
+    throw new RangeError('timeout must be a positive number of seconds no greater than 2147483.647')
+  }
   let timer
-  const promise = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`Timeout waiting for ${id} after ${ms}ms`)), ms)
-    timer.unref?.()
-  })
-  return { promise, clear: () => clearTimeout(timer) }
+  try {
+    return await Promise.race([
+      idle.then(() => 'completed'),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve('running'), timeout * 1000)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 function registerWaitTool(ctx) {
+  ctx.systemPrompt.section({
+    name: 'tool:subagent_wait',
+    order: ctx.systemPrompt.getSectionOrder('TOOL_JOBS') + 0.01,
+    text: (context) => ctx.tools.get('subagent_wait', context.scope) === undefined
+      ? ''
+      : 'Waiting or repeated polling with `subagent_wait` is permitted when no further foreground work can proceed until the subagent finishes.',
+  })
   ctx.tools.register(defineTool({
     name: 'subagent_wait',
-    description: 'Wait for a running background subagent or background job to finish, then return status only. Native DSH subagent-result context injection remains unchanged.',
+    description: 'Wait for a subagent to finish.',
     parameters: {
       subagent_id: {
         type: 'string',
         required: true,
-        description: 'Running background subagent ID or background job ID.',
+        description: 'Subagent ID.',
       },
-      timeout_ms: {
+      timeout: {
         type: 'number',
-        description: 'Maximum wait in milliseconds. Defaults to 300000.',
+        description: 'Optional maximum wait in seconds. Defaults to 300.',
       },
     },
     output: {
@@ -153,46 +160,23 @@ function registerWaitTool(ctx) {
     },
     async execute(args) {
       const id = args.subagent_id
-      const timeoutMs = Number.isFinite(args.timeout_ms) && args.timeout_ms > 0
-        ? args.timeout_ms
-        : 300000
-
-      const jobs = ctx.get('jobs')
-      if (jobs) {
-        try {
-          const job = jobs.get(id)
-          if (job) {
-            const result = await jobs.wait(id, timeoutMs)
-            return {
-              status: result.status,
-              subagent_id: id,
-              message: `Background job ${id} finished with status "${result.status}".`,
-            }
-          }
-        } catch {
-          // Not a job ID; continue with subagent lookup.
-        }
-      }
-
       const agent = ctx.get('agents')?.get(id)
-      if (agent) {
-        if (agent.status === 'running') {
-          const timeout = waitTimeout(timeoutMs, `subagent ${id}`)
-          try {
-            await Promise.race([agent.whenIdle(), timeout.promise])
-          } finally {
-            timeout.clear()
-          }
-        }
+      if (agent && isSubagent(agent)) {
+        const status = await waitForIdle(
+          agent.status === 'running' ? agent.whenIdle() : Promise.resolve(),
+          args.timeout,
+        )
         return {
-          status: 'completed',
+          status,
           subagent_id: id,
-          message: `Subagent ${id} finished execution.`,
+          message: status === 'running'
+            ? `Subagent ${id} is still running.`
+            : `Subagent ${id} finished execution.`,
         }
       }
 
       const session = ctx.get('sessions')?.get(id)
-      if (session) {
+      if (session && isSubagent({ session })) {
         return {
           status: 'completed',
           subagent_id: id,
@@ -200,7 +184,7 @@ function registerWaitTool(ctx) {
         }
       }
 
-      throw new Error(`Running subagent or background job "${id}" was not found.`)
+      throw new Error(`Subagent "${id}" was not found.`)
     },
     presentCall: (args) => ({
       card: 'generic',

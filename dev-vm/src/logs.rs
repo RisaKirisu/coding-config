@@ -28,6 +28,10 @@ pub fn daemon_log_path(log_dir: &Path, project_id: Uuid) -> PathBuf {
     project_log_dir(log_dir, project_id).join("daemon.log")
 }
 
+pub fn dsh_token_path(log_dir: &Path, project_id: Uuid) -> PathBuf {
+    project_log_dir(log_dir, project_id).join("dsh.token")
+}
+
 /// Formats epoch milliseconds as `YYYY-MM-DDTHH:MM:SS.mmmZ` (ISO 8601, UTC, milliseconds).
 fn format_iso8601_millis(epoch_millis: u64) -> String {
     let seconds = epoch_millis / 1000;

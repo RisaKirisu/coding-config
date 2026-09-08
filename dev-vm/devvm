@@ -210,7 +210,11 @@ case "${1:-shell}" in
         ;;
 
     status)
-        smolvm machine status --name "$NAME"
+        smolvm machine ls --json |
+        jq -r --arg name "$NAME" '
+            .[] | select(.name == $name) |
+            "Machine '\''\(.name)'\'': \(.state)"
+        '
         ;;
 
     rm|delete)

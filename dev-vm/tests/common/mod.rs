@@ -7,7 +7,6 @@ use axum::{
 use serde_json::json;
 use std::fs::File;
 use std::io::Write;
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Child;
@@ -69,8 +68,17 @@ pub fn create_mock_devvm(bin_path: &Path, log_dir: &Path) {
         &guest_bin.join("dsh"),
         r#"#!/usr/bin/env bash
 if [[ "${1:-}" == "web" ]]; then
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-open) shift ;;
+            *) echo "dsh web: unknown option $1" >&2; exit 1 ;;
+        esac
+    done
     printf 'start\n' >> "$MOCK_DSH_START_COUNTER"
-    echo "dsh web: http://127.0.0.1:3080"
+    count=$(wc -l < "$MOCK_DSH_START_COUNTER")
+    token="mock-token-redacted-${count}-base64url-auth-token00"
+    echo "dsh web: http://127.0.0.1:3080/?token=${token}"
     exec sleep 300
 fi
 exit 0
@@ -95,7 +103,7 @@ case "$cmd" in
             exit 3
         fi
         if [[ -f ".vm_running" ]]; then
-            echo "running"
+            echo "Machine 'test-project': running"
             exit 0
         else
             echo "stopped"
@@ -139,6 +147,7 @@ case "$cmd" in
                 exit 7
             fi
             mapped_cmd="${cmd_body//\/tmp\/devvm-daemon-dsh.pid/$PWD/.mock_dsh.pid}"
+            mapped_cmd="${mapped_cmd//\/tmp\/devvm-daemon-dsh.token/$PWD/.mock_dsh.token}"
             mapped_cmd="${mapped_cmd//\/devvm-root\/.project-logs/__LOG_DIR__}"
             mapped_cmd="${mapped_cmd//\/run\/devvm/$VM_RUN}"
             mapped_cmd="${mapped_cmd//\/root\/workspace/$PWD}"
@@ -181,120 +190,9 @@ pub fn mock_dsh_pid_file(project_dir: &Path) -> std::path::PathBuf {
     project_dir.join(".mock_dsh.pid")
 }
 
-/// Builds a binary DNS query packet for standard UDP DNS servers.
-pub fn build_dns_query(tx_id: u16, qname: &str, qtype: u16) -> Vec<u8> {
-    let mut packet = Vec::new();
-    // ID (2 bytes)
-    packet.extend_from_slice(&tx_id.to_be_bytes());
-    // Flags (2 bytes): Standard query, RD=1
-    packet.extend_from_slice(&0x0100u16.to_be_bytes());
-    // QDCOUNT: 1
-    packet.extend_from_slice(&1u16.to_be_bytes());
-    // ANCOUNT: 0, NSCOUNT: 0, ARCOUNT: 0
-    packet.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
-
-    for part in qname.split('.') {
-        packet.push(part.len() as u8);
-        packet.extend_from_slice(part.as_bytes());
-    }
-    packet.push(0); // Root label
-
-    // QTYPE
-    packet.extend_from_slice(&qtype.to_be_bytes());
-    // QCLASS IN (1)
-    packet.extend_from_slice(&1u16.to_be_bytes());
-
-    packet
-}
-
-/// Parsed representation of a DNS response packet.
-pub struct ParsedDnsResponse {
-    pub tx_id: u16,
-    pub rcode: u8,
-    pub is_authoritative: bool,
-    pub ancount: u16,
-    pub a_records: Vec<Ipv4Addr>,
-    pub aaaa_records: Vec<Ipv6Addr>,
-}
-
-/// Parses a binary DNS response packet into a `ParsedDnsResponse` struct.
-pub fn parse_dns_response(data: &[u8]) -> ParsedDnsResponse {
-    assert!(data.len() >= 12, "DNS response too short");
-    let tx_id = u16::from_be_bytes([data[0], data[1]]);
-    let flags = u16::from_be_bytes([data[2], data[3]]);
-    let is_authoritative = (flags & 0x0400) != 0;
-    let rcode = (flags & 0x000F) as u8;
-    let qdcount = u16::from_be_bytes([data[4], data[5]]);
-    let ancount = u16::from_be_bytes([data[6], data[7]]);
-
-    // Skip question section
-    let mut pos = 12;
-    for _ in 0..qdcount {
-        while pos < data.len() {
-            let len = data[pos] as usize;
-            if len == 0 {
-                pos += 1;
-                break;
-            }
-            if (len & 0xC0) == 0xC0 {
-                pos += 2;
-                break;
-            }
-            pos += 1 + len;
-        }
-        pos += 4; // qtype + qclass
-    }
-
-    let mut a_records = Vec::new();
-    let mut aaaa_records = Vec::new();
-
-    for _ in 0..ancount {
-        if pos >= data.len() {
-            break;
-        }
-        // Name (either pointer or label)
-        if (data[pos] & 0xC0) == 0xC0 {
-            pos += 2;
-        } else {
-            while pos < data.len() && data[pos] != 0 {
-                pos += 1 + (data[pos] as usize);
-            }
-            pos += 1;
-        }
-
-        if pos + 10 > data.len() {
-            break;
-        }
-        let atype = u16::from_be_bytes([data[pos], data[pos + 1]]);
-        let _aclass = u16::from_be_bytes([data[pos + 2], data[pos + 3]]);
-        let _ttl = u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
-        let rdlen = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
-        pos += 10;
-
-        if pos + rdlen > data.len() {
-            break;
-        }
-
-        if atype == 1 && rdlen == 4 {
-            let ip = Ipv4Addr::new(data[pos], data[pos + 1], data[pos + 2], data[pos + 3]);
-            a_records.push(ip);
-        } else if atype == 28 && rdlen == 16 {
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&data[pos..pos + 16]);
-            aaaa_records.push(Ipv6Addr::from(octets));
-        }
-
-        pos += rdlen;
-    }
-
-    ParsedDnsResponse {
-        tx_id,
-        rcode,
-        is_authoritative,
-        ancount,
-        a_records,
-        aaaa_records,
-    }
+/// The isolated stand-in for the guest's `/tmp/devvm-daemon-dsh.token`.
+pub fn mock_dsh_token_file(project_dir: &Path) -> std::path::PathBuf {
+    project_dir.join(".mock_dsh.token")
 }
 
 /// RAII Guard ensuring spawned child processes (like Caddy) are killed and reaped upon drop.

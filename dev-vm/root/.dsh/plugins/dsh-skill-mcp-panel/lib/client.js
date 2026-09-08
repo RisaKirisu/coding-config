@@ -2709,6 +2709,55 @@ window.__ModuleLoader__.load({
             });
         }
         // ── cordis 插件体 ─────────────────────────────────────────────────────
+        function resolveCurrentSessionId(sessions) {
+            if (!sessions) return undefined;
+            // DSH 0.1.2: list (snapshot current is the session id; persisted
+            // selection is updated from it) is authoritative for the active
+            // session; selection's sessionId is the restored fallback (its
+            // snapshot may be empty). Older DSH kept the current session in
+            // currentProvideInfo. Never call getSnapshot on a store that is
+            // absent — the removed API throws a synchronous TypeError.
+            if (typeof sessions.list?.getSnapshot === "function") {
+                const snap = sessions.list.getSnapshot();
+                if (snap) {
+                    if (typeof snap.current === "string" && snap.current) {
+                        return snap.current;
+                    }
+                    if (snap.currentAddress && typeof snap.currentAddress.sessionId === "string" && snap.currentAddress.sessionId) {
+                        return snap.currentAddress.sessionId;
+                    }
+                    if (typeof snap.sessionId === "string" && snap.sessionId) {
+                        return snap.sessionId;
+                    }
+                }
+            }
+            if (typeof sessions.selection?.getSnapshot === "function") {
+                const snap = sessions.selection.getSnapshot();
+                if (snap && typeof snap.sessionId === "string" && snap.sessionId) {
+                    return snap.sessionId;
+                }
+            }
+            if (typeof sessions.currentProvideInfo?.getSnapshot === "function") {
+                const snap = sessions.currentProvideInfo.getSnapshot();
+                if (snap && typeof snap.sessionId === "string" && snap.sessionId) {
+                    return snap.sessionId;
+                }
+            }
+            if (typeof sessions.getSnapshot === "function") {
+                const snap = sessions.getSnapshot();
+                if (snap) {
+                    if (typeof snap.current === "string" && snap.current) return snap.current;
+                    if (typeof snap.sessionId === "string" && snap.sessionId) return snap.sessionId;
+                }
+            }
+            if (typeof sessions.current === "string" && sessions.current) {
+                return sessions.current;
+            }
+            if (typeof sessions.sessionId === "string" && sessions.sessionId) {
+                return sessions.sessionId;
+            }
+            return undefined;
+        }
         const inject = ["slots", "locale", "remote", "sessions"];
         function apply(ctx) {
             // 字典注册（生命周期随插件 fiber）
@@ -2725,7 +2774,7 @@ window.__ModuleLoader__.load({
             const mt = ctx.locale.bind(MCP_NS);
             // 挂载远程贡献；所有远程调用都等待挂载完成后再取命名空间服务。
             const mount = ctx.remote.$mount(CONTRIBUTION);
-            const currentSessionId = () => ctx.get("sessions").currentProvideInfo.getSnapshot().sessionId;
+            const currentSessionId = () => resolveCurrentSessionId(ctx.get("sessions"));
             const callRemote = async (method, ...args) => {
                 await mount;
                 const remote = ctx.get("remote.skillsViewer");
@@ -2786,6 +2835,7 @@ window.__ModuleLoader__.load({
         bundleModule.exports.NS = NS;
         bundleModule.exports.apply = apply;
         bundleModule.exports.inject = inject;
+        bundleModule.exports.resolveCurrentSessionId = resolveCurrentSessionId;
         return bundleModule.exports;
     }
 });

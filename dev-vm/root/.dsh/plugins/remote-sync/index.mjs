@@ -10,7 +10,10 @@ export const inject = ['sessions'];
 export const DEFAULT_STATUS_FILE_PATH = '/run/devvm/sync-status.json';
 export const HEAD_MARKER_NAME = '.sync-head.json';
 
-/** Sessions and attachment objects transfer as a union: additions only, never shrinking. */
+/**
+ * Sessions and attachment objects transfer as a union: additions only, never shrinking.
+ * `--append-verify` is correct because session logs are byte-append-only.
+ */
 export const UNION_FILTER_ARGS = [
   '--include=sessions/***',
   '--include=attachments/',
@@ -20,8 +23,22 @@ export const UNION_FILTER_ARGS = [
   '--exclude=*',
 ];
 
-/** Storage units transfer as whole documents; the projection cache is rebuildable. */
+/**
+ * Per-session projection documents are whole-record atomically rewritten JSON
+ * checkpoints, so they transfer as whole files with newest-wins (`-az --update`),
+ * never through the append-only union flags.
+ */
+export const PROJECTION_FILTER_ARGS = [
+  '--include=storages/',
+  '--include=storages/session_projcache/',
+  '--include=storages/session_projcache/sessions/',
+  '--include=storages/session_projcache/sessions/***',
+  '--exclude=*',
+];
+
+/** Storage units transfer as whole documents; per-session projection documents transfer in the projection pass. */
 export const STORAGES_FILTER_ARGS = [
+  '--exclude=storages/session_projcache/***',
   '--exclude=storages/session_projcache.json',
   '--include=storages/',
   '--include=storages/*.json',
@@ -332,12 +349,16 @@ export class RemoteSyncManager {
     try {
       logStep('pushing sessions and attachment objects');
       await this._transfer('push', UNION_FLAGS, UNION_FILTER_ARGS, store);
+      logStep('pushing projection documents');
+      await this._transfer('push', NEWEST_WINS_FLAGS, PROJECTION_FILTER_ARGS, store);
       if (!remoteAhead) {
         logStep('pushing storage units');
         await this._transfer('push', NEWEST_WINS_FLAGS, STORAGES_FILTER_ARGS, store);
       }
       logStep('pulling sessions and attachment objects');
       await this._transfer('pull', UNION_FLAGS, UNION_FILTER_ARGS, store);
+      logStep('pulling projection documents');
+      await this._transfer('pull', NEWEST_WINS_FLAGS, PROJECTION_FILTER_ARGS, store);
       logStep(remoteAhead ? 'pulling storage units (Sync Store wins)' : 'pulling storage units');
       await this._transfer(
         'pull',
@@ -418,11 +439,13 @@ export class RemoteSyncManager {
       // Never push storage units while the Sync Store is ahead: a whole-document
       // push would drop the other workstation's session references.
       await this._transfer('push', UNION_FLAGS, UNION_FILTER_ARGS, store);
+      await this._transfer('push', NEWEST_WINS_FLAGS, PROJECTION_FILTER_ARGS, store);
       this._setStatus('remote_ahead');
       return;
     }
 
     await this._transfer('push', UNION_FLAGS, UNION_FILTER_ARGS, store);
+    await this._transfer('push', NEWEST_WINS_FLAGS, PROJECTION_FILTER_ARGS, store);
     await this._transfer('push', NEWEST_WINS_FLAGS, STORAGES_FILTER_ARGS, store);
     this.headSeq = advanced;
     this._setStatus('synchronized');

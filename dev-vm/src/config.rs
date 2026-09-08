@@ -1,5 +1,5 @@
 use crate::service::default_home_dir;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
@@ -12,37 +12,15 @@ pub struct DaemonConfig {
     pub home_dir: PathBuf,
     pub devvm_bin: PathBuf,
     pub ingress_port: u16,
-    pub tailnet_domain: String,
+    pub remote_domain: Option<String>,
 }
 
-pub fn determine_bind_addresses(
+pub fn determine_bind_address(
     host: Option<&str>,
     port: u16,
-    tailscale_ip: Option<Ipv4Addr>,
-) -> Vec<SocketAddr> {
-    match host {
-        Some(h) if !h.trim().is_empty() => {
-            if let Ok(ip) = h.parse::<std::net::IpAddr>() {
-                vec![SocketAddr::new(ip, port)]
-            } else {
-                vec![format!("{}:{}", h, port)
-                    .parse()
-                    .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], port)))]
-            }
-        }
-        _ => {
-            let mut addrs = vec![SocketAddr::from(([127, 0, 0, 1], port))];
-            if let Some(ts_ip) = tailscale_ip {
-                if !ts_ip.is_loopback() {
-                    let ts_addr = SocketAddr::new(std::net::IpAddr::V4(ts_ip), port);
-                    if !addrs.contains(&ts_addr) {
-                        addrs.push(ts_addr);
-                    }
-                }
-            }
-            addrs
-        }
-    }
+) -> Result<SocketAddr, std::net::AddrParseError> {
+    let host = host.filter(|s| !s.is_empty()).unwrap_or("127.0.0.1");
+    Ok(SocketAddr::new(host.parse()?, port))
 }
 
 impl DaemonConfig {
@@ -90,8 +68,9 @@ impl DaemonConfig {
             .and_then(|p| p.parse().ok())
             .unwrap_or(8102);
 
-        let tailnet_domain =
-            std::env::var("DEVVM_TAILNET_DOMAIN").unwrap_or_else(|_| "devvm.internal".to_string());
+        let remote_domain = std::env::var("DEVVM_REMOTE_DOMAIN")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
 
         Self {
             host,
@@ -102,7 +81,7 @@ impl DaemonConfig {
             home_dir,
             devvm_bin,
             ingress_port,
-            tailnet_domain,
+            remote_domain,
         }
     }
 }
@@ -118,57 +97,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_determine_bind_addresses_default_no_tailscale() {
-        let addrs = determine_bind_addresses(None, 8100, None);
-        assert_eq!(addrs, vec![SocketAddr::from(([127, 0, 0, 1], 8100))]);
-    }
-
-    #[test]
-    fn test_determine_bind_addresses_default_with_tailscale() {
-        let ts_ip: Ipv4Addr = "100.64.0.5".parse().unwrap();
-        let addrs = determine_bind_addresses(None, 8100, Some(ts_ip));
+    fn bind_address_defaults_to_loopback_and_rejects_invalid_input() {
+        for host in [None, Some(""), Some("127.0.0.1")] {
+            assert_eq!(
+                determine_bind_address(host, 8100).unwrap(),
+                SocketAddr::from(([127, 0, 0, 1], 8100))
+            );
+        }
         assert_eq!(
-            addrs,
-            vec![
-                SocketAddr::from(([127, 0, 0, 1], 8100)),
-                SocketAddr::from(([100, 64, 0, 5], 8100))
-            ]
+            determine_bind_address(Some("100.67.154.69"), 9000).unwrap(),
+            SocketAddr::from(([100, 67, 154, 69], 9000))
         );
+        assert!(determine_bind_address(Some("invalid"), 8100).is_err());
     }
 
     #[test]
-    fn test_determine_bind_addresses_empty_string_host_with_tailscale() {
-        let ts_ip: Ipv4Addr = "100.64.0.5".parse().unwrap();
-        let addrs = determine_bind_addresses(Some(""), 8100, Some(ts_ip));
-        assert_eq!(
-            addrs,
-            vec![
-                SocketAddr::from(([127, 0, 0, 1], 8100)),
-                SocketAddr::from(([100, 64, 0, 5], 8100))
-            ]
-        );
-    }
+    fn test_daemon_config_new_defaults_remote_domain_to_none() {
+        let orig_remote = std::env::var("DEVVM_REMOTE_DOMAIN").ok();
+        std::env::remove_var("DEVVM_REMOTE_DOMAIN");
 
-    #[test]
-    fn test_determine_bind_addresses_explicit_host() {
-        let ts_ip: Ipv4Addr = "100.64.0.5".parse().unwrap();
-        let addrs = determine_bind_addresses(Some("127.0.0.1"), 8100, Some(ts_ip));
-        assert_eq!(addrs, vec![SocketAddr::from(([127, 0, 0, 1], 8100))]);
-    }
+        let config = DaemonConfig::new();
+        assert_eq!(config.remote_domain, None);
 
-    #[test]
-    fn test_determine_bind_addresses_explicit_custom_ip() {
-        let addrs = determine_bind_addresses(Some("192.168.1.50"), 9000, None);
-        assert_eq!(addrs, vec![SocketAddr::from(([192, 168, 1, 50], 9000))]);
-    }
-
-    #[test]
-    fn test_determine_bind_addresses_no_wildcard_0_0_0_0() {
-        let addrs = determine_bind_addresses(None, 8100, None);
-        assert!(!addrs.iter().any(|a| a.ip().is_unspecified()));
-
-        let ts_ip: Ipv4Addr = "100.64.0.5".parse().unwrap();
-        let addrs_ts = determine_bind_addresses(None, 8100, Some(ts_ip));
-        assert!(!addrs_ts.iter().any(|a| a.ip().is_unspecified()));
+        if let Some(r) = orig_remote {
+            std::env::set_var("DEVVM_REMOTE_DOMAIN", r);
+        }
     }
 }

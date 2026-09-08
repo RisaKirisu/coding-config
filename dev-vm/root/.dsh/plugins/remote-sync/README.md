@@ -15,8 +15,8 @@ Everything lives under DSH Home (`DSH_HOME`, default `~/.dsh`):
 
 - `sessions/` — append-only session logs (`<root>/<project>/<session-id>/session.jsonl`).
 - `attachments/v1/objects/**` — content-addressed, immutable attachment objects.
-- `storages/*.json` — whole-document storage units, except `session_projcache.json`,
-  which is a rebuildable cache.
+- `storages/session_projcache/sessions/***` — per-session projection documents: whole-record JSON checkpoints transferred newest-wins in a dedicated projection pass so cold chat titles render immediately without log re-reading.
+- `storages/*.json` — whole-document storage units, excluding `storages/session_projcache/***`.
 
 Nothing else transfers. Credentials, settings, plugins, presets, profiles, derived
 request images, and the Sync Store head marker are excluded, and no transfer ever
@@ -67,16 +67,27 @@ Any other error is retried up to five attempts one second apart before the statu
 `failed` with `last_error`. A trigger arriving during an active transfer queues exactly one
 follow-up, which runs whether the active transfer succeeded or failed.
 
-## Two-pass transfer rules
+## Three-pass transfer rules
 
-Every direction runs two rsync passes with separate filter lists and no `--delete`:
+Every direction runs three rsync passes with separate filter lists and no `--delete`:
 
-1. **Union pass** — `sessions/***` and `attachments/v1/objects/***`, with
-   `-az --update --append-verify`. `--update` skips files newer on the receiver, and
-   `--append-verify` skips files that are the same size or longer on the receiver and
-   otherwise appends. Session logs are append-only, so this bounds clock skew and
-   interrupted writes and never accepts a shorter log.
-2. **Storages pass** — `storages/*.json` minus `session_projcache.json`. Pushes and the
+1. **Union pass** — `sessions/***` and `attachments/v1/objects/***` with
+   `-az --update --append-verify`. `--update` skips files newer on the receiver.
+   `--append-verify` leaves files the same size or longer on the receiver unchanged;
+   for a shorter receiver it verifies the existing prefix, appending when it matches
+   and retransferring when it does not. Session logs are byte-append-only, so this
+   pass never accepts a shorter log and never shrinks a receiver.
+2. **Projection pass** — `storages/session_projcache/sessions/***` with
+   `-az --update` (newest wins) in every direction and head branch, including
+   the remote-ahead branch. Projection documents are non-authoritative,
+   whole-record checkpoints rewritten atomically, so they must replace the receiver's
+   record as a whole file; the union pass's `--append-verify` must never carry them,
+   because retaining a stale receiver prefix and appending a sender suffix corrupts the
+   JSON document as valid but wrong content or invalid JSON. Unlike storage units, a
+   projection document is keyed by one immutable session and never carries session
+   registry references, so pushing it while the Sync Store is ahead cannot drop another
+   workstation's sessions.
+3. **Storages pass** — `storages/*.json` minus `storages/session_projcache/***`. Pushes and the
    equal-sequence pull use `-az --update` (newest wins). The pull taken while the Sync
    Store is ahead uses `-az` without `--update`, so the store wins regardless of
    modification time.
@@ -155,11 +166,12 @@ node /root/.dsh/plugins/remote-sync/reconcile.mjs
 
 It reads the Sync Store head first and branches on it. When the store is unreachable it
 records `degraded` and changes nothing. When the sequence equals `head_seq` this
-workstation wrote last: it pushes both passes, then pulls both with `--update`. When the
-sequence is higher — including a workstation with no `head_seq` at all — the store wrote
-last: sessions and attachments still push and pull as a union, storage units are pulled
-store-wins and never pushed. Either branch sets `head_seq` to the store's sequence and the
-status to `synchronized`. The first failing step records `failed` and stops.
+workstation wrote last: it pushes union, projection, and storage passes, then pulls
+all three with `--update`. When the sequence is higher — including a workstation with no
+`head_seq` at all — the store wrote last: union and projection passes still push and pull,
+storage units are pulled store-wins and never pushed. Either branch sets `head_seq` to the
+store's sequence and the status to `synchronized`. The first failing step records `failed`
+and stops.
 
 The script logs one line per step to stdout, errors to stderr, and **always exits 0**: a
 Session Sync problem must never block the DSH Runtime launch. The status it leaves behind
