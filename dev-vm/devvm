@@ -149,6 +149,10 @@ link_root() {
             ln -s "$source" "$target"
         done
 
+        # link: plugins resolve peer deps via this fallback; pnpm does not manage it.
+        [[ -L /root/.dsh/plugins/node_modules ]] \
+            || ln -sfn ../profiles/node_modules /root/.dsh/plugins/node_modules
+
         profile=/root/.dsh/profiles/web
         if command -v dsh >/dev/null 2>&1 \
             && [[ -f "$profile/package.json" ]] \
