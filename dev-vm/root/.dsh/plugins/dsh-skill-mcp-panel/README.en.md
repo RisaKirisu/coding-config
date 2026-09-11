@@ -7,6 +7,12 @@ A DSH plugin for managing skills right from the web UI and terminal
 <img width="602" height="599" alt="image" src="https://github.com/user-attachments/assets/23aabaf8-b1fa-43a7-8a9e-ea7c2186917e" />
 
 
+## Local MCP credential integration
+
+This installation writes `bearerTokenRef` for HTTP Bearer authentication. The locally patched `@deepseek-ai/dsh-mcp-client` resolves it through DSH's credentials service when connecting; patch YAML contains no token value. Both installed packages must retain this change together when upgrading.
+
+Run `node test-context7-registration.mjs` to verify the saved Context7 credential, panel configuration round-trip, real tool registration, and disposal. The panel's connection probe alone does not verify registration in the running host.
+
 ## Features
 
 - Skill card list: preview installed skills; expand a card to read the full content

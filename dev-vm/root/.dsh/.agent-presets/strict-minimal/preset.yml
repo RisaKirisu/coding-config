@@ -1,0 +1,2 @@
+name: Strict Minimal
+description: The minimal two-tool coding Agent with a strict whitelist — only bash (pwsh on Windows) and str_replace_editor stay visible and callable, whatever global tools the process registers.

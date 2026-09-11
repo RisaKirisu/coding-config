@@ -101,18 +101,13 @@ export function toOfficialConfig(input) {
         };
     }
     const headers = mergeSecretPatch({}, input.headers);
-    if (input.authType === "bearer") {
-        const ref = credentialRefForServer(input.serverName);
-        headers["Authorization"] = {
-            __jsExpr: `\`Bearer \${(() => { try { return require('yaml').parse(require('node:fs').readFileSync(dshHomePath('.credentials.yaml'), 'utf8'))?.refs?.['${ref}'] || ''; } catch { return ''; } })()}\``
-        };
-    } else if (input.authType === "none") {
-        delete headers["Authorization"];
-    }
+    const bearerTokenRef = input.authType === "bearer" ? credentialRefForServer(input.serverName) : undefined;
+    delete headers["Authorization"];
     return {
         ...common,
         transport: "streamable-http",
         url: input.url,
+        ...(bearerTokenRef === undefined ? {} : { bearerTokenRef }),
         headers
     };
 }
@@ -163,7 +158,7 @@ export function patchRowToView(row) {
         return undefined;
     const transport = config.transport === "streamable-http" ? "streamable-http" : config.transport === "stdio" ? "stdio" : "unknown";
     const reconnectRaw = config.reconnect !== null && typeof config.reconnect === "object" && !Array.isArray(config.reconnect) ? config.reconnect : {};
-    const authType = (config.headers && config.headers.Authorization !== undefined) ? "bearer" : "none";
+    const authType = (typeof config.bearerTokenRef === "string" || (config.headers && config.headers.Authorization !== undefined)) ? "bearer" : "none";
     return {
         serverName,
         transport,
@@ -219,7 +214,7 @@ export function inputFromPatchRow(row) {
         }
     };
     if (config.transport === "streamable-http") {
-        const authType = (config.headers && config.headers.Authorization !== undefined) ? "bearer" : "none";
+        const authType = (typeof config.bearerTokenRef === "string" || (config.headers && config.headers.Authorization !== undefined)) ? "bearer" : "none";
         return mcpServerInputSchema.parse({
             ...common,
             transport: "streamable-http",

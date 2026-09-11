@@ -1,9 +1,9 @@
 ui-onboarding:
   welcomeNoticeVersion: 2026-08-13.1
 agent-default-model:
-  provider: proxy-cli
+  provider: krill-codex
   model: "gpt-6-astra"
-  reasoningEffort: medium
+  reasoningEffort: xhigh
 llm-pi-ai:
   providers:
     krill-codex:
@@ -43,11 +43,13 @@ llm-pi-ai:
             chatTemplateKwargs: {}
             chatTemplateArgs: {}
         - id: gpt-6-astra
+          contextWindow: 270000
           input:
             - text
             - image
           reasoningEfforts:
-            off: null
+            off: low
+            minimal: low
             low: low
             medium: medium
             high: high
@@ -56,7 +58,6 @@ llm-pi-ai:
           compat:
             chatTemplateKwargs: {}
             chatTemplateArgs: {}
-          contextWindow: 1000000
       modelOverrides: {}
       compat:
         chatTemplateKwargs: {}
@@ -242,6 +243,7 @@ llm-pi-ai:
             chatTemplateKwargs: {}
             chatTemplateArgs: {}
         - id: gpt-6-astra
+          contextWindow: 499998
           input:
             - text
             - image
@@ -255,7 +257,6 @@ llm-pi-ai:
           compat:
             chatTemplateKwargs: {}
             chatTemplateArgs: {}
-          contextWindow: 1000000
       modelOverrides: {}
       compat:
         chatTemplateKwargs: {}
@@ -342,15 +343,15 @@ permission:
 locale:
   preference: zh
 shell:
-  timeoutMs: 600000
+  timeoutMs: 1200000
   maxOutputBytes: 20000
 ui-theme:
   preference: system
 
 subagent-model:
-  provider: "proxy-cli"
-  model: "gemini-3.8-flash-high"
-  reasoningEffort: "high"
+  provider: "deepseek-official"
+  model: "deepseek-flash"
+  reasoningEffort: "max"
 build-loop:
   {
     provider: spawn,
@@ -641,3 +642,27 @@ build-loop:
         exit_plan_mode
       ]
   }
+llm-deepseek:
+  models:
+    - id: deepseek-flash
+      name: DeepSeek-V4.1-Flash
+      description: Fast, efficient, and economical; suited to focused, routine, or
+        parallel tasks.
+      contextWindow: 1000000
+      inputModalities:
+        - text
+    - id: deepseek-v4-pro
+      name: DeepSeek-V4-Pro
+      description: Stronger agentic coding, knowledge, and difficult reasoning; suited
+        to complex or quality-critical tasks at higher cost.
+      contextWindow: 1000000
+      inputModalities:
+        - text
+    - id: deepseek-v4-flash-vision-exp
+      name: DeepSeek-V4-Flash-Vision-Exp
+      contextWindow: 1000000
+      inputModalities:
+        - text
+        - image
+      imagePixelBudget: 640000
+      imageMaxBytes: 1048576

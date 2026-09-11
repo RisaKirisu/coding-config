@@ -4,3 +4,24 @@
 - id: ui-permission
   disabled: true
 
+
+
+# >>> dsh-skill-mcp-panel:mcp:begin
+- insert:
+    - id: panel-mcp-context7
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: context7
+        toolCallTimeoutMs: 60000
+        failOnStartupError: true
+        reconnect:
+          enabled: true
+          initialDelayMs: 500
+          maxDelayMs: 30000
+          maxAttempts: 10
+        transport: streamable-http
+        url: https://mcp.context7.com/mcp
+        bearerTokenRef: MCP_636F6E7465787437_TOKEN
+        headers: {}
+# <<< dsh-skill-mcp-panel:mcp:end
+
