@@ -1,331 +1,301 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import {
-  auditPrompt,
-  evaluateAuditOutcome,
-  fixPrompt,
-  formatAuditFailure,
-  isClean,
-  renderOutcome,
-  runWithRetries,
-  toVerdict,
-} from './loop.mjs'
-import { DEFAULTS, filterDeniedTools, validateConfig } from './config.mjs'
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { setTimeout as delay } from 'node:timers/promises'
+import { runtime } from './test-runtime.mjs'
+import { Controller } from './controller.mjs'
+import { runCheck } from './checks.mjs'
+import { assertAcceptable, initialAudits, missingChecks, recordVerdict } from './loop.mjs'
+import { VERDICT_SCHEMA } from './schemas.mjs'
+import { DEFAULTS } from './config.mjs'
+import { loadInstructions } from './prompts.mjs'
+import { assignment, reminder, auditAssignment } from './assignments.mjs'
+import { registerTools } from './index.mjs'
 
-test('toVerdict accepts only valid structured verdicts and never returns clean without one', () => {
-  assert.equal(toVerdict(undefined), undefined)
-  assert.equal(toVerdict({ clean: true }), undefined)
-  assert.equal(toVerdict({ clean: true, findings: [] }), undefined)
-  assert.equal(toVerdict({ clean: true, findings: [], report: 123 }), undefined)
-  assert.equal(toVerdict({ clean: false, findings: [123], report: 'r' }), undefined)
-  assert.equal(toVerdict({ clean: 'yes', findings: [], report: 'r' }), undefined)
-  assert.equal(toVerdict({ clean: true, findings: 'none', report: 'r' }), undefined)
-  assert.deepEqual(toVerdict({ clean: true, findings: ['x'], report: 'r' }), { clean: false, findings: ['x'], report: 'r' })
-  assert.deepEqual(toVerdict({ clean: true, findings: [], report: 'r' }), { clean: true, findings: [], report: 'r' })
-  assert.deepEqual(toVerdict({ clean: false, findings: ['x'], report: 'r' }), { clean: false, findings: ['x'], report: 'r' })
+const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'build-loop-process-test-'))
+const host = await runtime()
+test.after(async () => { await host.close(); await fs.rm(directory, { recursive: true, force: true }) })
+
+async function fixture(t) {
+  const cwd = await fs.mkdtemp(path.join(directory, 'workspace-'))
+  const handle = await host.ctx.agents.create({ sessionId: randomUUID(), meta: { cwd } })
+  t.after(() => handle.dispose())
+  const contract = { summary: 'Small process pilot', scope: ['sample.mjs'], behaviors: [{ id: 'B1', observation: 'expected output', check: 'check' }], checks: [{ id: 'check', command: 'printf verified', scope: ['sample.mjs'], expectedExit: 0 }] }
+  const run = { id: randomUUID(), revision: 1, owner: handle.agent.session.id, cwd, ticket: 'ticket.md', contract, policy: structuredClone(DEFAULTS), instructions: loadInstructions(), phase: 'awaiting_acceptance', task: { phase: 'implement', ids: [] }, decisions: [], checks: [], attempt: 1, audits: [], findings: [], fixRounds: 0, maxFixRounds: 3, failure: null, handoff: { outcome: 'ready-for-audit', summary: 'implemented', files: ['sample.mjs'], observations: ['specific observation'], findings: [] } }
+  return { run, exec: { agent: handle.agent, signal: new AbortController().signal, callId: randomUUID() } }
+}
+
+function cleanAudits(run) {
+  for (const a of initialAudits(run)) recordVerdict(run, { ...a, ids: [] }, { findings: [], prior: [], report: 'required behavior inspected' })
+}
+
+test('acceptance requires checks and audits; source changes are caller judgment', async (t) => {
+  const { run, exec } = await fixture(t)
+  assert.throws(() => assertAcceptable(run), /check results/)
+  await runCheck(host.ctx, exec, run, run.contract.checks[0])
+  assert.throws(() => assertAcceptable(run), /audit results/)
+  cleanAudits(run)
+  await fs.writeFile(path.join(run.cwd, 'unrelated.txt'), 'not inspected by controller')
+  assert.doesNotThrow(() => assertAcceptable(run))
+  assert.deepEqual(await fs.readdir(run.cwd), ['unrelated.txt'])
+  const controller = new Controller(host.ctx)
+  controller.runs.set(run.id, run)
+  await assert.rejects(controller.decide({ run_id: run.id, revision: 99, kind: 'accept' }, exec), /stale/)
+  const result = await controller.decide({ run_id: run.id, revision: 1, kind: 'accept' }, exec)
+  assert.equal(result.phase, 'complete')
 })
 
-test('evaluateAuditOutcome accepts valid structured verdict', () => {
-  const cleanStructured = { clean: true, findings: [], report: 'All clean' }
-  assert.deepEqual(evaluateAuditOutcome({ structured: cleanStructured, stopReason: 'completed' }, 'completed'), {
-    ok: true,
-    verdict: { clean: true, findings: [], report: 'All clean' },
+test('check results count only for the current builder attempt', async (t) => {
+  const { run, exec } = await fixture(t)
+  await runCheck(host.ctx, exec, run, run.contract.checks[0])
+  assert.equal(missingChecks(run).length, 0)
+  run.attempt += 1
+  assert.equal(missingChecks(run).length, 1)
+  await runCheck(host.ctx, exec, run, run.contract.checks[0])
+  assert.equal(missingChecks(run).length, 0)
+  assert.equal(run.checks.length, 2)
+})
+
+test('all-ignore triage permits acceptance without another worker round; invalid triage is atomic', async (t) => {
+  const { run, exec } = await fixture(t)
+  await runCheck(host.ctx, exec, run, run.contract.checks[0])
+  cleanAudits(run)
+  const finding = { impact: 'high', location: 'sample.mjs:1', rule: 'B1', evidence: 'missing case', correction: 'add it' }
+  recordVerdict(run, { role: 'code', ids: [], obligations: ['B1', '@maintainability'] }, { findings: [finding], prior: [], report: 'one issue' })
+  run.phase = 'awaiting_decision'
+  const controller = new Controller(host.ctx)
+  controller.runs.set(run.id, run)
+  await assert.rejects(controller.decide({ run_id: run.id, revision: 1, kind: 'continue', instructions: 'fix everything' }, exec), /triage/)
+  for (const dispositions of [[], [{ id: 'other', action: 'ignore', reason: 'wrong id' }], [{ id: 'C1', action: 'ignore', reason: 'one' }, { id: 'C1', action: 'ignore', reason: 'duplicate' }]]) {
+    await assert.rejects(controller.decide({ run_id: run.id, revision: 1, kind: 'triage', dispositions }, exec))
+    assert.equal(run.findings[0].status, 'open')
+    assert.equal(run.revision, 1)
+  }
+  const result = await controller.decide({ run_id: run.id, revision: 1, kind: 'triage', dispositions: [{ id: 'C1', action: 'ignore', reason: 'outside the required behavior' }] }, exec)
+  assert.equal(result.phase, 'awaiting_acceptance')
+  assert.equal(run.attempt, 1)
+  assert.equal(run.fixRounds, 0)
+  assert.equal(run.findings[0].caller.reason, 'outside the required behavior')
+  assert.equal((await controller.decide({ run_id: run.id, revision: result.revision, kind: 'accept' }, exec)).phase, 'complete')
+})
+
+test('wrong auditor and blocked reports cannot close findings', async (t) => {
+  const { run } = await fixture(t)
+  run.findings = [{ id: 'T1', role: 'test', status: 'open' }]
+  const report = { findings: [], prior: [{ id: 'T1', status: 'resolved', evidence: 'checked' }], report: 'audit' }
+  assert.throws(() => recordVerdict(run, { role: 'code', ids: ['T1'], obligations: ['B1'] }, report), /foreign/)
+  recordVerdict(run, { role: 'test', ids: ['T1'], obligations: ['B1'] }, { ...report, blocked: 'unable to inspect' })
+  assert.equal(run.findings[0].status, 'open')
+  recordVerdict(run, { role: 'test', ids: ['T1'], obligations: ['B1'] }, { ...report, blocked: '' })
+  assert.equal(run.findings[0].status, 'closed')
+})
+
+test('real child failure keeps the one builder in memory and writes no checkpoint', async (t) => {
+  const { run, exec } = await fixture(t)
+  run.phase = 'awaiting_design'
+  run.task = { phase: 'approach', ids: [] }
+  run.handoff = { outcome: 'approach', summary: 'use a direct loop', files: ['sample.mjs'] }
+  const controller = new Controller(host.ctx)
+  controller.runs.set(run.id, run)
+  run.policy.reminderTokens = 1
+  // Web installs `subagent` on the parent's own layer: the child cannot restrict it, so the denylist must skip it.
+  const tool = (name) => ({ name, description: name, parameters: {}, output: { schema: { type: 'object' }, render: () => [] }, execute: async () => ({}) })
+  exec.agent.ctx.tools.register(tool('subagent'))
+  const global = host.ctx.tools.register(tool('workflow'))
+  t.after(global)
+  const started = t.mock.method(host.ctx.subagents, 'start')
+  const result = await controller.decide({ run_id: run.id, revision: 1, kind: 'approve_design' }, exec)
+  const request = started.mock.calls[0].arguments[1]
+  // Persona is the instruction files; the turn message carries only the assignment.
+  assert.ok(request.persona.startsWith(run.instructions.common))
+  assert.ok(request.persona.endsWith(run.instructions.builder))
+  assert.doesNotMatch(request.persona, /Auditor finding policy/)
+  assert.doesNotMatch(request.prompt[0].text, /system_reminder|# Builder instructions/)
+  assert.deepEqual(request.toolFilter.deny, ['workflow'])
+  assert.equal(result.phase, 'interrupted')
+  assert.match(run.failure, /builder ended with error/)
+  assert.equal(run.task.phase, 'implement')
+  assert.equal(run.fixRounds, 0)
+  assert.equal(controller.workers.active.size, 1)
+  assert.deepEqual(await fs.readdir(run.cwd), [])
+  await assert.rejects(new Controller(host.ctx).decide({ run_id: run.id, revision: run.revision, kind: 'inspect' }, exec), /unknown run/)
+  await controller.decide({ run_id: run.id, revision: run.revision, kind: 'continue', instructions: 'retry' }, exec)
+  assert.equal(started.mock.calls.length, 1)
+  // The retry is a follow-up turn on the same builder; with a 1-token threshold its pre-step injects one reminder from ctx.tokenMeter pressure.
+  const builder = controller.workers.builders.get(run.id)
+  const texts = builder.child.localAgent.session.deriveMessages().map((m) => m.content.map((c) => c.text ?? '').join(''))
+  assert.equal(texts.filter((text) => text.includes('<system_reminder>')).length, 1)
+  assert.ok(builder.remindedAt > 0)
+  assert.equal((await controller.decide({ run_id: run.id, revision: run.revision, kind: 'abandon' }, exec)).phase, 'abandoned')
+  assert.equal(controller.workers.active.size, 0)
+})
+
+test('native cancellation stops descendants without custom execution machinery', async (t) => {
+  const { run, exec } = await fixture(t)
+  const abort = new AbortController()
+  const script = "require('fs').writeFileSync('started', 'yes'); setTimeout(() => require('fs').writeFileSync('late', 'bad'), 1000)"
+  const pending = runCheck(host.ctx, { ...exec, signal: abort.signal }, run, { ...run.contract.checks[0], command: 'node -e ' + JSON.stringify(script) + '; :' })
+  const start = Date.now()
+  while (!(await fs.stat(path.join(run.cwd, 'started')).catch(() => null))) {
+    assert.ok(Date.now() - start < 5000)
+    await delay(10)
+  }
+  abort.abort()
+  assert.equal((await pending).failed, true)
+  await delay(1100)
+  await assert.rejects(fs.stat(path.join(run.cwd, 'late')), { code: 'ENOENT' })
+})
+
+test('prompts come from instructions/*.md; turn messages carry state, not personas', async (t) => {
+  const { run } = await fixture(t)
+  assert.equal(run.instructions.auditorFindings, await fs.readFile(new URL('./instructions/auditor-findings.md', import.meta.url), 'utf8'))
+  assert.match(run.instructions.auditorFindings, /strictly greater than 75; 75 is excluded/)
+  assert.doesNotMatch(run.instructions.common + run.instructions.builder + run.instructions.reviewer + run.instructions.tester, /revision|source identity|hash|checkpoint/)
+  const text = reminder(run)
+  assert.ok(text.startsWith('<system_reminder>\n\n' + run.instructions.common + '\n\n' + run.instructions.builder))
+  assert.ok(text.endsWith('</system_reminder>'))
+  assert.doesNotMatch(assignment(run), /# Builder instructions|# Shared worker instructions/)
+  assert.equal(VERDICT_SCHEMA.properties.findings.items.properties.confidence, undefined)
+  for (const role of ['code', 'test']) {
+    const packet = auditAssignment(run, { role, ids: [], ignored: [], obligations: ['B1'] })
+    assert.match(packet, /# Audit assignment/)
+    assert.doesNotMatch(packet, /Auditor finding policy|# Shared worker instructions/)
+  }
+})
+
+test('registered tool reaches the real builder in a plain directory without Git', async (t) => {
+  const { run, exec } = await fixture(t)
+  const controller = new Controller(host.ctx)
+  const fiber = host.ctx.plugin({ inject: ['tools', 'systemPrompt'], apply: (ctx) => registerTools(ctx, { get: () => DEFAULTS }, controller) })
+  await fiber.await()
+  try {
+    const result = await host.ctx.tools.execute({ ...exec, name: 'build_ticket', arguments: { ticket: 'ticket.md', contract: run.contract } })
+    assert.equal(result.isError, false, JSON.stringify(result))
+    // No model provider is installed: reaching the child error proves startup passed routing.
+    assert.match(result.value.text, /builder ended with error/)
+    assert.deepEqual(await fs.readdir(run.cwd), [])
+    assert.equal(controller.workers.active.size, 1)
+    controller.workers.active.set(exec.agent.session.id, { role: 'builder', run, denied: new Set(['build_ticket']) })
+    const checked = await host.ctx.tools.execute({ ...exec, callId: randomUUID(), name: 'build_ticket_check', arguments: { check_id: 'check' } })
+    assert.equal(checked.isError, false, JSON.stringify(checked))
+    assert.equal(checked.value.exitCode, 0)
+    const guarded = await host.ctx.tools.execute({ ...exec, callId: randomUUID(), name: 'build_ticket', arguments: { ticket: 'ticket.md', contract: run.contract } })
+    assert.equal(guarded.isError, true)
+    assert.match(guarded.error.message, /workers may not use build_ticket/)
+    controller.workers.active.delete(exec.agent.session.id)
+  } finally { await controller.workers.close(); await fiber.dispose() }
+})
+
+// Mock only the plugin's worker-call boundary with node:test; bash/check dispatch remains real.
+test('audit findings pause for caller; only approved fixes run and ignored IDs can reopen', async (t) => {
+  const { run, exec } = await fixture(t)
+  const controller = new Controller(host.ctx)
+  controller.runs.set(run.id, run)
+  let cycle = 0
+  t.mock.method(controller.workers, 'builder', async () => {
+    cycle += 1
+    if (cycle > 1) assert.deepEqual(run.task.ids, ['C1'])
+    return { ...run.handoff, findings: run.task.ids.map((id) => ({ id, status: 'fixed', evidence: 'corrected' })) }
   })
-
-  const findingStructured = { clean: false, findings: ['Issue 1'], report: 'Found bug' }
-  assert.deepEqual(evaluateAuditOutcome({ structured: findingStructured, stopReason: 'completed' }, 'completed'), {
-    ok: true,
-    verdict: { clean: false, findings: ['Issue 1'], report: 'Found bug' },
-  })
-})
-
-test('evaluateAuditOutcome falls back to normally finished non-empty plain text as clean false', () => {
-  // Normal plain-text completion when DSH maps missing-output stopReason to 'error'
-  const resFromDshMappedError = evaluateAuditOutcome(
-    {
-      output: [{ type: 'text', text: 'Audit finding: file.ts line 10 needs fix' }],
-      stopReason: 'error',
-    },
-    'completed',
-  )
-  assert.deepEqual(resFromDshMappedError, {
-    ok: true,
-    verdict: {
-      clean: false,
-      findings: ['Audit finding: file.ts line 10 needs fix'],
-      report: 'Audit finding: file.ts line 10 needs fix',
-    },
-  })
-
-  // Plain string output with completed stopReason
-  const resPlainString = evaluateAuditOutcome(
-    {
-      output: 'All tests pass but coverage is thin',
-      stopReason: 'completed',
-    },
-    undefined,
-  )
-  assert.deepEqual(resPlainString, {
-    ok: true,
-    verdict: {
-      clean: false,
-      findings: ['All tests pass but coverage is thin'],
-      report: 'All tests pass but coverage is thin',
-    },
-  })
-})
-
-test('evaluateAuditOutcome rejects partial output from failed execution', () => {
-  // Execution ended with error turnReason
-  const failed = evaluateAuditOutcome(
-    {
-      output: [{ type: 'text', text: 'Partial report before exception...' }],
-      stopReason: 'error',
-    },
-    'error',
-  )
-  assert.equal(failed.ok, false)
-  assert.match(failed.cause, /error/)
-
-  // Execution ended with error carrying diagnostic
-  const withDiagnostic = evaluateAuditOutcome(
-    {
-      stopReason: 'error',
-      diagnostic: 'timeout',
-    },
-    'error',
-  )
-  assert.equal(withDiagnostic.ok, false)
-  assert.match(withDiagnostic.cause, /timeout/)
-
-  // Execution aborted
-  const aborted = evaluateAuditOutcome(
-    {
-      output: [{ type: 'text', text: 'Partial text...' }],
-      stopReason: 'aborted',
-    },
-    'aborted',
-  )
-  assert.equal(aborted.ok, false)
-})
-
-test('evaluateAuditOutcome rejects empty execution even when completed', () => {
-  assert.deepEqual(evaluateAuditOutcome({ output: '', stopReason: 'completed' }, 'completed'), {
-    ok: false,
-    cause: 'audit produced empty output',
-  })
-  assert.deepEqual(evaluateAuditOutcome({ output: [{ type: 'text', text: '   ' }], stopReason: 'completed' }, 'completed'), {
-    ok: false,
-    cause: 'audit produced empty output',
-  })
-  assert.deepEqual(evaluateAuditOutcome({ output: [], stopReason: 'completed' }, 'completed'), {
-    ok: false,
-    cause: 'audit produced empty output',
-  })
-})
-
-test('runWithRetries respects three-attempt limit and reports exhausted attempts', async () => {
-  let attempts = 0
-  const res = await runWithRetries(async () => {
-    attempts++
-    return { ok: false, cause: 'flaky failure' }
-  }, { maxAttempts: 3 })
-
-  assert.equal(attempts, 3)
-  assert.deepEqual(res, { ok: false, attempts: 3, lastCause: 'flaky failure' })
-})
-
-test('runWithRetries succeeds after retry without executing further attempts', async () => {
-  let attempts = 0
-  const res = await runWithRetries(async (n) => {
-    attempts = n
-    if (n === 1) return { ok: false, cause: 'temp issue' }
-    return { ok: true, verdict: { clean: true, findings: [], report: 'clean report' } }
-  }, { maxAttempts: 3 })
-
-  assert.equal(attempts, 2)
-  assert.equal(res.ok, true)
-  assert.equal(res.attempts, 2)
-  assert.equal(res.verdict.clean, true)
-})
-
-test('runWithRetries retries on thrown exceptions in attempt function', async () => {
-  let attempts = 0
-  const res = await runWithRetries(async (n) => {
-    attempts = n
-    if (n === 1) throw new Error('connection dropped')
-    return { ok: true, verdict: { clean: false, findings: ['f'], report: 'r' } }
-  }, { maxAttempts: 3 })
-
-  assert.equal(attempts, 2)
-  assert.equal(res.ok, true)
-  assert.equal(res.attempts, 2)
-})
-
-test('runWithRetries halts immediately on caller cancellation without retrying', async () => {
-  const preAborted = new AbortController()
-  preAborted.abort()
-  let preAttempts = 0
-  await assert.rejects(
-    async () => {
-      await runWithRetries(async () => {
-        preAttempts++
-        return { ok: true, verdict: { clean: true, findings: [], report: 'r' } }
-      }, { maxAttempts: 3, signal: preAborted.signal })
-    },
-    /cancelled/,
-  )
-  assert.equal(preAttempts, 0)
-
-  const controller = new AbortController()
-  let attempts = 0
-  await assert.rejects(
-    async () => {
-      await runWithRetries(async () => {
-        attempts++
-        controller.abort()
-        throw new Error('child interrupted by caller abort')
-      }, { maxAttempts: 3, signal: controller.signal })
-    },
-    /child interrupted by caller abort/,
-  )
-  assert.equal(attempts, 1)
-
-  const resolveController = new AbortController()
-  let resolveAttempts = 0
-  await assert.rejects(
-    async () => {
-      await runWithRetries(async () => {
-        resolveAttempts++
-        resolveController.abort()
-        return { ok: true, verdict: { clean: true, findings: [], report: 'clean' } }
-      }, { maxAttempts: 3, signal: resolveController.signal })
-    },
-    /build_ticket was cancelled/,
-  )
-  assert.equal(resolveAttempts, 1)
-})
-
-test('runWithRetries ensures cleanup runs across all attempts', async () => {
-  const disposed = []
-  let attempts = 0
-  const res = await runWithRetries(async (n) => {
-    attempts = n
-    try {
-      if (n < 3) return { ok: false, cause: 'retry' }
-      return { ok: true, verdict: { clean: true, findings: [], report: 'done' } }
-    } finally {
-      disposed.push(`child-${n}`)
+  t.mock.method(controller.workers, 'auditor', async (_run, _parent, a) => {
+    if (cycle === 1) return { findings: [{ impact: 'medium', location: 'sample.mjs:1', rule: 'B1', evidence: 'observed gap', correction: 'fix gap' }], prior: [], report: 'initial audit' }
+    assert.equal(cycle, 2)
+    if (a.role === 'test') {
+      assert.deepEqual(a.ignored, ['T1'])
+      assert.match(auditAssignment(run, a), /existing test covers this/)
+      return { findings: [], prior: [{ id: 'T1', status: 'open', evidence: 'the existing assertion checks a different output; traced required result is unobserved' }], report: 'stronger evidence' }
     }
-  }, { maxAttempts: 3 })
-
-  assert.equal(attempts, 3)
-  assert.deepEqual(disposed, ['child-1', 'child-2', 'child-3'])
-  assert.equal(res.ok, true)
-})
-
-test('formatAuditFailure includes failed phases, attempt counts, last causes, and exact user instruction', () => {
-  const single = formatAuditFailure([{ phase: 'review', attempts: 3, lastCause: 'stream ended abnormally' }])
-  assert.match(single, /review failed after 3 attempt\(s\) \(last cause: stream ended abnormally\)/)
-  assert.match(single, /Notify the user immediately\. Do not retry build_ticket\./)
-
-  const sibling = formatAuditFailure([
-    { phase: 'review', attempts: 3, lastCause: 'crash' },
-    { phase: 'test-audit', attempts: 3, lastCause: 'empty output' },
-  ])
-  assert.match(sibling, /review failed after 3 attempt\(s\) \(last cause: crash\)/)
-  assert.match(sibling, /test-audit failed after 3 attempt\(s\) \(last cause: empty output\)/)
-  assert.match(sibling, /Notify the user immediately\. Do not retry build_ticket\./)
-})
-
-test('loop stops only when both audits are clean', () => {
-  const clean = { clean: true, findings: [], report: '' }
-  const dirty = { clean: false, findings: ['f'], report: '' }
-  assert.equal(isClean(clean, clean), true)
-  assert.equal(isClean(clean, dirty), false)
-  assert.equal(isClean(dirty, clean), false)
-})
-
-test('fix prompt carries every finding from both audits', () => {
-  const text = fixPrompt({
-    review: { clean: false, findings: ['review-1', 'review-2'], report: '' },
-    test: { clean: true, findings: [], report: '' },
-    round: 2,
-    maxRounds: 3,
+    return { findings: [], prior: [{ id: 'C1', status: 'resolved', evidence: 'corrected' }], report: 'fixed' }
   })
-  assert.match(text, /round 2 of 3/)
-  assert.match(text, /- review-1\n- review-2/)
-  assert.match(text, /Test audit: clean\./)
+  const first = await controller.decide({ run_id: run.id, revision: 1, kind: 'continue', instructions: 'implement' }, exec)
+  assert.equal(first.phase, 'awaiting_decision')
+  assert.equal(cycle, 1)
+  const second = await controller.decide({ run_id: run.id, revision: first.revision, kind: 'triage', dispositions: [
+    { id: 'C1', action: 'fix', reason: 'required correctness' },
+    { id: 'T1', action: 'ignore', reason: 'existing test covers this' },
+  ] }, exec)
+  assert.equal(second.phase, 'awaiting_decision')
+  assert.equal(cycle, 2)
+  assert.equal(run.fixRounds, 1)
+  assert.equal(run.findings.find((f) => f.id === 'C1').status, 'closed')
+  const reopened = run.findings.find((f) => f.id === 'T1')
+  assert.equal(reopened.status, 'open')
+  assert.equal(reopened.caller.reason, 'existing test covers this')
+  assert.match(reopened.verified.evidence, /different output/)
+  await assert.rejects(controller.decide({ run_id: run.id, revision: second.revision, kind: 'continue', instructions: 'skip triage' }, exec), /triage/)
 })
 
-test('audit prompt embeds the build report verbatim', () => {
-  const text = auditPrompt({ ticket: 't.md', buildReport: 'LINE A\nLINE B', round: 1 })
-  assert.match(text, /--- CHANGE DESCRIPTION ---\n\nLINE A\nLINE B\n\n--- END CHANGE DESCRIPTION ---/)
-})
-
-test('outcome renders all three reports verbatim and states the status', () => {
-  const out = renderOutcome({
-    ticket: 't.md', status: 'unresolved', rounds: 3, maxRounds: 3,
-    build: 'BUILD-REPORT', review: { clean: false, findings: ['a', 'b'], report: 'REVIEW-REPORT' },
-    test: { clean: true, findings: [], report: 'TEST-REPORT' },
+test('builder dispute pauses without closing findings; ignoring cannot skip current audits', async (t) => {
+  const { run, exec } = await fixture(t)
+  await runCheck(host.ctx, exec, run, run.contract.checks[0])
+  cleanAudits(run)
+  run.findings = [{ id: 'C1', role: 'code', status: 'open' }]
+  run.phase = 'awaiting_decision'
+  run.maxFixRounds = 1
+  const controller = new Controller(host.ctx)
+  controller.runs.set(run.id, run)
+  let calls = 0
+  t.mock.method(controller.workers, 'builder', async () => {
+    calls += 1
+    if (calls === 1) return { outcome: 'needs-decision', summary: 'scope conflict', findings: [{ id: 'C1', status: 'disputed', evidence: 'requires changing public contract' }] }
+    return { outcome: 'ready-for-audit', summary: 'completed remaining work', files: [], observations: ['verified'], findings: [] }
   })
-  assert.match(out, /NOT clean after 3 fix round/)
-  assert.match(out, /## Build report\n\nBUILD-REPORT/)
-  assert.match(out, /## Code review \(2 finding\(s\)\)\n\nREVIEW-REPORT/)
-  assert.match(out, /## Test audit \(clean\)\n\nTEST-REPORT/)
-  assert.match(renderOutcome({ ticket: 't', status: 'failed', rounds: 0, maxRounds: 3, build: 'B', failure: 'boom' }), /stopped early — boom/)
+  t.mock.method(controller.workers, 'auditor', async () => ({ findings: [], prior: [], report: 'no remaining issue' }))
+  const disputed = await controller.decide({ run_id: run.id, revision: 1, kind: 'triage', dispositions: [{ id: 'C1', action: 'fix', reason: 'required' }] }, exec)
+  assert.equal(disputed.phase, 'awaiting_decision')
+  assert.equal(run.findings[0].status, 'open')
+  assert.equal(run.findings[0].builder.status, 'disputed')
+  const ignored = await controller.decide({ run_id: run.id, revision: disputed.revision, kind: 'triage', dispositions: [{ id: 'C1', action: 'ignore', reason: 'preserve current contract' }] }, exec)
+  assert.equal(ignored.phase, 'awaiting_decision')
+  assert.throws(() => assertAcceptable(run), /ready handoff/)
+  const resumed = await controller.decide({ run_id: run.id, revision: ignored.revision, kind: 'continue', instructions: 'finish verification without the ignored change' }, exec)
+  assert.equal(resumed.phase, 'awaiting_acceptance')
+  assert.equal(run.fixRounds, 1)
+  assert.equal(calls, 2)
 })
 
-test('renderOutcome preserves latest reports and formats failure on exhausted audit', () => {
-  const failure = formatAuditFailure([{ phase: 'test-audit', attempts: 3, lastCause: 'process crashed' }])
-  const out = renderOutcome({
-    ticket: 't.md',
-    status: 'failed',
-    rounds: 1,
-    maxRounds: 3,
-    build: 'BUILD-REPORT-FIXED',
-    review: { clean: true, findings: [], report: 'REVIEW-REPORT-CLEAN' },
-    test: { clean: false, findings: ['prior'], report: 'TEST-REPORT-PRIOR' },
-    failure,
+test('reopening validates supplied IDs, preserves omitted ignores, and rejects confidence fields', async (t) => {
+  const { run } = await fixture(t)
+  run.findings = [{ id: 'C1', role: 'code', status: 'ignored', caller: { action: 'ignore', reason: 'out of scope' } }]
+  const a = { role: 'code', ids: [], ignored: ['C1'], obligations: ['B1'] }
+  const report = { findings: [], prior: [], report: 'reviewed' }
+  recordVerdict(run, a, report)
+  assert.equal(run.findings[0].status, 'ignored')
+  for (const prior of [[{ id: 'unknown', status: 'open', evidence: 'x' }], [{ id: 'C1', status: 'resolved', evidence: 'not assigned' }], [{ id: 'C1', status: 'open', evidence: 'x' }, { id: 'C1', status: 'open', evidence: 'duplicate' }]]) {
+    assert.throws(() => recordVerdict(run, a, { ...report, prior }))
+    assert.equal(run.findings[0].status, 'ignored')
+  }
+  assert.throws(() => recordVerdict(run, a, { ...report, findings: [{ impact: 'high', confidence: 90, location: 'x', rule: 'B1', evidence: 'x', correction: 'x' }] }), /confidence/)
+})
+
+test('guidance resumes the same fix batch without charging again; new batches still obey the cap', async (t) => {
+  const { run, exec } = await fixture(t)
+  await runCheck(host.ctx, exec, run, run.contract.checks[0])
+  cleanAudits(run)
+  run.findings = [{ id: 'C1', role: 'code', status: 'open' }]
+  run.phase = 'awaiting_decision'
+  run.maxFixRounds = 1
+  const controller = new Controller(host.ctx)
+  controller.runs.set(run.id, run)
+  let calls = 0
+  t.mock.method(controller.workers, 'builder', async () => {
+    calls += 1
+    if (calls === 1) return { outcome: 'needs-decision', summary: 'need guidance', findings: [{ id: 'C1', status: 'disputed', evidence: 'scope question' }] }
+    return { outcome: 'ready-for-audit', summary: 'implemented guidance', files: [], observations: ['checked'], findings: [{ id: 'C1', status: 'fixed', evidence: 'implemented' }] }
   })
-  assert.match(out, /stopped early — test-audit failed after 3 attempt\(s\) \(last cause: process crashed\)\. Notify the user immediately\. Do not retry build_ticket\./)
-  assert.match(out, /## Build report\n\nBUILD-REPORT-FIXED/)
-  assert.match(out, /## Code review \(clean\)\n\nREVIEW-REPORT-CLEAN/)
-  assert.match(out, /## Test audit \(1 finding\(s\)\)\n\nTEST-REPORT-PRIOR/)
-})
-
-test('config validation rejects empty prompts and negative budgets, accepts defaults', () => {
-  validateConfig(DEFAULTS)
-  assert.throws(() => validateConfig({ ...DEFAULTS, buildPersona: '  ' }), /buildPersona/)
-  assert.throws(() => validateConfig({ ...DEFAULTS, maxFixRounds: -1 }), /maxFixRounds/)
-  assert.throws(() => validateConfig({ ...DEFAULTS, deniedTools: 'x' }), /deniedTools/)
-})
-
-test('child denylist ignores parent-only and removed tool names while preserving global fan-out tools', () => {
-  const denied = filterDeniedTools(
-    ['build_ticket', 'subagent', 'subagent_fork', 'subagent_codex', 'workflow', 'ralph', 'run_code'],
-    [
-      { name: 'build_ticket' },
-      { name: 'subagent_fork' },
-      { name: 'workflow' },
-      { name: 'ralph' },
-      { name: 'bash' },
-      { name: 'run_code' },
-    ],
-  )
-  assert.deepEqual(denied, ['build_ticket', 'subagent_fork', 'workflow', 'ralph'])
-})
-
-test('child denylist safely handles empty and missing inputs', () => {
-  assert.deepEqual(filterDeniedTools([], [{ name: 'bash' }]), [])
-  assert.deepEqual(filterDeniedTools(['bash'], []), [])
-  assert.deepEqual(filterDeniedTools(undefined, [{ name: 'bash' }]), [])
-  assert.deepEqual(filterDeniedTools(['bash'], undefined), [])
-})
-
-test('build persona forbids verification claims in the report so auditors are not anchored', () => {
-  const report = DEFAULTS.buildPersona.slice(DEFAULTS.buildPersona.indexOf('## Report'), DEFAULTS.buildPersona.indexOf('## Fix rounds'))
-  assert.doesNotMatch(report, /Mutants:|Test counts/)
-  assert.match(report, /Do not include test counts.*mutation results/)
-  assert.match(DEFAULTS.testPersona, /Choose every mutation yourself/)
+  t.mock.method(controller.workers, 'auditor', async (_run, _parent, a) => ({ findings: [], prior: a.ids.map((id) => ({ id, status: 'open', evidence: 'required case is still missing' })), report: 'audited' }))
+  const decision = { run_id: run.id, revision: 1, kind: 'triage', dispositions: [{ id: 'C1', action: 'fix', reason: 'required case' }] }
+  const paused = await controller.decide(decision, exec)
+  assert.equal(run.fixRounds, 1)
+  const resumed = await controller.decide({ run_id: run.id, revision: paused.revision, kind: 'continue', instructions: 'keep the public API and correct only the implementation' }, exec)
+  assert.equal(resumed.phase, 'awaiting_decision')
+  assert.equal(run.fixRounds, 1)
+  assert.equal(calls, 2)
+  await assert.rejects(controller.decide({ ...decision, revision: resumed.revision }, exec), /budget exhausted/)
+  await assert.rejects(controller.decide({ run_id: run.id, revision: resumed.revision, kind: 'continue', instructions: 'one more fix' }, exec), /triage/)
+  assert.equal(run.fixRounds, 1)
+  assert.equal(run.revision, resumed.revision)
 })

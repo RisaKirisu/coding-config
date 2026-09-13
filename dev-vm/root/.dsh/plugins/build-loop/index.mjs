@@ -1,300 +1,79 @@
-/**
- * `build_ticket`: implement one ticket through a build child, then audit it with
- * a review child and a test child in parallel, feeding their findings back to
- * the same build child until both audits are clean or the fix budget is spent.
- * The orchestrator receives all three latest reports verbatim.
- *
- * Personas, fix budget, provider, and the child tool denylist are settings
- * (`build-loop` namespace in settings.yaml) editable from the web settings page.
- */
+/** Tool registration and settings; build policy and execution live with the controller. */
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { finalAssistantOutput } from '@deepseek-ai/dsh-subagent'
-import { foldConsumedWork } from '@deepseek-ai/dsh-agent'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import z from '@deepseek-ai/schemastery'
-import { DEFAULTS, filterDeniedTools, validateConfig } from './config.mjs'
-import {
-  VERDICT_SCHEMA,
-  auditPrompt,
-  buildPrompt,
-  evaluateAuditOutcome,
-  fixPrompt,
-  formatAuditFailure,
-  isClean,
-  renderOutcome,
-  runWithRetries,
-  textOf,
-} from './loop.mjs'
+import { Controller } from './controller.mjs'
+import { registerSettings } from './config.mjs'
+import { CONTRACT_SCHEMA, DECISION_SCHEMA, parameters } from './schemas.mjs'
 
 export const name = 'build-loop'
-export const inject = ['tools', 'subagents', 'settings', 'webServer', 'systemPrompt']
+export const inject = ['tools', 'subagents', 'settings', 'webServer', 'systemPrompt', 'tokenMeter']
 
-const SETTINGS_NS = 'build-loop'
-
-const ConfigSchema = z.object({
-  provider: z.string().default(DEFAULTS.provider),
-  maxFixRounds: z.natural().default(DEFAULTS.maxFixRounds),
-  buildPersona: z.string().default(DEFAULTS.buildPersona),
-  reviewPersona: z.string().default(DEFAULTS.reviewPersona),
-  testPersona: z.string().default(DEFAULTS.testPersona),
-  deniedTools: z.array(z.string()).default(DEFAULTS.deniedTools),
-})
-
-function json(res, status, value) {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
-  res.end(JSON.stringify(value))
+const OUTPUT = {
+  schema: { type: 'object', additionalProperties: true },
+  render: (_args, value) => [{ type: 'text', text: value.kind === 'background' ? 'Build job ' + value.jobId : value.text ?? JSON.stringify(value) }],
 }
 
-async function readJson(req) {
-  const chunks = []
-  for await (const chunk of req) chunks.push(chunk)
-  return chunks.length === 0 ? {} : JSON.parse(Buffer.concat(chunks).toString('utf8'))
-}
-
-function registerRoutes(ctx, scope) {
-  const dispose = ctx.webServer.register({
-    kind: 'exact',
-    path: '/api/build-loop/config',
-    handler: async (req, res) => {
-      if (req.method === 'GET' || req.method === 'HEAD') {
-        json(res, 200, { config: scope.get(), defaults: DEFAULTS })
-        return
-      }
-      if (req.method === 'DELETE') {
-        await scope.replace({})
-        json(res, 200, { config: scope.get(), defaults: DEFAULTS })
-        return
-      }
-      if (req.method !== 'POST') {
-        json(res, 405, { error: 'Method Not Allowed' })
-        return
-      }
-      try {
-        const next = await readJson(req)
-        validateConfig(next)
-        await scope.replace(next)
-        json(res, 200, { config: scope.get(), defaults: DEFAULTS })
-      } catch (error) {
-        json(res, 400, { error: error?.message || String(error) })
-      }
-    },
-  })
-  return dispose
-}
-
-/**
- * Child restrictions can name only global tools inherited by the child.
- * Parent-scoped and removed names are not restrictable and must be ignored.
- */
-function childToolFilter(ctx, denied) {
-  const deny = filterDeniedTools(denied, ctx.tools.schemas())
-  return deny.length === 0 ? undefined : { deny }
-}
-
-function getTurnReason(agent) {
-  if (!agent?.session) return undefined
-  try {
-    const own = agent.session.snapshotEvents()
-    return foldConsumedWork(own).end?.data.reason?.kind
-  } catch {
-    return undefined
+/** Background completion preserves the caller decision point; cancellation reaches owned work. */
+function dispatch(ctx, exec, background, label, work) {
+  if (!background) return work(exec)
+  const jobs = ctx.get('jobs')
+  if (!jobs) throw new Error('background jobs unavailable')
+  const abort = new AbortController()
+  return {
+    kind: 'background',
+    jobId: jobs.start({
+      kind: 'subagent', label, owner: exec.agent,
+      run: () => ({
+        cancel: (reason) => abort.abort(reason),
+        done: work({ ...exec, signal: abort.signal })
+          .then((value) => ({ status: abort.signal.aborted ? 'killed' : 'completed', output: value.text }))
+          .catch((error) => ({ status: abort.signal.aborted ? 'killed' : 'failed', detail: String(error) })),
+      }),
+    }),
   }
 }
 
-/** Run one audit phase with up to three launch attempts. */
-async function runAudit(ctx, base, phase, label, persona, prompt) {
-  const res = await runWithRetries(async () => {
-    const run = await ctx.subagents.start(base.provider, {
-      ...base.request,
-      label,
-      persona,
-      prompt: [{ type: 'text', text: prompt }],
-      outputSchema: VERDICT_SCHEMA,
-    })
-    try {
-      const result = await run.result
-      const turnReason = getTurnReason(run.localAgent)
-      return evaluateAuditOutcome(result, turnReason)
-    } finally {
-      await run.dispose()
-    }
-  }, { maxAttempts: 3, signal: base.request.signal })
-
-  if (res.ok) {
-    return { ok: true, phase, verdict: res.verdict }
-  }
-  return { ok: false, phase, attempts: res.attempts, lastCause: res.lastCause }
+export async function apply(ctx) {
+  const scope = await registerSettings(ctx)
+  const controller = new Controller(ctx)
+  ctx.effect(() => () => controller.workers.close(), 'build-loop workers')
+  registerTools(ctx, scope, controller)
 }
 
-/** One more turn on the live build child; returns its new final text or throws on an abnormal end. */
-async function fixTurn(agent, text) {
-  const boundary = agent.session.seq
-  agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
-  await agent.whenIdle()
-  const own = agent.session.snapshotEvents(boundary)
-  const reason = foldConsumedWork(own).end?.data.reason?.kind
-  if (reason !== 'completed') throw new Error(`build agent fix turn ended with ${reason ?? 'no turn/end'}`)
-  return textOf(finalAssistantOutput(own))
-}
-
-async function runLoop(ctx, config, { ticket, constraints, parent, signal }) {
-  const toolFilter = childToolFilter(ctx, config.deniedTools)
-  const base = { provider: config.provider, request: { parent, signal, ...(toolFilter ? { toolFilter } : {}) } }
-  const maxRounds = config.maxFixRounds
-  const state = { ticket, maxRounds, rounds: 0, build: undefined, review: undefined, test: undefined }
-
-  const buildRun = await ctx.subagents.start(config.provider, {
-    ...base.request,
-    label: `build ${ticket}`,
-    persona: config.buildPersona,
-    prompt: [{ type: 'text', text: buildPrompt({ ticket, constraints }) }],
-  })
-  const onAbort = () => buildRun.localAgent?.cancel({ kind: 'parent' })
-  signal.addEventListener('abort', onAbort, { once: true })
-  try {
-    const built = await buildRun.result
-    state.build = textOf(built.output)
-    if (built.stopReason !== 'completed') {
-      return renderOutcome({ ...state, status: 'failed', failure: `build agent ended with ${built.stopReason}${built.diagnostic ? ` (${built.diagnostic})` : ''}` })
-    }
-    if (buildRun.localAgent === undefined && maxRounds > 0) {
-      return renderOutcome({ ...state, status: 'failed', failure: `provider "${config.provider}" exposes no local agent; fix rounds need one` })
-    }
-
-    for (;;) {
-      if (signal.aborted) throw new Error('build_ticket was cancelled')
-      const audit = { ticket, constraints, buildReport: state.build, round: state.rounds + 1 }
-      const [reviewOutcome, testOutcome] = await Promise.all([
-        runAudit(ctx, base, 'review', `review ${ticket}`, config.reviewPersona, auditPrompt(audit)),
-        runAudit(ctx, base, 'test-audit', `test-audit ${ticket}`, config.testPersona, auditPrompt(audit)),
-      ])
-      if (signal.aborted) throw new Error('build_ticket was cancelled')
-
-      const failures = []
-      if (reviewOutcome.ok) {
-        state.review = reviewOutcome.verdict
-      } else {
-        failures.push(reviewOutcome)
-      }
-      if (testOutcome.ok) {
-        state.test = testOutcome.verdict
-      } else {
-        failures.push(testOutcome)
-      }
-
-      if (failures.length > 0) {
-        return renderOutcome({
-          ...state,
-          status: 'failed',
-          failure: formatAuditFailure(failures),
-        })
-      }
-
-      if (isClean(state.review, state.test)) return renderOutcome({ ...state, status: 'clean' })
-      if (state.rounds >= maxRounds) return renderOutcome({ ...state, status: 'unresolved' })
-      state.rounds += 1
-      try {
-        state.build = await fixTurn(buildRun.localAgent, fixPrompt({ review: state.review, test: state.test, round: state.rounds, maxRounds }))
-      } catch (error) {
-        return renderOutcome({ ...state, status: 'failed', failure: error.message })
-      }
-    }
-  } finally {
-    signal.removeEventListener('abort', onAbort)
-    await buildRun.dispose()
-  }
-}
-
-const DESCRIPTION = 'Implement one ticket end to end: a build agent implements it, then a code-review agent and a test-quality agent audit the result in parallel; their findings go back to the same build agent for fixing, up to the configured fix budget. Returns the build report, review report, and test report verbatim, with a clean/unresolved/failed status. Use for ticket implementation with delegated build and independent audits. This call waits for the whole loop by default; set run_in_background to get a job id.'
-
-export function apply(ctx) {
-  const scope = ctx.settings.register(SETTINGS_NS, ConfigSchema, { base: {}, validate: validateConfig })
-  ctx.effect(() => registerRoutes(ctx, scope), 'build-loop: web routes')
-
+/** Register tool interfaces independently of the HTTP carrier. */
+export function registerTools(ctx, scope, controller) {
   ctx.systemPrompt.section({
-    name: 'tool:build_ticket',
-    order: 116.7,
-    text: (context) => ctx.tools.get('build_ticket', context.scope) === undefined
-      ? ''
-      : 'Use build_ticket when the user requests a build loop or when a ticket needs to be implemented. An unresolved or failed loop is not a finished ticket.',
+    name: 'tool:build_ticket', order: 116.7,
+    text: (context) => ctx.tools.get('build_ticket', context.scope) ?
+      'Use build_ticket for ticket implementation. Supply an explicit contract: observable behaviors, approved check commands, and authorized scope. Approve the proposed approach through build_ticket_decide. Triage every open audit finding with fix or ignore and a reason; only approved fixes go to the builder. Resolve builder disputes as the caller. Auditors can reopen ignored findings with stronger evidence. Resume the same run and revision; failed or interrupted work is not complete.' : '',
   })
-
   ctx.tools.register(defineTool({
     name: 'build_ticket',
-    description: DESCRIPTION,
+    description: 'Start a supervised build and pause for caller design approval. Scope is an instruction to workers, not a filesystem restriction. Each behavior names an observation and optional approved check ID. The builder requests captured checks. Runs live in memory only; no Git, source hashing, sandboxing, or filesystem checkpoints.',
     parameters: {
-      ticket: {
-        type: 'string',
-        required: true,
-        description: 'Path to the ticket file to implement (the spec).',
-      },
-      constraints: {
-        type: 'string',
-        description: 'Extra caller constraints for the build agent beyond the ticket text.',
-      },
-      run_in_background: {
-        type: 'boolean',
-        description: 'Return a job id immediately instead of waiting; collect with job_output. Defaults to false.',
-      },
+      ticket: { type: 'string', required: true, description: 'Ticket path in the calling workspace.' },
+      contract: { type: 'object', properties: parameters(CONTRACT_SCHEMA), additionalProperties: false, required: true },
+      run_in_background: { type: 'boolean' },
     },
-    output: {
-      schema: {
-        oneOf: [
-          {
-            type: 'object',
-            additionalProperties: false,
-            properties: {
-              kind: { type: 'string', required: true, const: 'background' },
-              jobId: { type: 'string', required: true },
-            },
-          },
-          {
-            type: 'object',
-            additionalProperties: false,
-            properties: {
-              kind: { type: 'string', required: true, const: 'foreground' },
-              text: { type: 'string', required: true },
-            },
-          },
-        ],
-      },
-      render: (_args, value) => [{
-        type: 'text',
-        text: value.kind === 'background' ? `started background build loop job ${value.jobId}` : value.text,
-      }],
-    },
-    isConcurrencySafe: () => true,
+    output: OUTPUT,
     async execute(args, exec) {
-      const parent = exec.agent
-      if (!parent) throw new Error('build_ticket requires a calling agent')
-      const ticket = String(args.ticket ?? '').trim()
-      if (ticket.length === 0) throw new Error('ticket must be a non-empty path')
-      const config = scope.get()
-      const input = { ticket, constraints: args.constraints?.trim() || undefined, parent }
-
-      if (args.run_in_background === true) {
-        const jobs = ctx.get('jobs')
-        if (jobs === undefined) throw new Error('background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs')
-        return {
-          kind: 'background',
-          jobId: jobs.start({
-            kind: 'subagent',
-            label: `build_ticket ${ticket}`,
-            owner: parent,
-            run: () => {
-              const controller = new AbortController()
-              return {
-                cancel: (reason) => controller.abort(reason ?? 'build loop killed'),
-                done: runLoop(ctx, config, { ...input, signal: controller.signal })
-                  .then((text) => ({ status: 'completed', output: text }))
-                  .catch((error) => controller.signal.aborted ? { status: 'killed' } : { status: 'failed', detail: String(error) }),
-              }
-            },
-          }),
-        }
-      }
-      return { kind: 'foreground', text: await runLoop(ctx, config, { ...input, signal: exec.signal }) }
+      if (!exec.agent) throw new Error('build_ticket requires a calling agent')
+      if (!args.ticket.trim()) throw new Error('ticket must be nonempty')
+      return dispatch(ctx, exec, args.run_in_background, 'build ' + args.ticket, (execution) => controller.start(args, execution, scope.get()))
     },
-    presentCall: (args) => ({ card: 'generic', title: `build_ticket ${args.ticket}`, kind: 'other', rawInput: args }),
+  }))
+  ctx.tools.register(defineTool({
+    name: 'build_ticket_decide',
+    description: 'Resume an in-memory run with its exact decision revision. approve_design/revise_design answer an approach; triage requires dispositions [{id, action: fix|ignore, reason}] for every open finding and sends only approved fixes to the builder; continue supplies guidance or resumes an already approved task, not new untriaged fixes; ask questions a worker; accept requires checks and audits for the current attempt and no open findings; abandon stops; inspect reads state. Builder disputes remain open until caller decision; ignored findings may reopen with stronger auditor evidence. Host restart loses runs.',
+    parameters: parameters(DECISION_SCHEMA), output: OUTPUT,
+    async execute(args, exec) {
+      if (!exec.agent) throw new Error('build_ticket_decide requires a calling agent')
+      return dispatch(ctx, exec, args.run_in_background, 'build decision ' + args.run_id, (execution) => controller.decide(args, execution))
+    },
+  }))
+  ctx.tools.register(defineTool({
+    name: 'build_ticket_check',
+    description: 'Implementing build worker only: execute an approved check by ID through the controller. Returns captured exit, duration, stdout and stderr from the native bash tool. Use this instead of repeating the same command through bash.',
+    parameters: { check_id: { type: 'string', required: true } }, output: OUTPUT,
+    execute: (args, exec) => controller.check(args.check_id, exec),
   }))
 }

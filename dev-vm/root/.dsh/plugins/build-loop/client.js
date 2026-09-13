@@ -28,12 +28,6 @@ window.__ModuleLoader__.load({
       .bl-flow code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dsw-alias-label-primary,#1c1c1e)}
     `;
 
-    const PERSONAS = [
-      { key: 'buildPersona', label: 'Build agent prompt', hint: 'implements the ticket; receives fix rounds' },
-      { key: 'reviewPersona', label: 'Review agent prompt', hint: 'spec + standards + simplicity; reports only' },
-      { key: 'testPersona', label: 'Test agent prompt', hint: 'behavior vs implementation, no hand-rolled mocks, mutation tests' },
-    ];
-
     function Field(props) {
       return React.createElement(
         'div',
@@ -84,10 +78,10 @@ window.__ModuleLoader__.load({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(state.config),
-      }, 'Saved. Applies to the next build_ticket call.');
+      }, 'Saved. Applies to new runs.');
 
       const resetAll = () => {
-        if (!window.confirm('Discard every override and return all prompts and flow settings to defaults?')) return;
+        if (!window.confirm('Discard every override and return the flow settings to defaults?')) return;
         commit({ method: 'DELETE' }, 'All settings reset to defaults.');
       };
 
@@ -102,15 +96,16 @@ window.__ModuleLoader__.load({
         { className: 'bl-page' },
         React.createElement('style', null, CSS),
         React.createElement('h2', { className: 'bl-title' }, 'Build Loop'),
-        React.createElement('p', { className: 'bl-subtitle' }, 'Prompts and flow for the build_ticket tool: build → review ‖ test → fix, repeated until clean or the fix budget is spent. Saved values are read at the start of each build_ticket call.'),
+        React.createElement('p', { className: 'bl-subtitle' }, 'Flow settings for the build_ticket run. Worker prompts are the instructions/*.md files in the plugin directory, read when a run starts. The caller approves the approach, chooses fixes or ignores, and accepts the result; builder disputes return to the caller. Runs live in memory. Settings are copied when a run starts.'),
         React.createElement(
           'div',
           { className: 'bl-card' },
           React.createElement('ol', { className: 'bl-flow' },
-            React.createElement('li', null, 'Build agent implements the ticket and returns its report.'),
-            React.createElement('li', null, 'Review agent and test agent audit in parallel, each returning ', React.createElement('code', null, '{clean, findings, report}'), '.'),
-            React.createElement('li', null, 'Both clean → all three reports return to the orchestrator. Otherwise findings go back to the same build agent as a fix round.'),
-            React.createElement('li', null, 'After ', React.createElement('code', null, String(c.maxFixRounds)), ' fix round(s) the current state is reported as unresolved.'),
+            React.createElement('li', null, 'Builder proposes an approach; the run pauses for the caller\'s approval.'),
+            React.createElement('li', null, 'Builder implements and simplifies; approved checks run through build_ticket_check, and a failing check returns to the builder (two retries).'),
+            React.createElement('li', null, 'Code and test auditors inspect in parallel, internally score confidence from 0 to 100, and report findings above 75 with impact only.'),
+            React.createElement('li', null, 'The caller approves fixes or ignores with reasons, up to ', React.createElement('code', null, String(c.maxFixRounds)), ' fix rounds. Builder disputes pause; ignored findings may reopen with stronger auditor evidence.'),
+            React.createElement('li', null, 'The builder receives its full instructions again after compaction and every ', React.createElement('code', null, String(c.reminderTokens)), ' new context tokens.'),
           ),
         ),
         React.createElement(
@@ -119,20 +114,16 @@ window.__ModuleLoader__.load({
           React.createElement(
             'div',
             { className: 'bl-row' },
-            React.createElement(Field, { label: 'Max fix rounds', hint: '0 = audit once, never fix', modified: c.maxFixRounds !== d.maxFixRounds, onReset: () => patch('maxFixRounds', d.maxFixRounds) },
+            React.createElement(Field, { label: 'Max fix rounds', hint: 'builder fix rounds per run', modified: c.maxFixRounds !== d.maxFixRounds, onReset: () => patch('maxFixRounds', d.maxFixRounds) },
               React.createElement('input', { className: 'bl-input', type: 'number', min: 0, step: 1, value: c.maxFixRounds, onChange: (event) => patch('maxFixRounds', Math.max(0, Math.floor(Number(event.target.value) || 0))) })),
-            React.createElement(Field, { label: 'Subagent provider', hint: 'must support persona + structured output (spawn)', modified: c.provider !== d.provider, onReset: () => patch('provider', d.provider) },
+            React.createElement(Field, { label: 'Builder reminder tokens', hint: 'new context tokens between full instruction reminders', modified: c.reminderTokens !== d.reminderTokens, onReset: () => patch('reminderTokens', d.reminderTokens) },
+              React.createElement('input', { className: 'bl-input', type: 'number', min: 1000, step: 1000, value: c.reminderTokens, onChange: (event) => patch('reminderTokens', Math.max(1000, Math.floor(Number(event.target.value) || 0))) })),
+            React.createElement(Field, { label: 'Subagent provider', hint: 'must expose a local agent for follow-up turns (spawn)', modified: c.provider !== d.provider, onReset: () => patch('provider', d.provider) },
               React.createElement('input', { className: 'bl-input', type: 'text', value: c.provider, onChange: (event) => patch('provider', event.target.value) })),
           ),
           React.createElement(Field, { label: 'Tools denied to every child', hint: 'one name per line; names the child cannot see are ignored', modified: c.deniedTools.join('\n') !== d.deniedTools.join('\n'), onReset: () => patch('deniedTools', d.deniedTools) },
             React.createElement('textarea', { className: 'bl-textarea', style: { minHeight: '120px' }, value: c.deniedTools.join('\n'), onChange: (event) => patch('deniedTools', event.target.value.split('\n').map((line) => line.trim()).filter(Boolean)) })),
         ),
-        ...PERSONAS.map((persona) => React.createElement(
-          'div',
-          { className: 'bl-card', key: persona.key },
-          React.createElement(Field, { label: persona.label, hint: persona.hint, modified: c[persona.key] !== d[persona.key], onReset: () => patch(persona.key, d[persona.key]) },
-            React.createElement('textarea', { className: 'bl-textarea', value: c[persona.key], spellCheck: false, onChange: (event) => patch(persona.key, event.target.value) })),
-        )),
         React.createElement(
           'div',
           { className: 'bl-actions' },

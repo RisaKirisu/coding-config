@@ -1,17 +1,25 @@
 {
   "name": "@devvm/dsh-build-loop",
-  "version": "1.0.0",
-  "description": "build_ticket tool: build agent, then parallel review and test audits with a bounded fix loop, plus a web settings page for its prompts and flow",
+  "version": "2.2.0",
+  "description": "build_ticket and build_ticket_decide: a supervised build run with caller-approved design, controller-run checks, parallel read-only audits, caller triage, and a bounded fix budget, plus a web settings page for its flow settings; worker prompts are the instructions/*.md files",
   "type": "module",
   "main": "./index.mjs",
   "files": [
     "index.mjs",
+    "controller.mjs",
+    "workers.mjs",
     "loop.mjs",
+    "checks.mjs",
+    "schemas.mjs",
+    "assignments.mjs",
     "config.mjs",
     "prompts.mjs",
+    "instructions/",
     "client.js",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "test.mjs",
+    "test-runtime.mjs"
   ],
   "scripts": {
     "test": "node --test test.mjs"
@@ -34,7 +42,9 @@
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-agent": "^0.1.2-rc.1",
     "@deepseek-ai/dsh-llm": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-scope": "^0.1.2-rc.1",
     "@deepseek-ai/dsh-subagent": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-token-meter": "^0.1.2-rc.1",
     "@deepseek-ai/dsh-tools": "^0.1.2-rc.1",
     "@deepseek-ai/schemastery": "^3.18.1"
   },
