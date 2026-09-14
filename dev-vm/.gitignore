@@ -30,3 +30,6 @@ root/.logs/
 
 # Agent exploration
 .agents/exploration/
+
+# MISC
+.DS_Store
