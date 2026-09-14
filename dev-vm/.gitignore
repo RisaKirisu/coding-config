@@ -21,7 +21,7 @@ root/.dsh/storages/
 root/.dsh/plugins/subscriptions/
 root/.dsh/.anonymous-user-id
 root/.dsh/attachments
-thinking-effort-loaded.json
+**/thinking-effort-loaded.json
 
 # Project logs
 root/.project-logs/
