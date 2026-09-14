@@ -44,7 +44,7 @@ export function registerTools(ctx, scope, controller) {
   ctx.systemPrompt.section({
     name: 'tool:build_ticket', order: 116.7,
     text: (context) => ctx.tools.get('build_ticket', context.scope) ?
-      'Use build_ticket for ticket implementation. Supply an explicit contract: observable behaviors, approved check commands, and authorized scope. Approve the proposed approach through build_ticket_decide. Triage every open audit finding with fix or ignore and a reason; only approved fixes go to the builder. Resolve builder disputes as the caller. Auditors can reopen ignored findings with stronger evidence. Resume the same run and revision; failed or interrupted work is not complete. When a build_ticket or build_ticket_decide call would block you, run it with run_in_background and end your turn; you will be notified after the call finishes.' : '',
+      'Implement simple changes directly. Create tickets and use build_ticket for ticket implementation when user requests. A run that failed or was interrupted is not complete. build_ticket and build_ticket_decide can block for a long time: run them with run_in_background and end your turn; you will be notified when the call finishes.' : '',
   })
   ctx.tools.register(defineTool({
     name: 'build_ticket',
