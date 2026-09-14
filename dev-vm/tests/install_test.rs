@@ -93,11 +93,11 @@ fn test_web_profile_third_party_plugin_pins() {
     assert_eq!(
         deps.get("@hytime/dsh-thinking-effort")
             .and_then(|v| v.as_str()),
-        Some("^0.2.0")
+        Some("^0.2.4")
     );
     assert_eq!(
         deps.get("dsh-better-sidebar").and_then(|v| v.as_str()),
-        Some("^0.18.0")
+        Some("^0.19.1")
     );
 }
 

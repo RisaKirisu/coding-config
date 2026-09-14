@@ -13,8 +13,11 @@ export const HEAD_MARKER_NAME = '.sync-head.json';
 /**
  * Sessions and attachment objects transfer as a union: additions only, never shrinking.
  * `--append-verify` is correct because session logs are byte-append-only.
+ * `session.lock` is the per-session kernel flock file DSH 0.1.5 holds while a
+ * runtime owns the session; it is not state and stays local.
  */
 export const UNION_FILTER_ARGS = [
+  '--exclude=session.lock',
   '--include=sessions/***',
   '--include=attachments/',
   '--include=attachments/v1/',

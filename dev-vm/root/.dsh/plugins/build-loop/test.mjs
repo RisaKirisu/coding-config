@@ -127,6 +127,13 @@ test('real child failure keeps the one builder in memory and writes no checkpoin
   run.phase = 'awaiting_design'
   run.task = { phase: 'approach', ids: [] }
   run.handoff = { outcome: 'approach', report: 'use a direct loop', files: ['sample.mjs'] }
+  // Registered before the Controller so this listener wraps the plugin's pre-step handler and sees its final decision.
+  const decisions = []
+  t.after(host.ctx.on('agent/pre-step', async (payload, next) => {
+    const decision = await next()
+    decisions.push({ sessionId: payload.agent.session.id, decision })
+    return decision
+  }, { global: true }))
   const controller = new Controller(host.ctx)
   controller.runs.set(run.id, run)
   run.policy.reminderTokens = 1
@@ -151,11 +158,14 @@ test('real child failure keeps the one builder in memory and writes no checkpoin
   assert.equal(controller.workers.active.size, 1)
   assert.deepEqual(await fs.readdir(run.cwd), [])
   await assert.rejects(new Controller(host.ctx).decide({ run_id: run.id, revision: run.revision, kind: 'inspect' }, exec), /unknown run/)
+  // The retry is a follow-up turn on the same builder; with a 1-token threshold its pre-step injects one reminder from ctx.tokenMeter pressure.
+  // Pressure is estimated from the logged surface, and a provider-less step logs its messages only after the request is prepared,
+  // so the fixture logs one message itself and reads the reminder from the captured pre-step decision.
+  const builder = controller.workers.builders.get(run.id)
+  builder.child.localAgent.session.append('user/message', { role: 'user', content: [{ type: 'text', text: 'logged surface' }] }, { surfaceOp: 'append' })
   await controller.decide({ run_id: run.id, revision: run.revision, kind: 'continue', instructions: 'retry' }, exec)
   assert.equal(started.mock.calls.length, 1)
-  // The retry is a follow-up turn on the same builder; with a 1-token threshold its pre-step injects one reminder from ctx.tokenMeter pressure.
-  const builder = controller.workers.builders.get(run.id)
-  const texts = builder.child.localAgent.session.deriveMessages().map((m) => m.content.map((c) => c.text ?? '').join(''))
+  const texts = decisions.filter((d) => d.sessionId === builder.child.localAgent.session.id).flatMap((d) => d.decision.messages ?? []).map((m) => m.content.map((c) => c.text ?? '').join(''))
   assert.equal(texts.filter((text) => text.includes('<system_reminder>')).length, 1)
   assert.ok(builder.remindedAt > 0)
   assert.equal((await controller.decide({ run_id: run.id, revision: run.revision, kind: 'abandon' }, exec)).phase, 'abandoned')

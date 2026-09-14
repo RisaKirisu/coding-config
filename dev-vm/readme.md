@@ -68,9 +68,9 @@ Use a named Control Daemon URL that shares the Project URL's parent site:
 
 `control.devvm.localhost` is not a Caddy route or an explicit daemon hostname. Browsers and modern resolvers map every `.localhost` name to loopback, and the Control Daemon's `127.0.0.1:8100` listener accepts that Host header. Remote access routes through host-side Caddy, which terminates HTTPS on the configured Tailscale IP and proxies to the loopback listeners.
 
-The named URL is required for one-click DSH launch links under DSH `0.1.2-rc.1`. That release exchanges `/?token=<token>` for an `HttpOnly; SameSite=Strict` authority cookie, then redirects to `/`. A Control page opened at `127.0.0.1:8100`, `localhost:8100`, or a raw IP is cross-site relative to `*.devvm.localhost` or `*.risak.dev`; browsers store the cookie but withhold it on the redirect, and DSH responds with `dsh web authentication required`. The corresponding named Control and Project URLs share their parent domain and are same-site, so the redirect carries the cookie and succeeds.
+The named URL is required for one-click DSH launch links under DSH `0.1.5-rc.2`. That release exchanges `/?token=<token>` for an `HttpOnly; SameSite=Strict` authority cookie, then redirects to `/`. A Control page opened at `127.0.0.1:8100`, `localhost:8100`, or a raw IP is cross-site relative to `*.devvm.localhost` or `*.risak.dev`; browsers store the cookie but withhold it on the redirect, and DSH responds with `dsh web authentication required`. The corresponding named Control and Project URLs share their parent domain and are same-site, so the redirect carries the cookie and succeeds.
 
-The raw-IP and bare-localhost Control URLs remain usable for daemon management, but their Open DSH links have this DSH `0.1.2-rc.1` browser-auth limitation.
+The raw-IP and bare-localhost Control URLs remain usable for daemon management, but their Open DSH links have this DSH `0.1.5-rc.2` browser-auth limitation.
 
 The Web UI allows you to:
 1. Browse directories beneath `$HOME` and register Projects (creating or reading `.devvm-id`).

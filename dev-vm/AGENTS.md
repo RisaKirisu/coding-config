@@ -26,7 +26,7 @@ Lifecycle test fakes must isolate guest PID files and never evaluate commands ag
 
 ### Control Daemon browser origin
 
-For Control Daemon URLs, DSH launch links, browser authentication, or ingress changes, read ADR 0002. With DSH `0.1.2-rc.1`, use `http://control.devvm.localhost:8100` locally and `https://devvm.<remote-domain>` (default: `https://devvm.risak.dev`) over the tailnet: DSH exchanges its launch token for a `SameSite=Strict` cookie, so the Control and Project URLs must be same-site. Raw IP and bare `localhost` URLs remain management-only aliases because their Open DSH navigation is cross-site. Port `8100` reaches the Control Daemon directly locally (or via Host Caddy proxy remotely); Project URLs traverse FRP and Caddy.
+For Control Daemon URLs, DSH launch links, browser authentication, or ingress changes, read ADR 0002. With DSH `0.1.5-rc.2`, use `http://control.devvm.localhost:8100` locally and `https://devvm.<remote-domain>` (default: `https://devvm.risak.dev`) over the tailnet: DSH exchanges its launch token for a `SameSite=Strict` cookie, so the Control and Project URLs must be same-site. Raw IP and bare `localhost` URLs remain management-only aliases because their Open DSH navigation is cross-site. Port `8100` reaches the Control Daemon directly locally (or via Host Caddy proxy remotely); Project URLs traverse FRP and Caddy.
 
 Host ingress has one configuration source: `scripts/Caddyfile.host`. Setup prints it; integration tests load it directly. Read `docs/remote-access.md` before changing setup or ingress. Report HTTP cookie-replay checks separately from browser HTTPS/SameSite verification.
 

@@ -7,8 +7,8 @@
     "@devvm/dsh-style-control": "link:/root/.dsh/plugins/style-control",
     "@devvm/dsh-subagent-manager": "link:/root/.dsh/plugins/subagent-manager",
     "@devvm/dsh-voice-input": "link:/root/.dsh/plugins/voice-input",
-    "@hytime/dsh-thinking-effort": "^0.2.0",
-    "dsh-better-sidebar": "^0.18.0",
+    "@hytime/dsh-thinking-effort": "^0.2.4",
+    "dsh-better-sidebar": "^0.19.1",
     "dsh-skill-mcp-panel": "link:/root/.dsh/plugins/dsh-skill-mcp-panel"
   },
   "dsh": {

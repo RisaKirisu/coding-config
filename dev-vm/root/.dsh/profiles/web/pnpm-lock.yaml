@@ -27,11 +27,11 @@ importers:
         specifier: link:/root/.dsh/plugins/voice-input
         version: link:../../plugins/voice-input
       '@hytime/dsh-thinking-effort':
-        specifier: ^0.2.0
-        version: 0.2.0
+        specifier: ^0.2.4
+        version: 0.2.4
       dsh-better-sidebar:
-        specifier: ^0.18.0
-        version: 0.18.0
+        specifier: ^0.19.1
+        version: 0.19.1
       dsh-skill-mcp-panel:
         specifier: link:/root/.dsh/plugins/dsh-skill-mcp-panel
         version: link:../../plugins/dsh-skill-mcp-panel
@@ -116,8 +116,15 @@ packages:
   '@codemirror/view@6.43.11':
     resolution: {integrity: sha512-2+esucbQX6wB2JYi1eDvdCPFTA31BN8oSy6xCmk3G6CloV11yOvEjYk+gH7kLrP0MuHG94E8WDhjs5oMiu3+Wg==}
 
-  '@hytime/dsh-thinking-effort@0.2.0':
-    resolution: {integrity: sha512-0SPeH0yf6kKLP9DGIQpwQ/OZsHUf80q++4aO9OvzaVRlOnTg/FzWhZFO6mjCwEXOqJ6oALxeSgixVwr+/AmLmg==}
+  '@deepseek-ai/cosmokit@1.8.3':
+    resolution: {integrity: sha512-qBo+ronVM6Eu2WNVJXi8JcMiqZ19T9BRIpV+5qJUFPXjGH/Z0QKcQMC/IZJ7L394YTOtJgcovbk9qP0w2GsBXQ==}
+
+  '@deepseek-ai/schemastery@3.18.2':
+    resolution: {integrity: sha512-njDtZsznjYxok7KLLlHOPyuv2efdWVbSflAHgztSfbMsg+CVraEoRe2DjOCgClYv3ZCSm7WXoaUkbB/+RY7tWQ==}
+
+  '@hytime/dsh-thinking-effort@0.2.4':
+    resolution: {integrity: sha512-/NIw8koZvjXRTN8FPTszvlxpxvED322th7Zpjrqmh3WXY2hrrKqObZcW9XlQf5ctmH/YVxpL9peXpgcVkmHiUA==}
+    engines: {dsh: '>=0.1.0-rc.7'}
     peerDependencies:
       '@deepseek-ai/cordis': ^4.0.1
 
@@ -475,28 +482,31 @@ packages:
   dompurify@3.4.14:
     resolution: {integrity: sha512-dVoH9z+MY+C9IilgGCk3YfFqjLi3fChm2OiKJMzh6axrJ5qwxqWaZamgmHrpv22CN/KdbZJuGEGgfQoL00LTdg==}
 
-  dsh-better-sidebar@0.18.0:
-    resolution: {integrity: sha512-6sGUIpgrFLXikACKBXLSiyngULceZCIr5M4bLw2IdCJ3KWHcbNsJJl+TLHJw0lM9voRw0etbr5fC16VQ9YvshQ==}
+  dsh-better-sidebar@0.19.1:
+    resolution: {integrity: sha512-Jr0tPJoDKUVkq+fioL6Td+YwXZ+PULx3CnBJ4iktaQGNP5y9hgpz6V7o7f4Yh2czheVKZsewurqCaiN10GQYeQ==}
     engines: {node: '>=20'}
     peerDependencies:
       '@deepseek-ai/cordis': ^4.0.2
-      '@deepseek-ai/dsh-agent': ^0.1.2-rc.1
-      '@deepseek-ai/dsh-client-locale': ^0.1.2-rc.1
-      '@deepseek-ai/dsh-client-ui-conversation': ^0.1.2-rc.1
-      '@deepseek-ai/dsh-client-ui-primitives': ^0.1.2-rc.1
-      '@deepseek-ai/dsh-client-ui-settings': ^0.1.2-rc.1
-      '@deepseek-ai/dsh-client-ui-slots': ^0.1.2-rc.1
-      '@deepseek-ai/dsh-host-webserver': ^0.1.2-rc.1
-      '@deepseek-ai/dsh-invariants': ^0.1.2-rc.1
-      '@deepseek-ai/dsh-llm': ^0.1.2-rc.1
-      '@deepseek-ai/dsh-session': ^0.1.2-rc.1
-      '@deepseek-ai/dsh-settings': ^0.1.2-rc.1
-      '@deepseek-ai/dsh-subagent': ^0.1.2-rc.1
-      '@deepseek-ai/dsh-tools': ^0.1.2-rc.1
+      '@deepseek-ai/dsh-agent': ^0.1.5-rc.1
+      '@deepseek-ai/dsh-client-locale': ^0.1.5-rc.1
+      '@deepseek-ai/dsh-client-ui-conversation': ^0.1.5-rc.1
+      '@deepseek-ai/dsh-client-ui-primitives': ^0.1.5-rc.1
+      '@deepseek-ai/dsh-client-ui-settings': ^0.1.5-rc.1
+      '@deepseek-ai/dsh-client-ui-sidebar-right': ^0.1.5-rc.1
+      '@deepseek-ai/dsh-client-ui-slots': ^0.1.5-rc.1
+      '@deepseek-ai/dsh-host-webserver': ^0.1.5-rc.1
+      '@deepseek-ai/dsh-invariants': ^0.1.5-rc.1
+      '@deepseek-ai/dsh-llm': ^0.1.5-rc.1
+      '@deepseek-ai/dsh-session': ^0.1.5-rc.1
+      '@deepseek-ai/dsh-settings': ^0.1.5-rc.1
+      '@deepseek-ai/dsh-subagent': ^0.1.5-rc.1
+      '@deepseek-ai/dsh-tools': ^0.1.5-rc.1
       '@huanlin/dsh-plugin-better-locale': ^0.1.0
       react: ^18.2.0
       react-dom: ^18.2.0
     peerDependenciesMeta:
+      '@deepseek-ai/dsh-client-ui-sidebar-right':
+        optional: true
       '@huanlin/dsh-plugin-better-locale':
         optional: true
 
@@ -809,7 +819,16 @@ snapshots:
       style-mod: 4.1.3
       w3c-keyname: 2.2.8
 
-  '@hytime/dsh-thinking-effort@0.2.0': {}
+  '@deepseek-ai/cosmokit@1.8.3': {}
+
+  '@deepseek-ai/schemastery@3.18.2':
+    dependencies:
+      '@deepseek-ai/cosmokit': 1.8.3
+      '@standard-schema/spec': 1.1.0
+
+  '@hytime/dsh-thinking-effort@0.2.4':
+    dependencies:
+      '@deepseek-ai/schemastery': 3.18.2
 
   '@iconify/types@2.0.0': {}
 
@@ -1253,7 +1272,7 @@ snapshots:
     optionalDependencies:
       '@types/trusted-types': 2.0.7
 
-  dsh-better-sidebar@0.18.0:
+  dsh-better-sidebar@0.19.1:
     dependencies:
       '@codemirror/commands': 6.11.0
       '@codemirror/lang-cpp': 6.0.3

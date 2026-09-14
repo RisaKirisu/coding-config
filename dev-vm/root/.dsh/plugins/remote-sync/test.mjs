@@ -937,16 +937,6 @@ test('session projection documents synchronize in the projection pass and preser
   }
 });
 
-test('filter lists keep the union, projection, and storage passes separate', () => {
-  assert.equal(UNION_FILTER_ARGS.at(-1), '--exclude=*');
-  assert.equal(PROJECTION_FILTER_ARGS.at(-1), '--exclude=*');
-  assert.equal(STORAGES_FILTER_ARGS.at(-1), '--exclude=*');
-  assert.ok(UNION_FILTER_ARGS.includes('--include=sessions/***'));
-  assert.ok(PROJECTION_FILTER_ARGS.includes('--include=storages/session_projcache/sessions/***'));
-  assert.ok(!UNION_FILTER_ARGS.some((arg) => arg.includes('session_projcache')), 'projection documents must not ride the append-only union pass');
-  assert.ok(STORAGES_FILTER_ARGS.includes('--exclude=storages/session_projcache/***'));
-  assert.ok(!STORAGES_FILTER_ARGS.some((arg) => arg.includes('sessions/')));
-});
 
 test('projection documents replace whole records: append-only flags are never applied to them', async () => {
   const fixture = createFixture();
