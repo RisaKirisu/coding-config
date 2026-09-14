@@ -1,6 +1,6 @@
 ---
 name: developer
-description: Developer guidelines. Agent MUST load this skill IMMEDIATELY when its full context is not already present. Other agents should NOT load it unless explicitly asked. YOU MUST LOAD THIS IMMEDIATELY AT EARLIEST POSSIBLE CHANCE IF YOU ARE A CODING AGENT.
+description: Developer guidelines. DSH coding agents should load this IMMEDIATELY. Exception - Subagents do NOT load, subagents like build agent, review agent, test audit agent should NOT load this.
 ---
 
 ## Subagent Strategy

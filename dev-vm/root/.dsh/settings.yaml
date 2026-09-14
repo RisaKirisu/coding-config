@@ -1,8 +1,9 @@
 ui-onboarding:
   welcomeNoticeVersion: 2026-08-13.1
 agent-default-model:
-  provider: proxy-cli
-  model: "gemini-3.8-flash-high"
+  provider: deepseek-official
+  model: "deepseek-flash"
+  reasoningEffort: max
 llm-pi-ai:
   providers:
     krill-codex:
@@ -12,7 +13,7 @@ llm-pi-ai:
       baseURL: https://api.krill-code.net/codex/v1
       models:
         - id: gpt-5.6-sol
-          contextWindow: 1000000
+          contextWindow: 300000
           input:
             - text
             - image
@@ -42,7 +43,7 @@ llm-pi-ai:
             chatTemplateKwargs: {}
             chatTemplateArgs: {}
         - id: gpt-6-astra
-          contextWindow: 500000
+          contextWindow: 300000
           input:
             - text
             - image
@@ -86,28 +87,26 @@ llm-pi-ai:
           compat:
             chatTemplateKwargs: {}
             chatTemplateArgs: {}
-        - id: deepseek-v4-flash-0731
-          contextWindow: 1000000
+        - id: deepseek-v4.1-flash
+          contextWindow: 300000
           input: []
-          reasoningEfforts:
-            off: null
-            low: low
-            high: high
-            max: max
           compat:
             chatTemplateKwargs: {}
             chatTemplateArgs: {}
-        - id: deepseek-v4-pro-0813
-          contextWindow: 1000000
-          input: []
           reasoningEfforts:
             off: null
             high: high
             max: max
+        - id: GLM-5.3
+          input: []
           compat:
             chatTemplateKwargs: {}
             chatTemplateArgs: {}
-        - id: gemini-3.8-flash
+          reasoningEfforts:
+            off: null
+            high: high
+            max: max
+        - id: GLM-5.3-Flash
           input: []
           compat:
             chatTemplateKwargs: {}
@@ -201,7 +200,7 @@ llm-pi-ai:
             chatTemplateKwargs: {}
             chatTemplateArgs: {}
         - id: gpt-5.6-sol
-          contextWindow: 1000000
+          contextWindow: 300000
           input:
             - text
             - image
@@ -216,7 +215,7 @@ llm-pi-ai:
             chatTemplateKwargs: {}
             chatTemplateArgs: {}
         - id: gemini-3.8-flash-high
-          contextWindow: 1000000
+          contextWindow: 300000
           input:
             - text
             - image
@@ -242,7 +241,7 @@ llm-pi-ai:
             chatTemplateKwargs: {}
             chatTemplateArgs: {}
         - id: gpt-6-astra
-          contextWindow: 499999
+          contextWindow: 300000
           input:
             - text
             - image
@@ -348,8 +347,8 @@ ui-theme:
   preference: system
 
 subagent-model:
-  provider: "deepseek-official"
-  model: "deepseek-flash"
+  provider: "proxy-cli"
+  model: "gemini-3.8-flash-high"
   reasoningEffort: "high"
 build-loop: {}
 llm-deepseek:
@@ -358,7 +357,7 @@ llm-deepseek:
       name: DeepSeek-V4.1-Flash
       description: Fast, efficient, and economical; suited to focused, routine, or
         parallel tasks.
-      contextWindow: 1000000
+      contextWindow: 300000
       inputModalities:
         - text
     - id: deepseek-v4-pro
