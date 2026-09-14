@@ -5,6 +5,10 @@ import { CONTRACT_SCHEMA, HANDOFF_SCHEMA, VERDICT_SCHEMA, DECISION_SCHEMA } from
 export const ROLES = ['code', 'test']
 export const textOf = (blocks) => typeof blocks === 'string' ? blocks : (blocks ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('')
 
+export function recordUpdate(run, update) {
+  run.updates.push(structuredClone(update))
+}
+
 export function validate(schema, value) {
   if (value && typeof value === 'object' && typeof value.blocked === 'string' && !value.blocked.trim()) {
     delete value.blocked
@@ -96,17 +100,24 @@ export function validateVerdict(run, assignment, verdict) {
 
 export function recordVerdict(run, assignment, verdict) {
   validateVerdict(run, assignment, verdict)
+  const firstFinding = run.findings.length
   run.audits.push({ ...assignment, attempt: run.attempt, report: verdict.report, failure: verdict.blocked ?? null })
-  if (verdict.blocked) return
-  for (const prior of verdict.prior) {
-    const f = run.findings.find((f) => f.id === prior.id)
-    f.verified = prior
-    f.status = prior.status === 'resolved' ? 'closed' : 'open'
+  if (!verdict.blocked) {
+    for (const prior of verdict.prior) {
+      const f = run.findings.find((f) => f.id === prior.id)
+      f.verified = prior
+      f.status = prior.status === 'resolved' ? 'closed' : 'open'
+    }
+    for (const f of verdict.findings) {
+      const id = (assignment.role === 'code' ? 'C' : 'T') + (run.findings.filter((f) => f.role === assignment.role).length + 1)
+      run.findings.push({ ...f, id, role: assignment.role, status: 'open' })
+    }
   }
-  for (const f of verdict.findings) {
-    const id = (assignment.role === 'code' ? 'C' : 'T') + (run.findings.filter((f) => f.role === assignment.role).length + 1)
-    run.findings.push({ ...f, id, role: assignment.role, status: 'open' })
-  }
+  recordUpdate(run, {
+    type: 'audit', role: assignment.role, attempt: run.attempt,
+    report: verdict.report, blocked: verdict.blocked ?? null,
+    prior: verdict.prior, findings: run.findings.slice(firstFinding),
+  })
 }
 
 /** Apply only caller-approved dispositions, after validating the entire batch. */

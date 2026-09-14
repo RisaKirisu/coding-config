@@ -1,12 +1,13 @@
 /** Approved checks use the existing bash tool. Results stay with the in-memory run. */
 import { randomUUID } from 'node:crypto'
+import { recordUpdate } from './loop.mjs'
 
 export async function runCheck(ctx, exec, run, check) {
   const startedAt = Date.now()
   const result = await ctx.tools.execute({
     callId: randomUUID(), name: 'bash', parent: exec.token, rootCallId: exec.rootCallId,
     agent: exec.agent, signal: exec.signal,
-    arguments: { command: check.command, workdir: run.cwd, description: 'Run approved build verification check', timeoutMs: 30 * 60 * 1000 },
+    arguments: { command: check.command, workdir: run.cwd, description: 'Run approved build verification check' },
   })
   const value = result.isError ? undefined : result.value
   const record = {
@@ -18,5 +19,6 @@ export async function runCheck(ctx, exec, run, check) {
     error: result.isError ? result.error.message : null,
   }
   run.checks.push(record)
+  recordUpdate(run, { type: 'check', record })
   return record
 }

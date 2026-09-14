@@ -6,7 +6,7 @@ const object = (properties, required = Object.keys(properties)) => ({ type: 'obj
 const array = (items) => ({ type: 'array', items })
 
 export const CONTRACT_SCHEMA = object({
-  summary: text,
+  instruction: text,
   scope: strings,
   behaviors: array(object({ id: text, observation: text, check: text }, ['id', 'observation'])),
   checks: array(object({ id: text, command: text, scope: strings, expectedExit: { type: 'integer' } })),
@@ -14,13 +14,13 @@ export const CONTRACT_SCHEMA = object({
 
 export const HANDOFF_SCHEMA = object({
   outcome: { type: 'string', enum: ['approach', 'ready-for-audit', 'needs-decision', 'blocked'] },
-  summary: text,
+  report: text,
   files: strings,
   questions: strings,
   observations: strings,
   exceptions: strings,
   findings: array(object({ id: text, status: { type: 'string', enum: ['fixed', 'disputed'] }, evidence: text })),
-}, ['outcome', 'summary'])
+}, ['outcome', 'report'])
 
 export const VERDICT_SCHEMA = object({
   findings: array(object({

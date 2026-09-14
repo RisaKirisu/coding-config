@@ -21,8 +21,8 @@ export function assignment(run, instruction) {
   return [
     '# Current assignment', json(currentAssignment(run)),
     instruction ?? 'Continue the assigned task without restarting completed work.',
-    'Use build_ticket_check with an approved check_id for required verification. It records the actual result; do not repeat the same command just to make another copy. Rerun after relevant changes. Stop or collect your background jobs before handoff.',
-    'Use ready-for-audit only after every behavior has an observation and required checks have passed. Return needs-decision or blocked for a real conflict or environmental failure.',
+    'Run focused verification directly through ordinary tools while implementing. The controller runs the approved final checks after a ready-for-audit handoff. Do not duplicate the complete check set solely to create another result. Stop or collect background jobs before handoff.',
+    'Use ready-for-audit only after every behavior has an observation and your focused verification supports the handoff. Return needs-decision or blocked for a real conflict or environmental failure.',
     'End with exactly one fenced json report matching this schema, with nothing after it:', json(HANDOFF_SCHEMA),
   ].join('\n\n')
 }
@@ -49,11 +49,35 @@ export function auditAssignment(run, assignment, question, repair) {
 
 export const FORMAT_REPAIR = 'Format-only repair. Use the completed work, change no source, and return the corrected report. Do not rerun implementation or verification.'
 
-export function renderRun(run, answer) {
+function nextStep(run) {
+  const open = run.findings.filter((finding) => finding.status === 'open').map((finding) => finding.id)
+  if (open.length) return 'Next: triage open findings ' + open.join(', ') + '.'
+  if (run.phase === 'awaiting_design') return 'Next: approve or revise the builder approach.'
+  if (run.phase === 'awaiting_acceptance') return 'Next: accept, continue, ask, or abandon.'
+  if (run.phase === 'interrupted') return 'Next: continue, triage, ask, or abandon.'
+  return 'Next: run is ' + run.phase + '.'
+}
+
+function inspectionState(run) {
+  return {
+    task: run.task,
+    handoff: run.handoff?.outcome ?? null,
+    checks: run.contract.checks.map((check) => {
+      const record = latestCheck(run, check.id)
+      return record === undefined ? { check: check.id, status: 'missing' } : {
+        check: check.id, exitCode: record.exitCode, failed: record.failed,
+      }
+    }),
+    openFindings: run.findings.filter((finding) => finding.status === 'open'),
+    failure: run.failure,
+  }
+}
+
+export function renderRun(run, updates, inspection = false) {
   return [
     'Run ' + run.id + ' — ' + run.phase + ', revision ' + run.revision,
-    'To resume use build_ticket_decide with this exact run_id and revision. Triage every open finding with fix or ignore and a reason. Only approved fixes reach the builder; disputes return to you. Ignored findings can be reopened by auditors with stronger evidence.',
-    json(currentAssignment(run)), '# Audit reports', json(run.audits),
-    answer ? '# Answer\n' + answer : '',
+    nextStep(run),
+    inspection ? '# Current state\n' + json(inspectionState(run)) : '',
+    updates.length ? '# New updates\n' + json(updates) : '',
   ].filter(Boolean).join('\n\n')
 }

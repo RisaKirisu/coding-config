@@ -44,11 +44,11 @@ export function registerTools(ctx, scope, controller) {
   ctx.systemPrompt.section({
     name: 'tool:build_ticket', order: 116.7,
     text: (context) => ctx.tools.get('build_ticket', context.scope) ?
-      'Use build_ticket for ticket implementation. Supply an explicit contract: observable behaviors, approved check commands, and authorized scope. Approve the proposed approach through build_ticket_decide. Triage every open audit finding with fix or ignore and a reason; only approved fixes go to the builder. Resolve builder disputes as the caller. Auditors can reopen ignored findings with stronger evidence. Resume the same run and revision; failed or interrupted work is not complete.' : '',
+      'Use build_ticket for ticket implementation. Supply an explicit contract: observable behaviors, approved check commands, and authorized scope. Approve the proposed approach through build_ticket_decide. Triage every open audit finding with fix or ignore and a reason; only approved fixes go to the builder. Resolve builder disputes as the caller. Auditors can reopen ignored findings with stronger evidence. Resume the same run and revision; failed or interrupted work is not complete. When a build_ticket or build_ticket_decide call would block you, run it with run_in_background and end your turn; you will be notified after the call finishes.' : '',
   })
   ctx.tools.register(defineTool({
     name: 'build_ticket',
-    description: 'Start a supervised build and pause for caller design approval. Scope is an instruction to workers, not a filesystem restriction. Each behavior names an observation and optional approved check ID. The builder requests captured checks. Runs live in memory only; no Git, source hashing, sandboxing, or filesystem checkpoints.',
+    description: 'Start a supervised build and pause for caller design approval. Scope is an instruction to workers, not a filesystem restriction. Each behavior names an observation and optional approved check ID. The controller runs captured checks after each ready handoff. Runs live in memory only; no Git, source hashing, sandboxing, or filesystem checkpoints.',
     parameters: {
       ticket: { type: 'string', required: true, description: 'Ticket path in the calling workspace.' },
       contract: { type: 'object', properties: parameters(CONTRACT_SCHEMA), additionalProperties: false, required: true },
@@ -69,11 +69,5 @@ export function registerTools(ctx, scope, controller) {
       if (!exec.agent) throw new Error('build_ticket_decide requires a calling agent')
       return dispatch(ctx, exec, args.run_in_background, 'build decision ' + args.run_id, (execution) => controller.decide(args, execution))
     },
-  }))
-  ctx.tools.register(defineTool({
-    name: 'build_ticket_check',
-    description: 'Implementing build worker only: execute an approved check by ID through the controller. Returns captured exit, duration, stdout and stderr from the native bash tool. Use this instead of repeating the same command through bash.',
-    parameters: { check_id: { type: 'string', required: true } }, output: OUTPUT,
-    execute: (args, exec) => controller.check(args.check_id, exec),
   }))
 }

@@ -102,7 +102,7 @@ window.__ModuleLoader__.load({
           { className: 'bl-card' },
           React.createElement('ol', { className: 'bl-flow' },
             React.createElement('li', null, 'Builder proposes an approach; the run pauses for the caller\'s approval.'),
-            React.createElement('li', null, 'Builder implements and simplifies; approved checks run through build_ticket_check, and a failing check returns to the builder (two retries).'),
+            React.createElement('li', null, 'Builder implements, simplifies, and runs focused verification; the controller runs approved final checks, returning failures to the builder for two retries.'),
             React.createElement('li', null, 'Code and test auditors inspect in parallel, internally score confidence from 0 to 100, and report findings above 75 with impact only.'),
             React.createElement('li', null, 'The caller approves fixes or ignores with reasons, up to ', React.createElement('code', null, String(c.maxFixRounds)), ' fix rounds. Builder disputes pause; ignored findings may reopen with stronger auditor evidence.'),
             React.createElement('li', null, 'The builder receives its full instructions again after compaction and every ', React.createElement('code', null, String(c.reminderTokens)), ' new context tokens.'),

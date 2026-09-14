@@ -23,8 +23,8 @@ async function fixture(t) {
   const cwd = await fs.mkdtemp(path.join(directory, 'workspace-'))
   const handle = await host.ctx.agents.create({ sessionId: randomUUID(), meta: { cwd } })
   t.after(() => handle.dispose())
-  const contract = { summary: 'Small process pilot', scope: ['sample.mjs'], behaviors: [{ id: 'B1', observation: 'expected output', check: 'check' }], checks: [{ id: 'check', command: 'printf verified', scope: ['sample.mjs'], expectedExit: 0 }] }
-  const run = { id: randomUUID(), revision: 1, owner: handle.agent.session.id, cwd, ticket: 'ticket.md', contract, policy: structuredClone(DEFAULTS), instructions: loadInstructions(), phase: 'awaiting_acceptance', task: { phase: 'implement', ids: [] }, decisions: [], checks: [], attempt: 1, audits: [], findings: [], fixRounds: 0, maxFixRounds: 3, failure: null, handoff: { outcome: 'ready-for-audit', summary: 'implemented', files: ['sample.mjs'], observations: ['specific observation'], findings: [] } }
+  const contract = { instruction: 'Small process pilot', scope: ['sample.mjs'], behaviors: [{ id: 'B1', observation: 'expected output', check: 'check' }], checks: [{ id: 'check', command: 'printf verified', scope: ['sample.mjs'], expectedExit: 0 }] }
+  const run = { id: randomUUID(), revision: 1, owner: handle.agent.session.id, cwd, ticket: 'ticket.md', contract, policy: structuredClone(DEFAULTS), instructions: loadInstructions(), phase: 'awaiting_acceptance', task: { phase: 'implement', ids: [] }, decisions: [], checks: [], attempt: 1, audits: [], findings: [], updates: [], fixRounds: 0, maxFixRounds: 3, failure: null, handoff: { outcome: 'ready-for-audit', report: 'implemented', files: ['sample.mjs'], observations: ['specific observation'], findings: [] } }
   return { run, exec: { agent: handle.agent, signal: new AbortController().signal, callId: randomUUID() } }
 }
 
@@ -57,6 +57,35 @@ test('check results count only for the current builder attempt', async (t) => {
   await runCheck(host.ctx, exec, run, run.contract.checks[0])
   assert.equal(missingChecks(run).length, 0)
   assert.equal(run.checks.length, 2)
+})
+
+test('result output delivers updates once while inspect remains compact', async (t) => {
+  const { run, exec } = await fixture(t)
+  const controller = new Controller(host.ctx)
+  controller.runs.set(run.id, run)
+  run.updates.push({ type: 'builder', attempt: 1, handoff: { report: 'initial builder report' } })
+  recordVerdict(run, { role: 'code', ids: [], obligations: ['B1'] }, {
+    findings: [{ impact: 'medium', location: 'sample.mjs:1', rule: 'B1', evidence: 'missing case', correction: 'add it' }],
+    prior: [], report: 'initial audit report',
+  })
+
+  const first = controller.result(run)
+  assert.match(first.text, /initial builder report/)
+  assert.match(first.text, /initial audit report/)
+  assert.equal(run.audits.length, 1)
+  assert.equal(run.findings[0].id, 'C1')
+
+  const second = controller.result(run)
+  assert.doesNotMatch(second.text, /initial builder report|initial audit report/)
+  run.updates.push({ type: 'answer', role: 'code', text: 'fresh code answer' })
+  const answer = controller.result(run)
+  assert.match(answer.text, /fresh code answer/)
+  assert.doesNotMatch(answer.text, /initial builder report|initial audit report/)
+
+  const inspection = await controller.decide({ run_id: run.id, revision: run.revision, kind: 'inspect' }, exec)
+  assert.match(inspection.text, /# Current state/)
+  assert.match(inspection.text, /C1/)
+  assert.doesNotMatch(inspection.text, /initial builder report|initial audit report/)
 })
 
 test('all-ignore triage permits acceptance without another worker round; invalid triage is atomic', async (t) => {
@@ -97,7 +126,7 @@ test('real child failure keeps the one builder in memory and writes no checkpoin
   const { run, exec } = await fixture(t)
   run.phase = 'awaiting_design'
   run.task = { phase: 'approach', ids: [] }
-  run.handoff = { outcome: 'approach', summary: 'use a direct loop', files: ['sample.mjs'] }
+  run.handoff = { outcome: 'approach', report: 'use a direct loop', files: ['sample.mjs'] }
   const controller = new Controller(host.ctx)
   controller.runs.set(run.id, run)
   run.policy.reminderTokens = 1
@@ -179,9 +208,6 @@ test('registered tool reaches the real builder in a plain directory without Git'
     assert.deepEqual(await fs.readdir(run.cwd), [])
     assert.equal(controller.workers.active.size, 1)
     controller.workers.active.set(exec.agent.session.id, { role: 'builder', run, denied: new Set(['build_ticket']) })
-    const checked = await host.ctx.tools.execute({ ...exec, callId: randomUUID(), name: 'build_ticket_check', arguments: { check_id: 'check' } })
-    assert.equal(checked.isError, false, JSON.stringify(checked))
-    assert.equal(checked.value.exitCode, 0)
     const guarded = await host.ctx.tools.execute({ ...exec, callId: randomUUID(), name: 'build_ticket', arguments: { ticket: 'ticket.md', contract: run.contract } })
     assert.equal(guarded.isError, true)
     assert.match(guarded.error.message, /workers may not use build_ticket/)
@@ -189,7 +215,7 @@ test('registered tool reaches the real builder in a plain directory without Git'
   } finally { await controller.workers.close(); await fiber.dispose() }
 })
 
-// Mock only the plugin's worker-call boundary with node:test; bash/check dispatch remains real.
+// Mock only the plugin's worker-call boundary with node:test; controller check dispatch remains real.
 test('audit findings pause for caller; only approved fixes run and ignored IDs can reopen', async (t) => {
   const { run, exec } = await fixture(t)
   const controller = new Controller(host.ctx)
@@ -240,8 +266,8 @@ test('builder dispute pauses without closing findings; ignoring cannot skip curr
   let calls = 0
   t.mock.method(controller.workers, 'builder', async () => {
     calls += 1
-    if (calls === 1) return { outcome: 'needs-decision', summary: 'scope conflict', findings: [{ id: 'C1', status: 'disputed', evidence: 'requires changing public contract' }] }
-    return { outcome: 'ready-for-audit', summary: 'completed remaining work', files: [], observations: ['verified'], findings: [] }
+    if (calls === 1) return { outcome: 'needs-decision', report: 'scope conflict', findings: [{ id: 'C1', status: 'disputed', evidence: 'requires changing public contract' }] }
+    return { outcome: 'ready-for-audit', report: 'completed remaining work', files: [], observations: ['verified'], findings: [] }
   })
   t.mock.method(controller.workers, 'auditor', async () => ({ findings: [], prior: [], report: 'no remaining issue' }))
   const disputed = await controller.decide({ run_id: run.id, revision: 1, kind: 'triage', dispositions: [{ id: 'C1', action: 'fix', reason: 'required' }] }, exec)
@@ -283,8 +309,8 @@ test('guidance resumes the same fix batch without charging again; new batches st
   let calls = 0
   t.mock.method(controller.workers, 'builder', async () => {
     calls += 1
-    if (calls === 1) return { outcome: 'needs-decision', summary: 'need guidance', findings: [{ id: 'C1', status: 'disputed', evidence: 'scope question' }] }
-    return { outcome: 'ready-for-audit', summary: 'implemented guidance', files: [], observations: ['checked'], findings: [{ id: 'C1', status: 'fixed', evidence: 'implemented' }] }
+    if (calls === 1) return { outcome: 'needs-decision', report: 'need guidance', findings: [{ id: 'C1', status: 'disputed', evidence: 'scope question' }] }
+    return { outcome: 'ready-for-audit', report: 'implemented guidance', files: [], observations: ['checked'], findings: [{ id: 'C1', status: 'fixed', evidence: 'implemented' }] }
   })
   t.mock.method(controller.workers, 'auditor', async (_run, _parent, a) => ({ findings: [], prior: a.ids.map((id) => ({ id, status: 'open', evidence: 'required case is still missing' })), report: 'audited' }))
   const decision = { run_id: run.id, revision: 1, kind: 'triage', dispositions: [{ id: 'C1', action: 'fix', reason: 'required case' }] }

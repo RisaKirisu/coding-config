@@ -1,6 +1,6 @@
 /** In-memory process routing. The caller approves fixes; workers report evidence and disputes. */
 import { randomUUID } from 'node:crypto'
-import { assertAcceptable, initialAudits, missingAudits, missingChecks, recordVerdict, triageFindings, validateContract, validateDecision } from './loop.mjs'
+import { assertAcceptable, initialAudits, missingAudits, missingChecks, recordUpdate, recordVerdict, triageFindings, validateContract, validateDecision } from './loop.mjs'
 import { runCheck } from './checks.mjs'
 import { renderRun } from './assignments.mjs'
 import { Workers } from './workers.mjs'
@@ -14,7 +14,6 @@ export class Controller {
     this.workers = new Workers(ctx)
     this.runs = new Map()
     this.busy = new Set()
-    this.checks = new Set()
   }
 
   async start(args, exec, config) {
@@ -24,7 +23,7 @@ export class Controller {
       cwd: exec.agent.session.header.cwd, ticket: args.ticket,
       contract: args.contract, policy: structuredClone(config), instructions: loadInstructions(),
       phase: 'awaiting_design', task: { phase: 'approach', ids: [] },
-      decisions: [], checks: [], audits: [], findings: [], attempt: 0,
+      decisions: [], checks: [], audits: [], findings: [], updates: [], attempt: 0,
       fixRounds: 0, maxFixRounds: config.maxFixRounds, failure: null,
     }
     this.runs.set(run.id, run)
@@ -36,7 +35,7 @@ export class Controller {
     const run = this.runs.get(d.run_id)
     if (!run) throw new Error('unknown run; runs exist only for the lifetime of this plugin instance')
     if (run.owner !== exec.agent.session.id) throw new Error('run belongs to another calling session')
-    if (d.kind === 'inspect') return this.result(run)
+    if (d.kind === 'inspect') return this.result(run, undefined, true)
     validateDecision(run, d)
     if (d.kind === 'accept') assertAcceptable(run)
     const fixing = d.kind === 'triage' && triageFindings(run, d.dispositions, d.instructions)
@@ -62,7 +61,7 @@ export class Controller {
             ? await this.workers.builder(run, exec.agent, exec.signal, question, true)
             : await this.workers.auditor(run, exec.agent, assignment, exec.signal, question)
           run.phase = this.pausedPhase(run)
-          return answer
+          return { type: 'answer', role: d.role, text: answer }
         }
         case 'accept':
           run.phase = 'complete'
@@ -86,8 +85,12 @@ export class Controller {
     return 'awaiting_acceptance'
   }
 
-  result(run, answer) {
-    return { kind: 'foreground', run_id: run.id, revision: run.revision, phase: run.phase, text: renderRun(run, answer) }
+  result(run, answer, inspection = false) {
+    if (answer !== undefined) recordUpdate(run, answer)
+    const updates = run.updates
+    const text = renderRun(run, updates, inspection)
+    run.updates = []
+    return { kind: 'foreground', run_id: run.id, revision: run.revision, phase: run.phase, text }
   }
 
   async perform(run, work) {
@@ -100,6 +103,7 @@ export class Controller {
       if (run.phase === 'running') run.phase = this.pausedPhase(run)
     } catch (error) {
       run.failure = error?.message ?? String(error)
+      recordUpdate(run, { type: 'failure', message: run.failure })
       run.phase = 'interrupted'
     } finally {
       run.revision += 1
@@ -115,6 +119,7 @@ export class Controller {
       run.attempt += 1
       const handoff = await this.workers.builder(run, exec.agent, exec.signal, run.task.instructions)
       run.handoff = handoff
+      recordUpdate(run, { type: 'builder', attempt: run.attempt, handoff })
       for (const note of handoff.findings ?? []) run.findings.find((f) => f.id === note.id).builder = note
       if (run.task.phase === 'approach') { run.phase = 'awaiting_design'; return }
       if (handoff.outcome !== 'ready-for-audit' || handoff.findings?.some((f) => f.status === 'disputed')) {
@@ -122,18 +127,18 @@ export class Controller {
         return
       }
       for (const check of missingChecks(run)) {
-        // Reuse a result captured by the builder during this attempt, even a failed one.
-        if (!run.checks.some((c) => c.check === check.id && c.attempt === run.attempt)) await runCheck(this.ctx, exec, run, check)
+        await runCheck(this.ctx, exec, run, check)
         exec.signal.throwIfAborted()
       }
       const failed = missingChecks(run)
       if (!failed.length) break
       if (++checkRetries > CHECK_RETRIES) {
         run.failure = 'Required checks still failed after ' + CHECK_RETRIES + ' builder retries. Continue with instructions or abandon.'
+        recordUpdate(run, { type: 'failure', message: run.failure })
         run.phase = 'awaiting_decision'
         return
       }
-      run.task.instructions = 'Approved checks failed: ' + failed.map((c) => c.id).join(', ') + '. Read the captured results, correct the cause, rerun with build_ticket_check, and hand off again.'
+      run.task.instructions = 'Approved checks failed: ' + failed.map((c) => c.id).join(', ') + '. Read the captured results, correct the cause, and hand off again. The controller will rerun the approved checks.'
     }
     await this.audit(run, exec)
     run.phase = this.pausedPhase(run)
@@ -156,21 +161,14 @@ export class Controller {
     for (let i = 0; i < results.length; i++) {
       const result = results[i]
       if (result.status === 'fulfilled') recordVerdict(run, assignments[i], result.value)
-      else run.audits.push({ ...assignments[i], attempt: run.attempt, failure: result.reason?.message ?? String(result.reason) })
+      else {
+        const failure = result.reason?.message ?? String(result.reason)
+        run.audits.push({ ...assignments[i], attempt: run.attempt, failure })
+        recordUpdate(run, { type: 'audit', role: assignments[i].role, attempt: run.attempt, failure })
+      }
     }
     const missing = missingAudits(run)
     run.failure = missing.length ? 'Missing or failed audit results: ' + missing.join(', ') : null
   }
 
-  async check(checkId, exec) {
-    const worker = this.workers.active.get(exec.agent?.session.id)
-    if (!worker || worker.role !== 'builder' || worker.run.task.phase === 'approach') throw new Error('only an implementing builder may request checks')
-    const run = worker.run
-    const check = run.contract.checks.find((c) => c.id === checkId)
-    if (!check) throw new Error('unknown approved check')
-    if (this.checks.has(run.id)) throw new Error('another verification check is running')
-    this.checks.add(run.id)
-    try { return await runCheck(this.ctx, exec, run, check) }
-    finally { this.checks.delete(run.id) }
-  }
 }

@@ -9,7 +9,7 @@ import { parseReport, textOf, validateHandoff, validateVerdict } from './loop.mj
 import { assignment, FORMAT_REPAIR, auditAssignment, reminder } from './assignments.mjs'
 
 const message = (text) => createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'plugin', plugin: 'build-loop', form: 'instructions' } })
-const reason = (agent, boundary = 0) => foldConsumedWork(agent.session.snapshotEvents(boundary)).end?.data.reason?.kind
+const turnEnd = (agent, boundary = 0) => foldConsumedWork(agent.session.snapshotEvents(boundary)).end?.data.reason
 
 export class Workers {
   constructor(ctx) {
@@ -78,12 +78,18 @@ export class Workers {
     try {
       if (signal.aborted) { cancel(); await agent.whenIdle(); signal.throwIfAborted() }
       let result
+      let end
       if (text !== undefined) {
         agent.followup(message(text))
         await agent.whenIdle()
         const events = agent.session.snapshotEvents(boundary)
-        result = { output: finalAssistantOutput(events), stopReason: reason(agent, boundary) }
-      } else result = await worker.child.result
+        end = turnEnd(agent, boundary)
+        result = { output: finalAssistantOutput(events), stopReason: end?.kind }
+      } else {
+        result = await worker.child.result
+        end = turnEnd(agent)
+      }
+      if (end?.kind === 'error' && result.diagnostic === undefined) result = { ...result, diagnostic: end.error.message }
       await this.collect(worker)
       signal.throwIfAborted()
       return result
