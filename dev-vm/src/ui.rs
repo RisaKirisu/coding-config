@@ -218,6 +218,10 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
             padding-top: 20px;
         }
 
+        .project-dynamic-actions {
+            display: contents;
+        }
+
         .open-port-row {
             display: flex;
             align-items: center;
@@ -627,8 +631,11 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
                 renderProjects(projects);
             } catch (err) {
                 console.error(err);
-                document.getElementById('projects-container').innerHTML = 
-                    `<div class="empty-state" style="color: var(--danger)">Error loading projects: ${err.message}</div>`;
+                const container = document.getElementById('projects-container');
+                if (!container.querySelector('.project-card')) {
+                    container.innerHTML =
+                        `<div class="empty-state" style="color: var(--danger)">Error loading projects: ${err.message}</div>`;
+                }
             }
         }
 
@@ -673,6 +680,97 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
             }
         }
 
+        function createProjectCard(projectId) {
+            const card = document.createElement('div');
+            card.className = 'project-card';
+            card.id = `card-${projectId}`;
+            card.dataset.projectId = projectId;
+            card.innerHTML = `
+                <div class="project-header">
+                    <div>
+                        <div class="project-title" data-project-title></div>
+                        <div class="project-meta" data-project-path></div>
+                        <div class="project-meta" data-project-identity></div>
+                    </div>
+                    <div class="badges" data-project-badges></div>
+                </div>
+
+                <div class="open-port-row">
+                    <label for="port-input-${projectId}">Open Port:</label>
+                    <input type="number" id="port-input-${projectId}" placeholder="e.g. 3000" min="1" max="65535" class="port-input" />
+                    <button class="btn btn-secondary btn-sm" data-open-port>Open</button>
+                    <div id="port-links-${projectId}" class="port-links-container"></div>
+                </div>
+
+                <div class="project-actions">
+                    <span class="project-dynamic-actions" data-project-dynamic-actions></span>
+                    <button class="btn btn-secondary btn-sm" data-view-logs>View Logs</button>
+                    <button class="btn btn-secondary btn-sm" data-unregister-project>Unregister</button>
+                    <button class="btn btn-secondary btn-sm" data-delete-project-sync>Delete Sync Store</button>
+                    <button class="btn btn-danger btn-sm" data-delete-vm>Delete VM</button>
+                </div>
+            `;
+
+            card.querySelector('.port-input').addEventListener('keydown', event => {
+                if (event.key === 'Enter') openProjectPort(projectId);
+            });
+            card.querySelector('[data-open-port]').addEventListener('click', () => openProjectPort(projectId));
+            card.querySelector('[data-view-logs]').addEventListener('click', () => viewLogs(projectId, card.dataset.projectName));
+            card.querySelector('[data-unregister-project]').addEventListener('click', () => unregisterProject(projectId));
+            card.querySelector('[data-delete-project-sync]').addEventListener('click', () => deleteProjectSync(projectId, card.dataset.projectName));
+            card.querySelector('[data-delete-vm]').addEventListener('click', () => deleteVm(projectId, card.dataset.projectName));
+            return card;
+        }
+
+        function updateProjectCard(card, project) {
+            const vmStatus = statusPresentation(project, 'vm');
+            const dshStatus = statusPresentation(project, 'dsh');
+            const vmSpinner = vmStatus.loading ? '<span class="spinner" aria-hidden="true"></span>' : '';
+            const dshSpinner = dshStatus.loading ? '<span class="spinner" aria-hidden="true"></span>' : '';
+            const vmBadge = `<span class="badge badge-${vmStatus.value}">${vmSpinner}VM: ${vmStatus.label}</span>`;
+            const dshBadge = `<span class="badge badge-${dshStatus.value}">${dshSpinner}DSH: ${dshStatus.label}</span>`;
+
+            const syncStatus = project.sync_status;
+            const syncSpinner = syncStatus === 'synchronizing' ? '<span class="spinner" aria-hidden="true"></span>' : '';
+            const syncLabel = syncStatus
+                ? syncStatus.charAt(0).toUpperCase() + syncStatus.slice(1).replace('_', ' ')
+                : '';
+            const syncBadge = syncStatus
+                ? `<span class="badge badge-sync-${syncStatus}">${syncSpinner}Sync: ${syncLabel}</span>`
+                : '';
+
+            const localDshUrl = project.links && (project.links.local_dsh_url || project.links.dsh_url);
+            const tailnetDshUrl = project.links && project.links.tailnet_dsh_url;
+            const dshReady = dshStatus.value === 'running';
+            const localDshLink = localDshUrl && dshReady
+                ? `<a href="${localDshUrl}" target="_blank" class="btn btn-sm btn-success">Open DSH (Local)</a>`
+                : '';
+            const tailnetDshLink = tailnetDshUrl && dshReady
+                ? `<a href="${tailnetDshUrl}" target="_blank" class="btn btn-secondary btn-sm">Open DSH (Remote)</a>`
+                : '';
+
+            const vmActionBtn = vmStatus.loading
+                ? `<button class="btn btn-secondary btn-sm" disabled>${vmSpinner}${vmStatus.label} VM</button>`
+                : vmStatus.value === 'running'
+                    ? `<button class="btn btn-secondary btn-sm" onclick="stopVm('${project.id}')">Stop VM</button>`
+                    : `<button class="btn btn-secondary btn-sm" onclick="startVm('${project.id}')">Start VM</button>`;
+            const dshActionBtn = dshStatus.loading
+                ? `<button class="btn btn-secondary btn-sm" disabled>${dshSpinner}${dshStatus.label} DSH</button>`
+                : dshStatus.value === 'running'
+                    ? `<button class="btn btn-secondary btn-sm" onclick="stopDsh('${project.id}')">Stop DSH</button>`
+                    : `<button class="btn btn-secondary btn-sm" onclick="launchDsh('${project.id}')">Launch DSH</button>`;
+            const dshRestartBtn = dshStatus.value === 'running' && !dshStatus.loading
+                ? `<button class="btn btn-secondary btn-sm" onclick="restartDsh('${project.id}')">Restart DSH</button>`
+                : '';
+
+            card.dataset.projectName = project.name;
+            card.querySelector('[data-project-title]').textContent = project.name;
+            card.querySelector('[data-project-path]').textContent = `Path: ${project.path}`;
+            card.querySelector('[data-project-identity]').textContent = `ID: ${project.id} • Host: ${project.project_host}`;
+            card.querySelector('[data-project-badges]').innerHTML = `${vmBadge}${dshBadge}${syncBadge}`;
+            card.querySelector('[data-project-dynamic-actions]').innerHTML = `${localDshLink}${tailnetDshLink}${dshActionBtn}${dshRestartBtn}${vmActionBtn}`;
+        }
+
         function renderProjects(projects) {
             const container = document.getElementById('projects-container');
             if (!projects || projects.length === 0) {
@@ -685,86 +783,19 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
                 return;
             }
 
-            container.innerHTML = projects.map(p => {
-                const vmStatus = statusPresentation(p, 'vm');
-                const dshStatus = statusPresentation(p, 'dsh');
-                const vmSpinner = vmStatus.loading ? '<span class="spinner" aria-hidden="true"></span>' : '';
-                const dshSpinner = dshStatus.loading ? '<span class="spinner" aria-hidden="true"></span>' : '';
-                const vmBadge = `<span class="badge badge-${vmStatus.value}">${vmSpinner}VM: ${vmStatus.label}</span>`;
-                const dshBadge = `<span class="badge badge-${dshStatus.value}">${dshSpinner}DSH: ${dshStatus.label}</span>`;
+            container.querySelectorAll('.empty-state').forEach(element => element.remove());
+            const projectIds = new Set(projects.map(project => project.id));
+            container.querySelectorAll('.project-card').forEach(card => {
+                if (!projectIds.has(card.dataset.projectId)) card.remove();
+            });
 
-                const syncStatus = p.sync_status;
-                const syncSpinner = syncStatus === 'synchronizing' ? '<span class="spinner" aria-hidden="true"></span>' : '';
-                const syncLabel = syncStatus
-                    ? syncStatus.charAt(0).toUpperCase() + syncStatus.slice(1).replace('_', ' ')
-                    : '';
-                const syncBadge = syncStatus
-                    ? `<span class="badge badge-sync-${syncStatus}">${syncSpinner}Sync: ${syncLabel}</span>`
-                    : '';
-
-                const localDshUrl = p.links && (p.links.local_dsh_url || p.links.dsh_url);
-                const tailnetDshUrl = p.links && p.links.tailnet_dsh_url;
-                const dshReady = dshStatus.value === 'running';
-
-                const localDshLink = localDshUrl && dshReady
-                    ? `<a href="${localDshUrl}" target="_blank" class="btn btn-sm btn-success">Open DSH (Local)</a>`
-                    : '';
-                const tailnetDshLink = tailnetDshUrl && dshReady
-                    ? `<a href="${tailnetDshUrl}" target="_blank" class="btn btn-secondary btn-sm">Open DSH (Remote)</a>`
-                    : '';
-
-                const vmActionBtn = vmStatus.loading
-                    ? `<button class="btn btn-secondary btn-sm" disabled>${vmSpinner}${vmStatus.label} VM</button>`
-                    : vmStatus.value === 'running'
-                        ? `<button class="btn btn-secondary btn-sm" onclick="stopVm('${p.id}')">Stop VM</button>`
-                        : `<button class="btn btn-secondary btn-sm" onclick="startVm('${p.id}')">Start VM</button>`;
-
-                const dshActionBtn = dshStatus.loading
-                    ? `<button class="btn btn-secondary btn-sm" disabled>${dshSpinner}${dshStatus.label} DSH</button>`
-                    : dshStatus.value === 'running'
-                        ? `<button class="btn btn-secondary btn-sm" onclick="stopDsh('${p.id}')">Stop DSH</button>`
-                        : `<button class="btn btn-secondary btn-sm" onclick="launchDsh('${p.id}')">Launch DSH</button>`;
-
-                const dshRestartBtn = dshStatus.value === 'running' && !dshStatus.loading
-                    ? `<button class="btn btn-secondary btn-sm" onclick="restartDsh('${p.id}')">Restart DSH</button>`
-                    : '';
-
-                return `
-                    <div class="project-card" id="card-${p.id}">
-                        <div class="project-header">
-                            <div>
-                                <div class="project-title">${escapeHtml(p.name)}</div>
-                                <div class="project-meta">Path: ${escapeHtml(p.path)}</div>
-                                <div class="project-meta">ID: ${p.id} &bull; Host: ${p.project_host}</div>
-                            </div>
-                            <div class="badges">
-                                ${vmBadge}
-                                ${dshBadge}
-                                ${syncBadge}
-                            </div>
-                        </div>
-
-                        <div class="open-port-row">
-                            <label for="port-input-${p.id}">Open Port:</label>
-                            <input type="number" id="port-input-${p.id}" placeholder="e.g. 3000" min="1" max="65535" class="port-input" onkeydown="if(event.key==='Enter') openProjectPort('${p.id}')" />
-                            <button class="btn btn-secondary btn-sm" onclick="openProjectPort('${p.id}')">Open</button>
-                            <div id="port-links-${p.id}" class="port-links-container"></div>
-                        </div>
-
-                        <div class="project-actions">
-                            ${localDshLink}
-                            ${tailnetDshLink}
-                            ${dshActionBtn}
-                            ${dshRestartBtn}
-                            ${vmActionBtn}
-                            <button class="btn btn-secondary btn-sm" onclick="viewLogs('${p.id}', '${escapeHtml(p.name)}')">View Logs</button>
-                            <button class="btn btn-secondary btn-sm" onclick="unregisterProject('${p.id}')">Unregister</button>
-                            <button class="btn btn-secondary btn-sm" onclick="deleteProjectSync('${p.id}', '${escapeHtml(p.name)}')">Delete Sync Store</button>
-                            <button class="btn btn-danger btn-sm" onclick="deleteVm('${p.id}', '${escapeHtml(p.name)}')">Delete VM</button>
-                        </div>
-                    </div>
-                `;
-            }).join('');
+            projects.forEach((project, index) => {
+                let card = document.getElementById(`card-${project.id}`);
+                if (!card) card = createProjectCard(project.id);
+                updateProjectCard(card, project);
+                const cardAtIndex = container.children[index];
+                if (cardAtIndex !== card) container.insertBefore(card, cardAtIndex || null);
+            });
         }
 
         async function openProjectPort(projectId) {

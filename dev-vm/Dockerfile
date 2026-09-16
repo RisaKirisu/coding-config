@@ -13,6 +13,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     RUSTUP_HOME=/root/.rustup \
     PATH=/root/.cargo/bin:/usr/local/bin:/root/.local/bin:$PATH \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PLAYWRIGHT_MCP_HEADLESS=true \
+    PLAYWRIGHT_MCP_SANDBOX=false \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
@@ -83,6 +85,11 @@ RUN set -eux; \
     npm --version
 
 RUN npm install --global pnpm && pnpm --version
+
+RUN npm install -g @playwright/cli@latest \
+    && npm exec --prefix "$(npm root -g)/@playwright/cli" -- playwright install --with-deps chrome \
+    && playwright-cli --help >/dev/null \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSLo /tmp/install-nvm.sh \
         "https://raw.githubusercontent.com/nvm-sh/nvm/v${NVM_VERSION}/install.sh" \

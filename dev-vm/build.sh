@@ -19,5 +19,5 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-"$CONTAINER_RUNTIME" build -t rust-dev-smolvm-opencode-$ARCH .
+"$CONTAINER_RUNTIME" build --network host -t rust-dev-smolvm-opencode-$ARCH .
 "$CONTAINER_RUNTIME" save -o rust-dev-opencode-$ARCH.tar rust-dev-smolvm-opencode-$ARCH
