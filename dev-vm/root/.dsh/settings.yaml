@@ -3,7 +3,7 @@ ui-onboarding:
 agent-default-model:
   provider: proxy-cli
   model: "gpt-5.6-sol"
-  reasoningEffort: high
+  reasoningEffort: xhigh
 llm-pi-ai:
   providers:
     krill-codex:

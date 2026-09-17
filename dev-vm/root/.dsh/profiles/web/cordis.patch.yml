@@ -5,7 +5,7 @@
   disabled: true
 - id: tool-jobs
   config:
-    maxConsecutiveWakes: 20
+    maxConsecutiveWakes: 100
 
 
 # >>> dsh-skill-mcp-panel:mcp:begin
