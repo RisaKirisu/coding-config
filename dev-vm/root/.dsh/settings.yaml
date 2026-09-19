@@ -2,8 +2,8 @@ ui-onboarding:
   welcomeNoticeVersion: 2026-08-13.1
 agent-default-model:
   provider: proxy-cli
-  model: "gpt-5.6-sol"
-  reasoningEffort: xhigh
+  model: "gpt-6-astra"
+  reasoningEffort: high
 llm-pi-ai:
   providers:
     krill-codex:
@@ -333,7 +333,7 @@ llm-pi-ai:
       requestImageMaxBytes: 1048576
   subagentEffort: high
 agent-presets:
-  default: standard
+  default: standard-bash
 ui-conversation:
   busyEnter: steer
 permission:

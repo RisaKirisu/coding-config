@@ -3,9 +3,6 @@
 # overrides, disables, and insert lists; `!!js` expressions allowed).
 - id: ui-permission
   disabled: true
-- id: tool-jobs
-  config:
-    maxConsecutiveWakes: 100
 
 
 # >>> dsh-skill-mcp-panel:mcp:begin

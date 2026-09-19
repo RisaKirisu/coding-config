@@ -61,6 +61,8 @@
 # chooses is whether its agent can collect and stop background work at all.
 - id: tool-jobs
   name: '@deepseek-ai/dsh-tool-jobs'
+  config:
+    maxConsecutiveWakes: 100
 
 # ── skills ──────────────────────────────────────────────────────────────────
 
