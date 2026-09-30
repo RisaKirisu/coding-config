@@ -43,9 +43,9 @@ description: Developer guidelines. DSH coding agents should load this IMMEDIATEL
 - When a task, issue, or story is finished, update the relevant documentation and `AGENTS.md` before marking it complete.
 
 ## Task Management
-1. Plan first with clear steps and design decisions.
-2. Verify the plan before implementing; use `question` when needed.
-3. Track progress as you go.
+- Define “done” from the user's request before starting.
+- Each additional action must resolve an unmet requirement or an evidenced risk that could change the result. Reuse established evidence and delegated results.
+- Once the requested outcome is verified, deliver it and stop. Report non-blocking uncertainty instead of expanding the task.
 
 ## Core Principles
 - Simplest change possible. Follow `ponytail`. NO speculative features.
