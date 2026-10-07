@@ -18,11 +18,18 @@ export const HEAD_MARKER_NAME = '.sync-head.json';
  */
 export const UNION_FILTER_ARGS = [
   '--exclude=session.lock',
+  '--exclude=session.migration.*.tmp',
+  '--exclude=session.v*.jsonl.*.tmp',
+  '--exclude=session.v*.jsonl.zstd.*.tmp',
   '--include=sessions/***',
   '--include=attachments/',
   '--include=attachments/v1/',
   '--include=attachments/v1/objects/',
   '--include=attachments/v1/objects/***',
+  '--include=attachments/v1/file-objects/',
+  '--include=attachments/v1/file-objects/***',
+  '--include=attachments/v1/files/',
+  '--include=attachments/v1/files/***',
   '--exclude=*',
 ];
 
@@ -435,10 +442,7 @@ export class RemoteSyncManager {
   async _push(store) {
     // A workstation that has never reconciled is behind by definition.
     const expected = this.headSeq;
-    const advanced =
-      expected === null ? null : await store.advanceHead(expected, this.now().toISOString());
-
-    if (advanced === null) {
+    if (expected === null || (await store.readHead()) !== expected) {
       // Never push storage units while the Sync Store is ahead: a whole-document
       // push would drop the other workstation's session references.
       await this._transfer('push', UNION_FLAGS, UNION_FILTER_ARGS, store);
@@ -450,6 +454,11 @@ export class RemoteSyncManager {
     await this._transfer('push', UNION_FLAGS, UNION_FILTER_ARGS, store);
     await this._transfer('push', NEWEST_WINS_FLAGS, PROJECTION_FILTER_ARGS, store);
     await this._transfer('push', NEWEST_WINS_FLAGS, STORAGES_FILTER_ARGS, store);
+    const advanced = await store.advanceHead(expected, this.now().toISOString());
+    if (advanced === null) {
+      this._setStatus('remote_ahead');
+      return;
+    }
     this.headSeq = advanced;
     this._setStatus('synchronized');
   }

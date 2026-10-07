@@ -8,8 +8,6 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { scrubbedParentEnv } from "@deepseek-ai/dsh-subprocess";
 import { mcpServerInputSchema } from "./model.js";
-import { credentialRefForServer, readCredential } from "./credentials.js";
-
 const PROBE_TIMEOUT_MS = 15000;
 function stringMap(value) {
     const out = {};
@@ -41,18 +39,6 @@ export async function probeMcpServer(raw, timeoutMs = PROBE_TIMEOUT_MS) {
     }
     catch (error) {
         return { ok: false, tools: [], error: "配置无效：" + (error instanceof Error ? error.message : String(error)) };
-    }
-    // 如果设置了 Bearer Token 模式，确保探测请求携带已存或新输入的 Token
-    if (input.transport === "streamable-http" && input.authType === "bearer") {
-        let token = input.bearerToken;
-        if (!token) {
-            const ref = credentialRefForServer(input.serverName);
-            token = await readCredential(ref);
-        }
-        if (token) {
-            input.headers = input.headers ?? {};
-            input.headers["Authorization"] = `Bearer ${token}`;
-        }
     }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);

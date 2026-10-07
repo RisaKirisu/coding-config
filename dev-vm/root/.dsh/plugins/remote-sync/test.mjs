@@ -1,7 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { pathToFileURL } from 'node:url';
+import { zstdCompressSync } from 'node:zlib';
+import { boot, getDshRuntimeVersion } from '@deepseek-ai/dsh-app-boot';
+import { workspaceDomainSpec } from '@deepseek-ai/dsh-workspace';
+import { projectionCacheDomainSpec } from '@deepseek-ai/dsh-session-projection-cache';
 import {
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -9,20 +16,61 @@ import {
   readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join, relative } from 'node:path';
 import {
   HEAD_MARKER_NAME,
   PROJECTION_FILTER_ARGS,
   RemoteSyncManager,
-  STORAGES_FILTER_ARGS,
-  UNION_FILTER_ARGS,
 } from './index.mjs';
 
 const PROJECT_ID = '00000000-0000-4000-8000-000000000001';
+const candidateHome = process.env.DSH_HOME;
+const packageEntry = process.env.DSH_PACKAGE_ENTRY;
+assert.ok(candidateHome && packageEntry, 'Run with staged DSH_HOME and DSH_PACKAGE_ENTRY');
+const runtimePackage = JSON.parse(readFileSync(packageEntry, 'utf8'));
+const candidateCli = join(dirname(packageEntry), runtimePackage.bin.dsh);
+const candidateOverlay = join(candidateHome, 'test-data', 'candidate-web.patch.yml');
+
+const { ApiSessionList } = await import(new URL('types/list.js', import.meta.resolve('@deepseek-ai/dsh-api-session-controller')));
+
+test('tests resolve exact rc.2 through the staged plugin dependency fallback', () => {
+  assert.equal(runtimePackage.version, '0.2.0-rc.2');
+  assert.equal(getDshRuntimeVersion(), '0.2.0-rc.2');
+});
+
+/** A test-only Loader composition with the real agent-owned persistence lifecycle. */
+async function createDshInstance(home, remoteSyncConfig, compression = 'none') {
+  const entries = [
+    { id: 'session', name: '@deepseek-ai/dsh-session' },
+    { id: 'agent', name: '@deepseek-ai/dsh-agent' },
+    { id: 'llm', name: '@deepseek-ai/dsh-llm' },
+    { id: 'tools', name: '@deepseek-ai/dsh-tools' },
+    { id: 'system-prompt', name: '@deepseek-ai/dsh-system-prompt' },
+    { id: 'session-projection', name: '@deepseek-ai/dsh-session-projection' },
+    { id: 'agent-loop', name: '@deepseek-ai/dsh-agent-loop', config: {} },
+    { id: 'session-persistence-jsonl', name: '@deepseek-ai/dsh-session-persistence-jsonl', config: { root: join(home, 'sessions'), compression } },
+    { id: 'storage', name: '@deepseek-ai/dsh-storage' },
+    { id: 'storage-json', name: '@deepseek-ai/dsh-storage-json', config: { root: join(home, 'storages') } },
+    { id: 'storage-domain', name: '@deepseek-ai/dsh-storage-domain', config: { backend: 'json' } },
+    { id: 'session-projection-cache', name: '@deepseek-ai/dsh-session-projection-cache', config: { writeEveryEvents: 200, writeIntervalMs: 5000 } },
+    { id: 'session-title', name: '@deepseek-ai/dsh-session-title', config: { fallbackMaxWords: 10, fallbackMaxBytes: 100, maxTitleBytes: 200 } },
+    { id: 'session-query-sqlite', name: '@deepseek-ai/dsh-session-query-sqlite', config: { path: ':memory:', openAt: 'never' } },
+    { id: 'attachment-local', name: '@deepseek-ai/dsh-attachment-local', config: { dshHome: home } },
+    { id: 'message-feedback', name: '@deepseek-ai/dsh-message-feedback', config: { maxNoteBytes: 4096 } },
+  ];
+  if (remoteSyncConfig) entries.push({ id: 'remote-sync', name: pathToFileURL(join(import.meta.dirname, 'index.mjs')).href, config: remoteSyncConfig });
+  const configPath = join(home, 'test.cordis.json');
+  writeFileSync(configPath, JSON.stringify(entries));
+  const ctx = await boot('remote-sync-test', configPath, [], undefined, import.meta.url);
+  const failures = [...ctx.loader.entries()].filter((entry) => entry.fiber?.state !== 2);
+  assert.deepEqual(failures.map((entry) => entry.options.id), [], 'Every test composition entry must activate');
+  return { ctx, listState: new ApiSessionList(ctx), close: () => ctx.fiber.dispose() };
+}
 
 /** Tests keep the VM-local status file inside their temp DSH Home, never in /run/devvm. */
 const STATUS_FILE_NAME = 'sync-status.json';
@@ -83,7 +131,7 @@ function createFixture(options = {}) {
 function writeLocalState(dshHome, { sessionId = 'session-a', sessionBody = '{"type":"turn/end"}\n', workspace = '{"workspaces":[]}' } = {}) {
   const sessionDir = join(dshHome, 'sessions', 'root', 'project', sessionId);
   mkdirSync(sessionDir, { recursive: true });
-  writeFileSync(join(sessionDir, 'session.jsonl'), sessionBody);
+  writeFileSync(join(sessionDir, 'session.v4.jsonl'), sessionBody);
   mkdirSync(join(dshHome, 'storages'), { recursive: true });
   writeFileSync(join(dshHome, 'storages', 'workspace.json'), workspace);
   return { sessionDir };
@@ -127,7 +175,7 @@ function runReconcileChild(env) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ['reconcile.mjs'], {
       cwd: import.meta.dirname,
-      env,
+      env: { ...process.env, ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -225,7 +273,7 @@ test('head protocol advances the Sync Store marker only from a known head', asyn
     assert.equal(await fresh.triggerSync(), 'remote_ahead');
     assert.equal(fresh.headSeq, null);
     assert.equal(existsSync(join(fixture.storeDir, HEAD_MARKER_NAME)), false);
-    assert.ok(findFile(join(fixture.storeDir, 'sessions'), 'session.jsonl'), 'union push must carry the session log');
+    assert.ok(findFile(join(fixture.storeDir, 'sessions'), 'session.v4.jsonl'), 'union push must carry the session log');
     assert.equal(existsSync(join(fixture.storeDir, 'storages', 'workspace.json')), false, 'storages must not be pushed while behind');
 
     assert.equal(await fresh.reconcile(), 'synchronized');
@@ -241,6 +289,51 @@ test('head protocol advances the Sync Store marker only from a known head', asyn
     fixture.cleanup();
   }
 });
+
+for (const [pass, filePath] of [
+  ['union', 'sessions/root/project/session-a/session.v4.jsonl'],
+  ['projection', 'storages/session_projcache/sessions/session-a.json'],
+  ['storage', 'storages/workspace.json'],
+]) {
+  test(`a failed ${pass} transfer preserves both heads and retries successfully`, async () => {
+    const fixture = createFixture();
+    try {
+      writeLocalState(fixture.dshHome);
+      seedHeadSeq(fixture.dshHome, 27);
+      writeMarker(fixture.storeDir, 27, 'writer-under-test');
+      const projectionPath = join(fixture.dshHome, 'storages', 'session_projcache', 'sessions', 'session-a.json');
+      mkdirSync(dirname(projectionPath), { recursive: true });
+      writeFileSync(projectionPath, '{"title":"Session A"}');
+
+      // Real rsync cannot replace a nonempty directory with a regular file.
+      const blockedPath = join(fixture.storeDir, filePath);
+      mkdirSync(blockedPath, { recursive: true });
+      writeFileSync(join(blockedPath, 'occupied'), 'block transfer');
+      const markerBefore = readMarker(fixture.storeDir);
+      const manager = fixture.manager();
+
+      assert.equal(await manager.triggerSync(), 'failed');
+      assert.equal(manager.headSeq, 27);
+      assert.deepEqual(readMarker(fixture.storeDir), markerBefore, 'failed transfers must not publish a new head');
+      assert.match(manager.lastError, /rsync push failed/);
+      const persisted = JSON.parse(readFileSync(join(fixture.dshHome, STATUS_FILE_NAME), 'utf8'));
+      assert.equal(persisted.status, 'failed');
+      assert.equal(persisted.head_seq, 27);
+
+      assert.equal(relative(fixture.storeDir, blockedPath), filePath);
+      rmSync(blockedPath, { recursive: true });
+      assert.equal(await manager.retry(), 'synchronized');
+      assert.equal(manager.headSeq, 28);
+      assert.equal(readMarker(fixture.storeDir).seq, 28);
+      assert.equal(readMarker(fixture.storeDir).writer_id, 'writer-under-test');
+      assert.equal(manager.lastError, null);
+      assert.equal(readFileSync(join(fixture.storeDir, filePath), 'utf8'), readFileSync(join(fixture.dshHome, filePath), 'utf8'));
+      assert.equal(readFileSync(join(fixture.storeDir, 'storages', 'workspace.json'), 'utf8'), '{"workspaces":[]}');
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
 
 test('a Sync Store that moved ahead suspends storage pushes but keeps session and projection pushes', async () => {
   const fixture = createFixture();
@@ -263,7 +356,7 @@ test('a Sync Store that moved ahead suspends storage pushes but keeps session an
       readFileSync(join(fixture.storeDir, 'storages', 'workspace.json'), 'utf8'),
       '{"workspaces":["remote"]}',
     );
-    assert.ok(findFile(join(fixture.storeDir, 'sessions'), 'session.jsonl'));
+    assert.ok(findFile(join(fixture.storeDir, 'sessions'), 'session.v4.jsonl'));
     assert.equal(
       existsSync(join(fixture.storeDir, 'storages', 'session_projcache', 'sessions', 'session-ahead.json')),
       true,
@@ -292,7 +385,7 @@ test('reconciliation at an equal head keeps the newest storage unit and gains Sy
 
     const storeSession = join(fixture.storeDir, 'sessions', 'root', 'project', 'session-store');
     mkdirSync(storeSession, { recursive: true });
-    writeFileSync(join(storeSession, 'session.jsonl'), '{"type":"turn/start"}\n');
+    writeFileSync(join(storeSession, 'session.v4.jsonl'), '{"type":"turn/start"}\n');
 
     // A projection document newer locally must reach the store (newest-wins),
     // and a stale store document must never overwrite the newer local one.
@@ -322,7 +415,7 @@ test('reconciliation at an equal head keeps the newest storage unit and gains Sy
     assert.equal(manager.headSeq, 3);
     assert.equal(readFileSync(storeWorkspace, 'utf8'), '{"workspaces":["local"]}');
     assert.equal(
-      existsSync(join(fixture.dshHome, 'sessions', 'root', 'project', 'session-store', 'session.jsonl')),
+      existsSync(join(fixture.dshHome, 'sessions', 'root', 'project', 'session-store', 'session.v4.jsonl')),
       true,
     );
     // The projection pass is newest-wins whole-file in both directions.
@@ -383,7 +476,7 @@ test('reconciliation behind the Sync Store lets the store win storages regardles
       'the Sync Store wins storage units while it is ahead',
     );
     assert.equal(readFileSync(storeWorkspace, 'utf8'), '{"workspaces":["store"]}', 'storages must not be pushed');
-    assert.ok(findFile(join(fixture.storeDir, 'sessions'), 'session.jsonl'), 'session logs still push as a union');
+    assert.ok(findFile(join(fixture.storeDir, 'sessions'), 'session.v4.jsonl'), 'session logs still push as a union');
   } finally {
     fixture.cleanup();
   }
@@ -399,27 +492,27 @@ test('session logs never shrink: pulls skip shorter copies and pushes append', a
 
     const localA = join(fixture.dshHome, 'sessions', 'root', 'project', 'grow-store');
     mkdirSync(localA, { recursive: true });
-    writeFileSync(join(localA, 'session.jsonl'), longBody);
+    writeFileSync(join(localA, 'session.v4.jsonl'), longBody);
     const storeA = join(fixture.storeDir, 'sessions', 'root', 'project', 'grow-store');
     mkdirSync(storeA, { recursive: true });
-    writeFileSync(join(storeA, 'session.jsonl'), shortBody);
-    setMtime(join(storeA, 'session.jsonl'), 1000000);
-    setMtime(join(localA, 'session.jsonl'), 1600000000);
+    writeFileSync(join(storeA, 'session.v4.jsonl'), shortBody);
+    setMtime(join(storeA, 'session.v4.jsonl'), 1000000);
+    setMtime(join(localA, 'session.v4.jsonl'), 1600000000);
 
     const localB = join(fixture.dshHome, 'sessions', 'root', 'project', 'keep-local');
     mkdirSync(localB, { recursive: true });
-    writeFileSync(join(localB, 'session.jsonl'), longBody);
-    setMtime(join(localB, 'session.jsonl'), 1000000);
+    writeFileSync(join(localB, 'session.v4.jsonl'), longBody);
+    setMtime(join(localB, 'session.v4.jsonl'), 1000000);
     const storeB = join(fixture.storeDir, 'sessions', 'root', 'project', 'keep-local');
     mkdirSync(storeB, { recursive: true });
-    writeFileSync(join(storeB, 'session.jsonl'), shortBody);
-    setMtime(join(storeB, 'session.jsonl'), 1600000000);
+    writeFileSync(join(storeB, 'session.v4.jsonl'), shortBody);
+    setMtime(join(storeB, 'session.v4.jsonl'), 1600000000);
 
     const manager = fixture.manager();
     assert.equal(await manager.reconcile(), 'synchronized');
-    assert.equal(readFileSync(join(storeA, 'session.jsonl'), 'utf8'), longBody, 'the push must grow the Sync Store log');
+    assert.equal(readFileSync(join(storeA, 'session.v4.jsonl'), 'utf8'), longBody, 'the push must grow the Sync Store log');
     assert.equal(
-      readFileSync(join(localB, 'session.jsonl'), 'utf8'),
+      readFileSync(join(localB, 'session.v4.jsonl'), 'utf8'),
       longBody,
       'a shorter Sync Store log must never replace the local one',
     );
@@ -492,9 +585,8 @@ test('an unreachable Sync Store fails a push after five attempts', async () => {
     const status = JSON.parse(readFileSync(join(dshHome, STATUS_FILE_NAME), 'utf8'));
     assert.equal(status.status, 'failed');
     assert.ok(status.last_error.length > 0);
-    // Five attempts, each reading the clock for its synchronizing write and its
-    // head-marker timestamp, plus the final failed write.
-    assert.equal(clock.calls, 11);
+    // Five synchronizing writes and the final failure; no marker commit is attempted.
+    assert.equal(clock.calls, 6);
   } finally {
     rmSync(holder, { recursive: true, force: true });
     rmSync(dshHome, { recursive: true, force: true });
@@ -577,7 +669,7 @@ test('a full push carries portable state only and never workstation-wide categor
       'per-session projection documents must transfer as portable state',
     );
     assert.equal(existsSync(join(store, 'attachments', 'v1', 'objects', 'ab', 'abcdef')), true);
-    assert.ok(findFile(join(store, 'sessions'), 'session.jsonl'));
+    assert.ok(findFile(join(store, 'sessions'), 'session.v4.jsonl'));
 
     assert.equal(existsSync(join(store, 'storages', 'session_projcache.json')), false);
     assert.equal(existsSync(join(store, 'attachments', 'v1', 'request-images')), false);
@@ -611,134 +703,63 @@ test('the retry entry point starts no transfer while Session Sync is synchronize
 });
 
 test('real DSH persistence events push saved changes into the Sync Store', async () => {
-  const dshModules = '/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai';
-  const [
-    { Context },
-    { default: SessionStore },
-    { default: JsonlSessionPersistence },
-    { default: Storage },
-    storageJson,
-    storageDomain,
-    { workspaceDomainSpec },
-    { messageFeedbackDomainSpec },
-    plugin,
-  ] = await Promise.all([
-    import(`/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/cordis/lib/index.js`),
-    import(`${dshModules}/dsh-session/lib/index.js`),
-    import(`${dshModules}/dsh-session-persistence-jsonl/lib/index.js`),
-    import(`${dshModules}/dsh-storage/lib/index.js`),
-    import(`${dshModules}/dsh-storage-json/lib/index.js`),
-    import(`${dshModules}/dsh-storage-domain/lib/index.js`),
-    import(`${dshModules}/dsh-workspace/lib/index.js`),
-    import(`${dshModules}/dsh-message-feedback/lib/index.js`),
-    import('./index.mjs'),
-  ]);
-
-  const dshHome = createTempDir();
-  const storeRoot = createTempDir();
-  const storeDir = join(storeRoot, PROJECT_ID);
-  const workspaceDir = join(dshHome, 'workspace');
-  const oldSyncConfigPath = process.env.DEVVM_SYNC_CONFIG_PATH;
-  const oldProjectId = process.env.DEVVM_PROJECT_ID;
-  const ctx = new Context();
-  const forks = [];
-  let workspaceDomain;
-  let feedbackDomain;
-
+  const fixture = createFixture();
+  const workspaceDir = join(fixture.dshHome, 'workspace');
   mkdirSync(workspaceDir);
-  mkdirSync(storeDir, { recursive: true });
-  seedHeadSeq(dshHome, 0);
-  process.env.DEVVM_SYNC_CONFIG_PATH = join(dshHome, 'sync.json');
-  process.env.DEVVM_PROJECT_ID = PROJECT_ID;
-  writeFileSync(
-    process.env.DEVVM_SYNC_CONFIG_PATH,
-    JSON.stringify({ remote_sync_root: storeRoot, writer_id: 'writer-under-test' }),
-  );
-
+  seedHeadSeq(fixture.dshHome, 0);
+  let instance;
+  let workspaceDomain;
   try {
-    forks.push(ctx.plugin(SessionStore));
-    forks.push(ctx.plugin(JsonlSessionPersistence, { root: join(dshHome, 'sessions'), compression: 'none' }));
-    forks.push(ctx.plugin(Storage));
-    forks.push(ctx.plugin(storageJson, { root: join(dshHome, 'storages') }));
-    forks.push(ctx.plugin(storageDomain, { backend: 'json' }));
-    const remoteSyncFork = ctx.plugin(plugin, {
-      dshHome,
-      statusFilePath: join(dshHome, STATUS_FILE_NAME),
+    instance = await createDshInstance(fixture.dshHome, {
+      dshHome: fixture.dshHome,
+      statusFilePath: join(fixture.dshHome, STATUS_FILE_NAME),
+      projectId: PROJECT_ID,
       retryDelayMs: 0,
+      syncConfig: { remote_sync_root: fixture.storeRoot, writer_id: 'writer-under-test' },
     });
-    forks.push(remoteSyncFork);
-
-    await waitFor(
-      () => ctx.sessions && ctx.sessionPersistence && ctx.storageDomain && ctx.remoteSync,
-      'Real DSH services and Remote Sync must activate',
-    );
-    assert.equal(remoteSyncFork.state, 2, 'Remote Sync must be active in the real Cordis context');
-
+    const { ctx } = instance;
     workspaceDomain = await ctx.storageDomain.open(workspaceDomainSpec);
-    feedbackDomain = await ctx.storageDomain.open(messageFeedbackDomainSpec);
-
-    const session = ctx.sessions.create('session-real-contract', { meta: { cwd: workspaceDir } });
+    const { agent } = await ctx.agents.create({ sessionId: 'session-real-contract', meta: { cwd: workspaceDir } });
+    const session = agent.session;
     session.append('turn/start', { turn: 1 });
+    session.append('step/start', { turn: 1, step: 1 });
+    session.append('assistant/message', { turn: 1, step: 1, stream: [], message: { id: 'feedback-target', role: 'assistant', source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' }, content: [{ type: 'text', text: 'Saved response.' }] } }, { surfaceOp: 'append' });
+    session.append('step/end', { turn: 1, step: 1 });
     session.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
-
+    const logPath = ctx.sessionPersistence.locate(session.header).path;
+    assert.equal(basename(logPath), 'session.v4.jsonl');
+    const storeLog = join(fixture.storeDir, relative(fixture.dshHome, logPath));
     await waitFor(
-      () => findFile(storeDir, 'session.jsonl') !== null,
-      'A real completed-turn session/event must push the session log into the Sync Store',
+      () => existsSync(storeLog) && readFileSync(storeLog, 'utf8').includes('"type":"turn/end"'),
+      'A completed-turn event must push the actual rc.2 generation into the Sync Store',
     );
-    const storeLog = findFile(storeDir, 'session.jsonl');
-    assert.match(readFileSync(storeLog, 'utf8'), /"type":"turn\/end"/);
+    assert.equal(JSON.parse(readFileSync(storeLog, 'utf8').split('\n')[0]).version, 4);
 
     await workspaceDomain.global.set(workspaceDomain.global.get());
     await waitFor(
-      () => existsSync(join(storeDir, 'storages', 'workspace.json')),
-      'A real saved workspace domain change must push the storage unit',
+      () => existsSync(join(fixture.storeDir, 'storages', 'workspace.json')),
+      'A saved workspace domain change must push the storage unit',
     );
-
-    await feedbackDomain.table('sessions').put(session.id, {
-      session: { createdAt: session.header.createdAt, cwd: workspaceDir },
-      items: [],
-    });
+    const feedback = await ctx.messageFeedback.put({ sessionId: session.id, messageId: 'feedback-target', rating: 'positive', ifVersion: null });
+    assert.equal(feedback.ok, true);
+    session.append('turn/start', { turn: 2 });
+    session.append('turn/end', { turn: 2, reason: { kind: 'completed' } });
     await waitFor(
-      () => existsSync(join(storeDir, 'storages', 'message_feedback.json')),
-      'A real saved message-feedback change must push the storage unit',
+      () => readFileSync(storeLog, 'utf8').includes('"type":"feedback/message-put"'),
+      'Rc.2 canonical message feedback must synchronize in the session generation',
     );
-
     if (ctx.remoteSync.activeTransfer) await ctx.remoteSync.activeTransfer;
     assert.ok(ctx.remoteSync.headSeq >= 1, 'each successful push advances the head sequence');
-    assert.equal(readMarker(storeDir).writer_id, 'writer-under-test');
+    assert.equal(readMarker(fixture.storeDir).writer_id, 'writer-under-test');
   } finally {
-    await feedbackDomain?.close();
     await workspaceDomain?.close();
-    for (const fork of forks.reverse()) await fork.dispose();
-    if (oldSyncConfigPath === undefined) delete process.env.DEVVM_SYNC_CONFIG_PATH;
-    else process.env.DEVVM_SYNC_CONFIG_PATH = oldSyncConfigPath;
-    if (oldProjectId === undefined) delete process.env.DEVVM_PROJECT_ID;
-    else process.env.DEVVM_PROJECT_ID = oldProjectId;
-    rmSync(dshHome, { recursive: true, force: true });
-    rmSync(storeRoot, { recursive: true, force: true });
+    await instance?.close();
+    fixture.cleanup();
   }
 });
 
 test('reconcile.mjs always exits zero and records the outcome', async () => {
-  function runReconcile(env) {
-    return new Promise((resolve, reject) => {
-      const child = spawn(process.execPath, ['reconcile.mjs'], {
-        cwd: import.meta.dirname,
-        env: { ...process.env, ...env },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      let stdout = '';
-      let stderr = '';
-      child.stdout.on('data', (chunk) => {
-        stdout += chunk.toString();
-      });
-      child.stderr.on('data', (chunk) => {
-        stderr += chunk.toString();
-      });
-      child.on('error', reject);
-      child.on('close', (code) => resolve({ code, stdout, stderr }));
-    });
-  }
+  const runReconcile = runReconcileChild;
 
   const dshHome = createTempDir();
   const storeRoot = createTempDir();
@@ -769,7 +790,7 @@ test('reconcile.mjs always exits zero and records the outcome', async () => {
     const status = JSON.parse(readFileSync(join(dshHome, STATUS_FILE_NAME), 'utf8'));
     assert.equal(status.status, 'synchronized');
     assert.equal(status.head_seq, 0);
-    assert.ok(findFile(join(storeRoot, PROJECT_ID, 'sessions'), 'session.jsonl'));
+    assert.ok(findFile(join(storeRoot, PROJECT_ID, 'sessions'), 'session.v4.jsonl'));
     assert.match(synchronized.stdout, /remote-sync: status synchronized/);
   } finally {
     rmSync(dshHome, { recursive: true, force: true });
@@ -778,73 +799,20 @@ test('reconcile.mjs always exits zero and records the outcome', async () => {
 });
 
 test('session projection documents synchronize in the projection pass and preserve cold listing titles', async () => {
-  const dshModules = '/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai';
-  const [
-    { Context },
-    { default: SessionStore },
-    { default: JsonlSessionPersistence },
-    { default: Storage },
-    storageJson,
-    storageDomain,
-    { default: SessionProjection },
-    { default: SessionProjectionCache },
-    { default: SessionTitleService },
-    { default: SessionQuery },
-    { workspaceDomainSpec },
-    { ApiSessionList },
-  ] = await Promise.all([
-    import('/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/cordis/lib/index.js'),
-    import(`${dshModules}/dsh-session/lib/index.js`),
-    import(`${dshModules}/dsh-session-persistence-jsonl/lib/index.js`),
-    import(`${dshModules}/dsh-storage/lib/index.js`),
-    import(`${dshModules}/dsh-storage-json/lib/index.js`),
-    import(`${dshModules}/dsh-storage-domain/lib/index.js`),
-    import(`${dshModules}/dsh-session-projection/lib/index.js`),
-    import(`${dshModules}/dsh-session-projection-cache/lib/index.js`),
-    import(`${dshModules}/dsh-session-title/lib/index.js`),
-    import(`${dshModules}/dsh-session-query/lib/index.js`),
-    import(`${dshModules}/dsh-workspace/lib/index.js`),
-    import(`${dshModules}/dsh-api-session-controller/lib/types/list.js`),
-  ]);
-
-  async function createDshInstance(home) {
-    const ctx = new Context();
-    const forks = [];
-    forks.push(ctx.plugin(SessionStore));
-    forks.push(ctx.plugin(JsonlSessionPersistence, { root: join(home, 'sessions') }));
-    forks.push(ctx.plugin(Storage));
-    forks.push(ctx.plugin(storageJson, { root: join(home, 'storages') }));
-    forks.push(ctx.plugin(storageDomain, { backend: 'json' }));
-    forks.push(ctx.plugin(SessionProjection));
-    forks.push(ctx.plugin(SessionProjectionCache, { writeEveryEvents: 200, writeIntervalMs: 5000 }));
-    forks.push(ctx.plugin(SessionTitleService, { fallbackMaxWords: 10, fallbackMaxBytes: 100, maxTitleBytes: 200 }));
-    forks.push(ctx.plugin(SessionQuery));
-    await waitFor(
-      () => ctx.sessions && ctx.sessionPersistence && ctx.storageDomain && ctx.sessionProjections && ctx.sessionProjectionCache && ctx.sessionTitle && ctx.sessionQuery,
-      'DSH core services activation',
-    );
-    ctx.provide('agents', { get: () => undefined });
-    const listState = new ApiSessionList(ctx, 1024);
-    return {
-      ctx,
-      forks,
-      listState,
-      async close() {
-        for (const f of forks.reverse()) await f.dispose();
-      },
-    };
-  }
-
   const fixture = createFixture();
   const workstationBHome = createTempDir();
   const sessionId = 'session-cold-title-test';
   const realTitle = 'Add Authentication Middleware';
-  const workspaceCwd = '/root/.dsh';
+  const workspaceCwd = join(fixture.dshHome, 'workspace');
+  mkdirSync(workspaceCwd);
+  let instA;
+  let instB;
+  let wsDomainA;
 
   try {
-    // 1. In workstation A (fixture.dshHome), create a session whose compressed log is > 1024 bytes
-    const instA = await createDshInstance(fixture.dshHome);
-    const wsDomainA = await instA.ctx.storageDomain.open(workspaceDomainSpec);
+    // Create a real agent-owned rc.2 session, then checkpoint it for cold listing.
+    instA = await createDshInstance(fixture.dshHome);
+    wsDomainA = await instA.ctx.storageDomain.open(workspaceDomainSpec);
     await wsDomainA.table('workspaces').put('ws-1', {
       path: workspaceCwd,
       title: '.dsh',
@@ -853,7 +821,8 @@ test('session projection documents synchronize in the projection pass and preser
       updatedAt: new Date().toISOString(),
     });
 
-    const sessionA = instA.ctx.sessions.create(sessionId, { meta: { cwd: workspaceCwd } });
+    const { agent } = await instA.ctx.agents.create({ sessionId, meta: { cwd: workspaceCwd, agentPreset: 'standard-bash' } });
+    const sessionA = agent.session;
     sessionA.append('turn/start', { turn: 1 });
     sessionA.append('user/message', {
       id: 'msg-user-1',
@@ -871,7 +840,11 @@ test('session projection documents synchronize in the projection pass and preser
     for (let i = 0; i < 400; i++) {
       longBody += `Step ${i}: configure route handler authentication with token verification and scope checks ${i * 7919} for endpoint /api/v1/resource/${i * 104729}.\n`;
     }
+    sessionA.append('step/start', { turn: 1, step: 1 });
     sessionA.append('assistant/message', {
+      turn: 1,
+      step: 1,
+      stream: [],
       message: {
         id: 'msg-assistant-1',
         role: 'assistant',
@@ -879,6 +852,7 @@ test('session projection documents synchronize in the projection pass and preser
         content: [{ type: 'text', text: longBody }],
       },
     }, { surfaceOp: 'append' });
+    sessionA.append('step/end', { turn: 1, step: 1 });
     sessionA.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
 
     await instA.ctx.sessions.flush(sessionA);
@@ -886,13 +860,23 @@ test('session projection documents synchronize in the projection pass and preser
 
     const loc = instA.ctx.sessionPersistence.locate(sessionA.header);
     const fileSizeA = statSync(loc.path).size;
-    assert.ok(fileSizeA > 1024, `Compressed session log must exceed 1024 bytes (was ${fileSizeA})`);
+    assert.equal(basename(loc.path), 'session.v4.jsonl');
+    assert.ok(fileSizeA > 1024, `Session generation must exceed 1024 bytes (was ${fileSizeA})`);
+    const genericFileBytes = Buffer.from('portable generic attachment\n');
+    const fileRef = await instA.ctx.attachments.saveFile({ data: genericFileBytes, name: 'portable.txt' });
+    const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADElEQVQImWNgZGIGAAAOAAeCcsnOAAAAAElFTkSuQmCC', 'base64');
+    const imageRef = await instA.ctx.attachments.saveImage({ data: imageBytes, mediaType: 'image/png' });
 
     const projDocPath = join(fixture.dshHome, 'storages', 'session_projcache', 'sessions', `${sessionId}.json`);
     assert.ok(existsSync(projDocPath), 'Session projection document must exist in Workstation A');
+    const actualProjection = JSON.parse(readFileSync(projDocPath, 'utf8'));
+    assert.equal(actualProjection.version, projectionCacheDomainSpec.version);
+    assert.equal(actualProjection.record.identity.formatVersion, 4);
 
     await wsDomainA.close();
+    wsDomainA = undefined;
     await instA.close();
+    instA = undefined;
 
     // 2. Push from Workstation A to Sync Store using real RemoteSyncManager
     const managerA = fixture.manager();
@@ -917,7 +901,7 @@ test('session projection documents synchronize in the projection pass and preser
     );
 
     // 4. Cold-list sessions in Workstation B without opening the session
-    const instB = await createDshInstance(workstationBHome);
+    instB = await createDshInstance(workstationBHome);
     const coldSummariesB = await instB.listState.list();
     const summaryB = coldSummariesB.find((s) => s.sessionId === sessionId);
     assert.ok(summaryB, 'Session summary must be returned in cold listing');
@@ -930,13 +914,106 @@ test('session projection documents synchronize in the projection pass and preser
     assert.notEqual(computedDisplayTitle, workspaceTitleOf(workspaceCwd), 'Display title must not fall back to workspace basename');
     assert.equal(computedDisplayTitle, realTitle, `Computed display title must be "${realTitle}"`);
 
+    assert.equal(instB.ctx.sessions.get(sessionId), undefined, 'cold listing must not open the session');
+    const genericFilePath = instB.ctx.attachments.fileHostPath(fileRef);
+    assert.deepEqual(readFileSync(genericFilePath), genericFileBytes, 'generic-file alias bytes must survive the pull');
+    const objectDirectory = join(workstationBHome, 'attachments', 'v1', 'file-objects');
+    const objectFiles = readdirSync(objectDirectory).flatMap((shard) => readdirSync(join(objectDirectory, shard)).map((name) => join(objectDirectory, shard, name)));
+    assert.equal(objectFiles.length, 1);
+    assert.deepEqual(readFileSync(objectFiles[0]), genericFileBytes, 'canonical generic-file object must also transfer');
+    assert.equal(existsSync(instB.ctx.attachments.imageHostPath(imageRef)), true, 'image object must transfer');
+    const { agent: reopened } = await instB.ctx.agents.resume({ resumeSessionId: sessionId });
+    assert.equal(reopened.session.header.agentPreset, 'standard-bash');
+    assert.equal(instB.ctx.sessionTitle.get(reopened.session).title, realTitle);
+    reopened.session.append('turn/start', { turn: 2 });
+    reopened.session.append('turn/end', { turn: 2, reason: { kind: 'completed' } });
+    await instB.ctx.sessions.flush(reopened.session);
+    const savedEvents = reopened.session.snapshotEvents();
     await instB.close();
+    instB = await createDshInstance(workstationBHome);
+    const { agent: restarted } = await instB.ctx.agents.resume({ resumeSessionId: sessionId });
+    assert.deepEqual(restarted.session.snapshotEvents().slice(0, -1), savedEvents, 'receiving instance must persist appended events across restart');
+    assert.equal(restarted.session.snapshotEvents().at(-1).type, 'session/end-seed', 'resume adds its current end-seed marker');
   } finally {
+    await wsDomainA?.close();
+    await instA?.close();
+    await instB?.close();
     fixture.cleanup();
     rmSync(workstationBHome, { recursive: true, force: true });
   }
 });
 
+
+test('rc.2 migrates copied V3 state and rsync preserves committed generations while excluding staging in both directions', async () => {
+  for (const compression of ['none', 'zstd']) {
+    const fixture = createFixture();
+    const receiverHome = createTempDir();
+    let instance;
+    let receiver;
+    try {
+      const sessionId = `session-v3-${compression}`;
+      instance = await createDshInstance(fixture.dshHome, undefined, compression);
+      const header = { type: 'session', version: 3, id: sessionId, createdAt: 1, isSeeded: false, delegationDepth: 0, agentPreset: 'standard-bash' };
+      const successorPath = instance.ctx.sessionPersistence.locate(header).path;
+      const directory = dirname(successorPath);
+      mkdirSync(directory, { recursive: true });
+      const predecessorPath = join(directory, `session.v3.jsonl${compression === 'zstd' ? '.zstd' : ''}`);
+      const events = [
+        { type: 'turn/start', data: { turn: 1 } },
+        { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+      ].map((event, seq) => ({ ...event, seq, time: seq + 10 }));
+      const headerLine = JSON.stringify(header) + '\n';
+      const eventLines = events.map((row) => JSON.stringify(row)).join('\n') + '\n';
+      const predecessorBytes = compression === 'zstd'
+        ? Buffer.concat([zstdCompressSync(Buffer.from(headerLine)), zstdCompressSync(Buffer.from(eventLines))])
+        : Buffer.from(headerLine + eventLines);
+      writeFileSync(predecessorPath, predecessorBytes);
+      const predecessorStat = statSync(predecessorPath, { bigint: true });
+      const { agent } = await instance.ctx.agents.resume({ resumeSessionId: sessionId });
+      assert.equal(agent.session.header.version, 4);
+      assert.equal(agent.session.header.agentPreset, 'standard-bash');
+      agent.session.append('turn/start', { turn: 2 });
+      agent.session.append('turn/end', { turn: 2, reason: { kind: 'completed' } });
+      await instance.ctx.sessions.flush(agent.session);
+      const savedEvents = agent.session.snapshotEvents();
+      assert.ok(existsSync(successorPath), 'rc.2 must publish its V4 successor');
+      assert.deepEqual(readFileSync(predecessorPath), predecessorBytes);
+      const after = statSync(predecessorPath, { bigint: true });
+      for (const field of ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs']) assert.equal(after[field], predecessorStat[field], `migration must preserve predecessor ${field}`);
+      await instance.close();
+      instance = undefined;
+
+      const stagingNames = ['session.lock', 'session.migration.0123456789ab.jsonl.tmp', 'session.migration.0123456789ab.jsonl.zstd.tmp', 'session.v3.jsonl.0123456789ab.tmp', 'session.v4.jsonl.0123456789ab.tmp', 'session.v4.jsonl.zstd.0123456789ab.tmp'];
+      for (const name of stagingNames) writeFileSync(join(directory, name), 'local staging');
+      assert.equal(await fixture.manager().reconcile(), 'synchronized');
+      const storeDirectory = join(fixture.storeDir, relative(fixture.dshHome, directory));
+      assert.deepEqual(readFileSync(join(storeDirectory, basename(predecessorPath))), predecessorBytes, 'committed V3 must remain union-eligible');
+      assert.deepEqual(readFileSync(join(storeDirectory, basename(successorPath))), readFileSync(successorPath), 'committed V4 must remain union-eligible');
+      for (const name of stagingNames) {
+        assert.equal(existsSync(join(storeDirectory, name)), false, `${name} must not push`);
+        writeFileSync(join(storeDirectory, name), 'remote staging');
+      }
+      const receiverManager = new RemoteSyncManager({
+        dshHome: receiverHome, statusFilePath: join(receiverHome, STATUS_FILE_NAME), projectId: PROJECT_ID, retryDelayMs: 0,
+        syncConfig: { remote_sync_root: fixture.storeRoot, writer_id: 'receiver' },
+      });
+      assert.equal(await receiverManager.reconcile(), 'synchronized');
+      const receiverDirectory = join(receiverHome, relative(fixture.dshHome, directory));
+      for (const name of stagingNames) assert.equal(existsSync(join(receiverDirectory, name)), false, `${name} must not pull`);
+      assert.deepEqual(readFileSync(join(receiverDirectory, basename(predecessorPath))), predecessorBytes);
+      receiver = await createDshInstance(receiverHome, undefined, compression);
+      const { agent: reopened } = await receiver.ctx.agents.resume({ resumeSessionId: sessionId });
+      assert.deepEqual(reopened.session.snapshotEvents().slice(0, -1), savedEvents, 'receiving instance must reopen the committed successor with appended events');
+      assert.equal(reopened.session.snapshotEvents().at(-1).type, 'session/end-seed');
+      assert.equal(reopened.session.header.agentPreset, 'standard-bash');
+    } finally {
+      await instance?.close();
+      await receiver?.close();
+      fixture.cleanup();
+      rmSync(receiverHome, { recursive: true, force: true });
+    }
+  }
+});
 
 test('projection documents replace whole records: append-only flags are never applied to them', async () => {
   const fixture = createFixture();
@@ -952,10 +1029,10 @@ test('projection documents replace whole records: append-only flags are never ap
 
     // The authoritative sender document: a whole-record JSON checkpoint.
     const freshDoc = JSON.stringify({
-      version: 5,
+      version: projectionCacheDomainSpec.version,
       record: {
-        identity: { createdAt: 1788000000000, cwd: '/root/.dsh' },
-        rows: { title: { ver: 2, seq: 11, val: 'Add Authentication Middleware' } },
+        identity: { formatVersion: 4, createdAt: 1788000000000, cwd: fixture.dshHome, isSeeded: false, inheritedEventCount: 0 },
+        rows: { title: { ver: 1, seq: 11, val: 'Add Authentication Middleware' } },
       },
     });
     writeFileSync(join(sessionsDir, 'session-x.json'), freshDoc);
@@ -965,9 +1042,9 @@ test('projection documents replace whole records: append-only flags are never ap
     // record or spliced as stale-prefix plus sender suffix; it is never replaced
     // by the sender's whole record.
     const staleDoc = JSON.stringify({
-      version: 5,
+      version: projectionCacheDomainSpec.version,
       record: {
-        identity: { createdAt: 1788000000000, cwd: '/root/.dsh' },
+        identity: { formatVersion: 4, createdAt: 1788000000000, cwd: fixture.dshHome, isSeeded: false, inheritedEventCount: 0 },
         rows: { title: { ver: 1, seq: 9, val: 'OLD' } },
       },
       tail: { padding: 'this stale record is written longer than the fresh sender record' },
@@ -977,36 +1054,13 @@ test('projection documents replace whole records: append-only flags are never ap
     setMtime(join(storeProjDir, 'session-x.json'), 1000000);
     setMtime(join(sessionsDir, 'session-x.json'), 1600000000);
 
-    // Mutation: route the projection documents through the append-only union
-    // flags, then reconcile in a fresh child process so the change is loaded
-    // (this test file's own static import is cached before the mutation).
-    const indexPath = join(import.meta.dirname, 'index.mjs');
-    const original = readFileSync(indexPath, 'utf8');
-    const mutated = original.replaceAll(
-      'NEWEST_WINS_FLAGS, PROJECTION_FILTER_ARGS',
-      'UNION_FLAGS, PROJECTION_FILTER_ARGS',
-    );
-    assert.notEqual(mutated, original, 'mutation must change projection transfer sites');
-    writeFileSync(indexPath, mutated);
-    const configPath = join(staleHome, 'sync.json');
-    writeFileSync(configPath, JSON.stringify({ remote_sync_root: fixture.storeRoot, writer_id: 'mutation' }));
+    // Demonstrate the regression with real rsync without mutating plugin source.
+    execFileSync('rsync', ['-az', '--update', '--append-verify', ...PROJECTION_FILTER_ARGS, `${fixture.dshHome}/`, `${fixture.storeDir}/`]);
     let mutatedTitle;
     try {
-      const mutatedResult = await runReconcileChild({
-        DSH_HOME: fixture.dshHome,
-        DEVVM_SYNC_STATUS_PATH: join(fixture.dshHome, STATUS_FILE_NAME),
-        DEVVM_PROJECT_ID: PROJECT_ID,
-        DEVVM_SYNC_CONFIG_PATH: configPath,
-      });
-      assert.equal(mutatedResult.code, 0, mutatedResult.stderr);
-      const mutatedStore = readFileSync(join(storeProjDir, 'session-x.json'), 'utf8');
-      try {
-        mutatedTitle = JSON.parse(mutatedStore).record.rows.title.val;
-      } catch {
-        // Spliced stale-prefix plus sender suffix: also the bug.
-      }
-    } finally {
-      writeFileSync(indexPath, original);
+      mutatedTitle = JSON.parse(readFileSync(join(storeProjDir, 'session-x.json'), 'utf8')).record.rows.title.val;
+    } catch {
+      // A stale-prefix/sender-suffix splice is also the regression.
     }
     assert.notEqual(
       mutatedTitle,
@@ -1080,93 +1134,118 @@ test('manifest, bundle patch, and client resolution contract', async () => {
 });
 
 test('web profile integration - dump-config, profile isolation, and sync routes', async () => {
-  const { execSync } = await import('node:child_process');
-
-  const webDump = execSync('dsh --profile web --dump-config', { encoding: 'utf8' });
-  const remoteSyncMatches = webDump.match(/name: ['"]?@devvm\/dsh-remote-sync['"]?/g) || [];
-  const voiceInputMatches = webDump.match(/name: ['"]?@devvm\/dsh-voice-input['"]?/g) || [];
-  assert.equal(remoteSyncMatches.length, 1, 'web dump-config must include @devvm/dsh-remote-sync exactly once');
-  assert.equal(voiceInputMatches.length, 1, 'web dump-config must include @devvm/dsh-voice-input exactly once');
-  assert.ok(
-    webDump.includes('/root/voice-dictation-cleanup/data/archive_voice_input.jsonl'),
-    'voice-input config path must be preserved',
-  );
-
-  const headlessDump = execSync('dsh --profile headless --dump-config', { encoding: 'utf8' });
-  assert.ok(!headlessDump.includes('@devvm/dsh-remote-sync'), 'headless profile dump must exclude @devvm/dsh-remote-sync');
-  assert.ok(!headlessDump.includes('@devvm/dsh-voice-input'), 'headless profile dump must exclude @devvm/dsh-voice-input');
-
-  const testPort = '3599';
-  const statusDir = createTempDir();
-  const dshProcess = spawn('dsh', ['--profile', 'web', '--no-open', '--port', testPort], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, DEVVM_SYNC_STATUS_PATH: join(statusDir, STATUS_FILE_NAME) },
-  });
-
-  let output = '';
-  let errorOutput = '';
-
-  const bootPromise = new Promise((resolve, reject) => {
-    dshProcess.stdout.on('data', (chunk) => {
-      output += chunk.toString();
-      if (output.includes(`dsh web: http://127.0.0.1:${testPort}`)) resolve({ success: true });
-    });
-    dshProcess.stderr.on('data', (chunk) => {
-      errorOutput += chunk.toString();
-    });
-    dshProcess.on('exit', (code) => {
-      if (code !== 0 && !output.includes(testPort)) {
-        reject(new Error(`dsh exited prematurely with code ${code}: ${errorOutput}\n${output}`));
-      }
-    });
-  });
-
-  const timerPromise = new Promise((_, reject) =>
-    setTimeout(
-      () => reject(new Error(`Timeout waiting for dsh web boot. Output: ${output}, Stderr: ${errorOutput}`)),
-      10000,
-    ),
-  );
-
+  const root = createTempDir();
+  const home = join(root, 'home');
+  const workspace = join(root, 'workspace');
+  const archivePath = join(home, 'test-data', 'voice.jsonl');
+  const storeRoot = join(home, 'test-data', 'sync-store');
+  const statusPath = join(home, 'test-data', STATUS_FILE_NAME);
+  const isolationOverlay = join(root, 'web-isolation.patch.json');
+  let dshProcess;
+  let exited;
+  let bootTimeout;
   try {
-    await Promise.race([bootPromise, timerPromise]);
+    mkdirSync(workspace);
+    mkdirSync(storeRoot, { recursive: true });
+    writeFileSync(archivePath, '');
+    writeFileSync(statusPath, JSON.stringify({ status: 'failed', head_seq: 0, last_error: 'fixture retry', updated_at: new Date().toISOString() }));
+    writeMarker(join(storeRoot, PROJECT_ID), 0, 'web-fixture');
+    cpSync(join(candidateHome, 'cordis.patch.yml'), join(home, 'cordis.patch.yml'));
+    cpSync(join(candidateHome, 'style-presets.json'), join(home, 'style-presets.json'));
+    for (const profile of ['web', 'headless']) {
+      const profileDir = join(home, 'profiles', profile);
+      mkdirSync(profileDir, { recursive: true });
+      for (const filename of ['package.json', 'cordis.yml', 'cordis.patch.yml']) {
+        cpSync(join(candidateHome, 'profiles', profile, filename), join(profileDir, filename));
+      }
+      symlinkSync(join(candidateHome, 'profiles', profile, 'node_modules'), join(profileDir, 'node_modules'));
+    }
+    symlinkSync(join(candidateHome, 'profiles', 'node_modules'), join(home, 'profiles', 'node_modules'));
+    writeFileSync(isolationOverlay, JSON.stringify([
+      { id: 'tool-voice-input', config: { file: archivePath } },
+      { id: 'remote-sync', config: { dshHome: home, statusFilePath: statusPath, projectId: PROJECT_ID, retryDelayMs: 0, syncConfig: { remote_sync_root: storeRoot, writer_id: 'web-fixture' } } },
+      { id: 'style-control', config: { filePath: join(home, 'style-presets.json') } },
+    ]));
+    const env = {
+      ...process.env, DSH_HOME: home, DSH_PACKAGE_ENTRY: packageEntry, DSH_TELEMETRY_DISABLED: '1',
+      npm_config_prefix: join(home, 'test-data', 'npm-global'),
+      NPM_CONFIG_PREFIX: join(home, 'test-data', 'npm-global'),
+      DEVVM_WORKSPACE: workspace, DEVVM_PROJECT_ID: PROJECT_ID, DEVVM_SYNC_STATUS_PATH: statusPath,
+      DEVVM_SYNC_CONFIG_PATH: join(home, 'missing-sync-config.json'),
+    };
+    const webArgs = ['--profile', 'web', '--patch', candidateOverlay, '--patch', isolationOverlay];
+    const webDump = execFileSync(process.execPath, [candidateCli, ...webArgs, '--dump-config'], { cwd: workspace, env, encoding: 'utf8' });
+    assert.equal((webDump.match(/name: ['"]?@devvm\/dsh-remote-sync['"]?/g) || []).length, 1);
+    assert.equal((webDump.match(/name: ['"]?@devvm\/dsh-voice-input['"]?/g) || []).length, 1);
+    assert.ok(webDump.includes(archivePath), 'Web must use the isolated voice archive');
+    assert.ok(webDump.includes(storeRoot), 'Web must use the isolated local Sync Store');
+    assert.ok(webDump.includes(statusPath), 'Web must use the isolated status file');
+    assert.match(webDump, /id: panel-mcp-context7\n(?:[^\n]*\n)*?\s+disabled: true/, 'only the fixture disables production Context7');
+    const headlessDump = execFileSync(process.execPath, [candidateCli, '--profile', 'headless', '--dump-config'], { cwd: workspace, env, encoding: 'utf8' });
+    assert.ok(!headlessDump.includes('@devvm/dsh-remote-sync'), 'headless must exclude Remote Sync');
+    assert.ok(!headlessDump.includes('@devvm/dsh-voice-input'), 'headless must exclude Voice Input');
 
-    const directRes = await fetch(`http://127.0.0.1:${testPort}/plugins/@devvm/dsh-remote-sync/client.js`);
-    assert.equal(directRes.status, 404, 'Direct client.js endpoint is removed and must return HTTP 404');
-
-    const tokenMatch = output.match(/\?token=([^\s\r\n]+)/);
-    assert.ok(tokenMatch, 'dsh web output must include launch token');
-    const authRes = await fetch(`http://127.0.0.1:${testPort}/?token=${tokenMatch[1]}`, { redirect: 'manual' });
-    const cookie = authRes.headers.get('set-cookie');
-    const indexRes = await fetch(`http://127.0.0.1:${testPort}/`, {
-      headers: cookie ? { cookie } : {},
+    dshProcess = spawn(process.execPath, [candidateCli, ...webArgs, '--no-open', '--host', '127.0.0.1', '--port', '0'], {
+      cwd: workspace, env, stdio: ['ignore', 'pipe', 'pipe'],
     });
-    assert.equal(indexRes.status, 200, 'Index HTML must return HTTP 200');
+    exited = once(dshProcess, 'close');
+    let output = '';
+    let errorOutput = '';
+    const ready = new Promise((resolve, reject) => {
+      dshProcess.stdout.on('data', (chunk) => {
+        output += chunk.toString();
+        const match = output.match(/dsh web: (http:\/\/127\.0\.0\.1:\d+\/[^\s]*)/);
+        if (match) resolve(new URL(match[1]));
+      });
+      dshProcess.stderr.on('data', (chunk) => { errorOutput += chunk.toString(); });
+      dshProcess.on('error', reject);
+      dshProcess.on('close', (code) => reject(new Error(`dsh exited before ready (${code}): ${errorOutput}\n${output}`)));
+      bootTimeout = setTimeout(() => reject(new Error(`Timeout waiting for staged Web: ${errorOutput}\n${output}`)), 30000);
+    });
+    const readyUrl = await ready;
+    clearTimeout(bootTimeout);
+    assert.notEqual(readyUrl.port, '0', 'the ready URL must report the assigned port');
+    assert.ok(readyUrl.searchParams.has('token'), 'the ready URL must include its launch token');
+    const authRes = await fetch(readyUrl, { redirect: 'manual' });
+    assert.equal(authRes.status, 303);
+    const cookie = authRes.headers.get('set-cookie')?.split(';')[0];
+    assert.ok(cookie, 'launch token exchange must issue an authentication cookie');
+    const headers = { cookie };
+    const origin = readyUrl.origin;
+    const directRes = await fetch(`${origin}/plugins/@devvm/dsh-remote-sync/client.js`, { headers });
+    assert.equal(directRes.status, 404, 'Direct client.js endpoint must remain removed');
+    const indexRes = await fetch(`${origin}/`, { headers });
+    assert.equal(indexRes.status, 200);
     const indexHtml = await indexRes.text();
-    const comboMatch = indexHtml.match(/\/plugins\/\?\?@devvm\/dsh-remote-sync\/client\.js&rev=[^"'\s\\]+/);
-    assert.ok(comboMatch, 'Combo URL for @devvm/dsh-remote-sync must be present in index HTML');
-
-    const clientRes = await fetch(`http://127.0.0.1:${testPort}${comboMatch[0]}`);
-    assert.equal(clientRes.status, 200, 'Client bundle combo endpoint must return HTTP 200');
-    const clientText = await clientRes.text();
-    assert.ok(clientText.includes('@devvm/dsh-remote-sync'), 'Client bundle text must include @devvm/dsh-remote-sync');
-
-    const statusRes = await fetch(`http://127.0.0.1:${testPort}/api/sync/status`);
-    assert.equal(statusRes.status, 200, '/api/sync/status endpoint must return HTTP 200');
+    const comboUrl = [...indexHtml.matchAll(/plugins\/\?\?[^"'\s\\]+/g)]
+      .map(([url]) => url.replaceAll('&amp;', '&'))
+      .find((url) => url.includes('@devvm/dsh-remote-sync/client.js'));
+    assert.ok(comboUrl, 'Remote Sync must be included in the advertised rc.2 client batches');
+    const clientRes = await fetch(new URL(comboUrl, `${origin}/`), { headers });
+    assert.equal(clientRes.status, 200);
+    assert.ok((await clientRes.text()).includes('@devvm/dsh-remote-sync'));
+    const statusRes = await fetch(`${origin}/api/sync/status`, { headers });
+    assert.equal(statusRes.status, 200);
     const statusBody = await statusRes.json();
-    assert.deepEqual(
-      Object.keys(statusBody).sort(),
-      ['daemon_url', 'head_seq', 'last_error', 'project_id', 'status', 'updated_at'],
-    );
-
-    const retryRes = await fetch(`http://127.0.0.1:${testPort}/api/sync/retry`, { method: 'POST' });
-    assert.equal(retryRes.status, 200, '/api/sync/retry endpoint must return HTTP 200');
-    assert.ok(typeof (await retryRes.json()).status === 'string');
-
-    const triggerRes = await fetch(`http://127.0.0.1:${testPort}/api/sync/trigger`, { method: 'POST' });
-    assert.notEqual(triggerRes.status, 200, 'the removed /api/sync/trigger route must not answer');
+    assert.deepEqual(Object.keys(statusBody).sort(), ['daemon_url', 'head_seq', 'last_error', 'project_id', 'status', 'updated_at']);
+    assert.equal(statusBody.project_id, PROJECT_ID);
+    const retryRes = await fetch(`${origin}/api/sync/retry`, { method: 'POST', headers });
+    assert.equal(retryRes.status, 200);
+    assert.equal((await retryRes.json()).status, 'synchronized');
+    assert.ok(existsSync(statusPath), 'the status route must operate on the isolated home');
+    assert.ok(existsSync(join(storeRoot, PROJECT_ID, HEAD_MARKER_NAME)), 'retry must publish only to the isolated store');
+    const checkRes = await fetch(`${origin}/api/sync/check`, { method: 'POST', headers });
+    assert.equal(checkRes.status, 200);
+    assert.equal((await checkRes.json()).status, 'synchronized');
+    const triggerRes = await fetch(`${origin}/api/sync/trigger`, { method: 'POST', headers });
+    assert.notEqual(triggerRes.status, 200, 'the removed trigger route must not answer');
   } finally {
-    dshProcess.kill('SIGTERM');
-    rmSync(statusDir, { recursive: true, force: true });
+    clearTimeout(bootTimeout);
+    if (dshProcess) {
+      if (dshProcess.exitCode === null && dshProcess.signalCode === null) dshProcess.kill('SIGTERM');
+      const killTimeout = setTimeout(() => dshProcess.kill('SIGKILL'), 5000);
+      try { await exited; } finally { clearTimeout(killTimeout); }
+    }
+    rmSync(root, { recursive: true, force: true });
   }
 });

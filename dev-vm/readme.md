@@ -30,6 +30,8 @@ DevVM Workspace Supervision: isolated development microVMs for OpenCode and Deep
 
 ## Setup
 
+Setup pins Smolvm to `1.19.3`. It skips installation when that exact version is present and replaces any other installed version with the pin.
+
 ```sh
 ./setup-devvm.sh
 ```

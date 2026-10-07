@@ -8,15 +8,15 @@ use std::process::Command;
 use tempfile::tempdir;
 
 #[test]
-fn test_web_profile_links_first_party_plugins_to_their_sources() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let profile_path = manifest_dir.join("root/.dsh/profiles/web/package.json");
+fn test_web_profile_installs_local_plugins_as_packages() {
+    let profile_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("root/.dsh/profiles/web/package.json");
     let profile: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&profile_path).unwrap()).unwrap();
     let dependencies = profile["dependencies"].as_object().unwrap();
-    let node_modules = manifest_dir.join("root/.dsh/profiles/web/node_modules");
 
     for (package, source) in [
+        ("@devvm/dsh-agent-presets", "agent-presets"),
         ("@devvm/dsh-build-loop", "build-loop"),
         ("@devvm/dsh-remote-sync", "remote-sync"),
         ("@devvm/dsh-style-control", "style-control"),
@@ -26,30 +26,8 @@ fn test_web_profile_links_first_party_plugins_to_their_sources() {
     ] {
         assert_eq!(
             dependencies.get(package).and_then(|value| value.as_str()),
-            Some(format!("link:/root/.dsh/plugins/{source}").as_str()),
-            "{package} manifest spec must be link:/root/.dsh/plugins/{source}"
-        );
-
-        let installed_path = node_modules.join(package);
-        let metadata = fs::symlink_metadata(&installed_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to read metadata for {}: {e}",
-                installed_path.display()
-            )
-        });
-        assert!(
-            metadata.file_type().is_symlink(),
-            "{package} at {} must be a symbolic link rather than a hardlinked directory",
-            installed_path.display()
-        );
-
-        let target = fs::canonicalize(&installed_path)
-            .unwrap_or_else(|e| panic!("failed to canonicalize {}: {e}", installed_path.display()));
-        let expected_target = fs::canonicalize(manifest_dir.join("root/.dsh/plugins").join(source))
-            .unwrap_or_else(|e| panic!("failed to canonicalize source for {source}: {e}"));
-        assert_eq!(
-            target, expected_target,
-            "{package} symlink must resolve to its source directory"
+            Some(format!("file:../../plugins/{source}").as_str()),
+            "{package} must use a portable native package dependency"
         );
     }
 }
@@ -93,20 +71,21 @@ fn test_web_profile_third_party_plugin_pins() {
     assert_eq!(
         deps.get("@hytime/dsh-thinking-effort")
             .and_then(|v| v.as_str()),
-        Some("^0.2.4")
+        Some("0.3.6")
     );
     assert_eq!(
         deps.get("dsh-better-sidebar").and_then(|v| v.as_str()),
-        Some("^0.19.1")
+        Some("0.24.1")
     );
 }
 
 #[test]
-fn test_web_profile_lockfile_has_no_file_links_for_local_plugins() {
+fn test_web_profile_lockfile_packages_local_plugins() {
     let lockfile_path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("root/.dsh/profiles/web/pnpm-lock.yaml");
     let lockfile_content = fs::read_to_string(&lockfile_path).unwrap();
     for plugin in [
+        "agent-presets",
         "build-loop",
         "remote-sync",
         "style-control",
@@ -115,26 +94,24 @@ fn test_web_profile_lockfile_has_no_file_links_for_local_plugins() {
         "dsh-skill-mcp-panel",
     ] {
         assert!(
-            !lockfile_content.contains(&format!("file:/root/.dsh/plugins/{plugin}")),
-            "lockfile must not contain file: specifier for {plugin}"
+            lockfile_content.contains(&format!("specifier: file:../../plugins/{plugin}")),
+            "lockfile must install {plugin} as a local package"
         );
         assert!(
-            !lockfile_content.contains(&format!("file:../../../../root/.dsh/plugins/{plugin}")),
-            "lockfile must not contain file: version for {plugin}"
+            lockfile_content.contains(&format!(
+                "resolution: {{directory: ../../plugins/{plugin}, type: directory}}"
+            )),
+            "lockfile must resolve {plugin} through pnpm's package installer"
         );
         assert!(
-            lockfile_content.contains(&format!("specifier: link:/root/.dsh/plugins/{plugin}")),
-            "lockfile must contain link: specifier for {plugin}"
-        );
-        assert!(
-            lockfile_content.contains(&format!("version: link:../../plugins/{plugin}")),
-            "lockfile must contain link: version for {plugin}"
+            !lockfile_content.contains(&format!("link:/root/.dsh/plugins/{plugin}")),
+            "lockfile must not link directly to {plugin} source"
         );
     }
 
     assert!(
-        lockfile_content.contains("'@hytime/dsh-thinking-effort@0.2.0':"),
-        "lockfile must contain @hytime/dsh-thinking-effort locked at 0.2.0"
+        lockfile_content.contains("'@hytime/dsh-thinking-effort@0.3.6':"),
+        "lockfile must contain @hytime/dsh-thinking-effort locked at 0.3.6"
     );
     assert!(
         !lockfile_content.contains("38f541073e7193d940a9ab5295cf8eb1e5ad5d6d"),
@@ -151,35 +128,6 @@ fn test_headless_profile_lockfile_does_not_contain_duplicate_web_fetch() {
         !lockfile_content.contains("@deepseek-ai/dsh-web-fetch-http"),
         "headless lockfile must not contain @deepseek-ai/dsh-web-fetch-http"
     );
-}
-
-#[test]
-fn test_plugins_directory_has_fallback_node_modules_symlink() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let link_path = manifest_dir.join("root/.dsh/plugins/node_modules");
-    let metadata = fs::symlink_metadata(&link_path)
-        .unwrap_or_else(|e| panic!("failed to read metadata for {}: {e}", link_path.display()));
-    assert!(
-        metadata.file_type().is_symlink(),
-        "{} must be a symbolic link",
-        link_path.display()
-    );
-    let target = fs::read_link(&link_path).unwrap_or_else(|e| {
-        panic!(
-            "failed to read link target for {}: {e}",
-            link_path.display()
-        )
-    });
-    assert_eq!(
-        target,
-        Path::new("../profiles/node_modules"),
-        "plugins/node_modules must point to ../profiles/node_modules"
-    );
-    let canonical = fs::canonicalize(&link_path)
-        .unwrap_or_else(|e| panic!("failed to canonicalize {}: {e}", link_path.display()));
-    let expected = fs::canonicalize(manifest_dir.join("root/.dsh/profiles/node_modules"))
-        .unwrap_or_else(|e| panic!("failed to canonicalize profiles/node_modules: {e}"));
-    assert_eq!(canonical, expected);
 }
 
 #[test]
@@ -753,7 +701,7 @@ chmod +x "$DEVVM_HOME/target/release/devvm-daemon"
         fs::read_to_string(home.join(".smolvm/.version"))
             .unwrap()
             .trim(),
-        "1.13.1"
+        "1.19.3"
     );
     assert_eq!(
         fs::read_to_string(home.join(".local/bin/devvm-daemon")).unwrap(),
@@ -767,7 +715,7 @@ chmod +x "$DEVVM_HOME/target/release/devvm-daemon"
         fs::read_to_string(home.join(".smolvm/.version"))
             .unwrap()
             .trim(),
-        "1.13.1"
+        "1.19.3"
     );
     assert_eq!(
         fs::read_to_string(home.join(".local/bin/devvm-daemon")).unwrap(),

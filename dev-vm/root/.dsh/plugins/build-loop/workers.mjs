@@ -8,7 +8,7 @@ import { HANDOFF_SCHEMA, VERDICT_SCHEMA } from './schemas.mjs'
 import { parseReport, textOf, validateHandoff, validateVerdict } from './loop.mjs'
 import { assignment, FORMAT_REPAIR, auditAssignment, reminder } from './assignments.mjs'
 
-const message = (text) => createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'plugin', plugin: 'build-loop', form: 'instructions' } })
+const message = (text) => createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'build-loop', form: 'instructions' } })
 const turnEnd = (agent, boundary = 0) => foldConsumedWork(agent.session.snapshotEvents(boundary)).end?.data.reason
 
 export class Workers {
@@ -41,12 +41,12 @@ export class Workers {
   async collect(worker) {
     const jobs = this.ctx.get('jobs')
     if (!jobs) return
-    const owner = worker.child.localAgent
-    for (const item of jobs.list(owner).filter((j) => j.ownerSession === owner.session.id)) {
-      if (['running', 'stopping'].includes(item.status)) jobs.kill(item.id, owner, 'Build phase ended; source must be quiescent')
-      let settled = jobs.get(item.id, owner)
-      while (['running', 'stopping'].includes(settled.status)) settled = await jobs.wait(item.id, 60000, owner)
-      jobs.read(item.id, owner)
+    const ownerId = worker.child.localAgent.session.id
+    for (const item of jobs.list(ownerId).filter((job) => job.owner === ownerId)) {
+      if (['running', 'stopping'].includes(item.status)) jobs.kill(item.id, ownerId, 'Build phase ended; source must be quiescent')
+      let settled = jobs.get(item.id, ownerId)
+      while (['running', 'stopping'].includes(settled.status)) settled = await jobs.wait(item.id, 60000, ownerId)
+      jobs.read(item.id, ownerId)
     }
   }
 

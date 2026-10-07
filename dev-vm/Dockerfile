@@ -5,7 +5,7 @@ ARG NODE_VERSION=24.19.0
 ARG NVM_VERSION=0.40.6
 ARG FRP_VERSION=0.71.0
 ARG CADDY_VERSION=2.11.4
-ARG DSH_VERSION=0.1.5-rc.2
+ARG DSH_VERSION=0.2.0-rc.2
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_HOME=/root/.cargo \
@@ -175,8 +175,7 @@ RUN set -eux; \
     package_dir=/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-connection; \
     client_target="$package_dir/lib/client.js"; \
     server_target="$package_dir/lib/index.js"; \
-    printf '%s  %s\n' '319cc46762af6ccb7ac74c9bab37ab8377be212dad9de4dba1f892b7e5b4d8a1' "$client_target" | sha256sum --check -; \
-    printf '%s  %s\n' 'bbe7c9aa6d82a7a4ec657aa8bc51064e12bb091be0465526d0b9f5e031f540f7' "$server_target" | sha256sum --check -; \
+    patch --batch --forward --dry-run --strip=1 --directory="$package_dir" < /tmp/deepseek-harness-localhost-subdomains.patch; \
     patch --batch --forward --strip=1 --directory="$package_dir" < /tmp/deepseek-harness-localhost-subdomains.patch; \
     grep -Fq 'hostname.endsWith(".localhost")' "$client_target"; \
     grep -Fq 'hostname.endsWith(".localhost")' "$server_target"; \

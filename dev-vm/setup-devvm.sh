@@ -3,6 +3,7 @@ set -euo pipefail
 
 DEVVM_HOME="${DEVVM_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 FRP_VERSION=0.71.0
+SMOLVM_VERSION=1.19.3
 FRPS_BIN="$HOME/.local/bin/frps"
 INSTALL_SERVICE=0
 SKIP_IMAGE=0
@@ -10,7 +11,6 @@ REMOTE=0
 REMOTE_DOMAIN=""
 REMOTE_IP=""
 SMOLVM_INSTALLER_URL="https://smolmachines.com/install.sh"
-SMOLVM_RELEASE_URL="https://github.com/smol-machines/smolvm/releases/latest"
 
 installed_smolvm_version() {
     if [[ -f "$HOME/.smolvm/.version" ]]; then
@@ -21,11 +21,6 @@ installed_smolvm_version() {
             | head -1
     fi
     return 0
-}
-
-latest_smolvm_version() {
-    curl -fsSLI -o /dev/null -w '%{url_effective}' "$SMOLVM_RELEASE_URL" \
-        | sed -nE 's#.*/releases/tag/v?([^/]+)$#\1#p'
 }
 
 # Parse command-line flags
@@ -88,23 +83,18 @@ mkdir -p "$HOME/.local/bin"
 mkdir -p "$DEVVM_HOME/root/.config/devvm"
 install -d -m 0700 "$DEVVM_HOME/root/.ssh"
 
-echo "=== Installing or upgrading smolvm ==="
-LATEST_SMOLVM_VERSION="$(latest_smolvm_version)"
-if [[ -z "$LATEST_SMOLVM_VERSION" ]]; then
-    echo "Failed to determine the latest smolvm release." >&2
-    exit 1
-fi
+echo "=== Ensuring smolvm $SMOLVM_VERSION ==="
 CURRENT_SMOLVM_VERSION="$(installed_smolvm_version)"
-if [[ "$CURRENT_SMOLVM_VERSION" == "$LATEST_SMOLVM_VERSION" ]]; then
-    echo "smolvm $CURRENT_SMOLVM_VERSION is already up to date."
+if [[ "$CURRENT_SMOLVM_VERSION" == "$SMOLVM_VERSION" ]]; then
+    echo "smolvm $CURRENT_SMOLVM_VERSION matches the pinned version."
 else
     if [[ -n "$CURRENT_SMOLVM_VERSION" ]]; then
-        echo "Upgrading smolvm $CURRENT_SMOLVM_VERSION -> $LATEST_SMOLVM_VERSION..."
+        echo "Replacing smolvm $CURRENT_SMOLVM_VERSION with $SMOLVM_VERSION..."
     else
-        echo "Installing smolvm $LATEST_SMOLVM_VERSION..."
+        echo "Installing smolvm $SMOLVM_VERSION..."
     fi
     curl -fsSL "$SMOLVM_INSTALLER_URL" \
-        | bash -s -- --version "$LATEST_SMOLVM_VERSION"
+        | bash -s -- --version "$SMOLVM_VERSION"
 fi
 
 case "$(uname -s)" in

@@ -3,8 +3,9 @@
     mode: danger-full-access
     workspaceRoot: !!js process.cwd()
 
+# PTC requires the service; danger-full-access above keeps execution unrestricted.
 - id: sandbox
-  disabled: true
+  disabled: false
 
 - id: bash-sandbox
   disabled: true
@@ -21,30 +22,17 @@
 - id: approval
   disabled: true
 
-- id: compaction-basic
-  config:
-    thresholdRatio: 0.5
-    maxTokens: 10000
-    compactionRetries: 5
-    maxOverflowRetries: 5
-
-- id: tool-result-pruner
-  config:
-    thresholdChars: 8192
-    headChars: 2048
-    tailChars: 1024
-
-- id: tool-web
-  disabled: false
-  config:
-    search: false
-    fetch: true
-
 - insert:
     - id: bash-local
       name: '@deepseek-ai/dsh-bash-local'
       config:
-        timeoutMs: 60000
+        timeoutMs: 1200000
+        maxTimeoutMs: 1200000
+        maxOutputBytes: 20000
 
     - id: fs-local
       name: '@deepseek-ai/dsh-fs-local'
+
+- id: ui-conversation
+  config:
+    busyEnter: steer

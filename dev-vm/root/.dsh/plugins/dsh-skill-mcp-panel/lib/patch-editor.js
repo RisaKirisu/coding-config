@@ -6,17 +6,7 @@
  */
 import { open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { parseDocument, Document } from "yaml";
-
-export const jsTag = {
-    tag: "tag:yaml.org,2002:js",
-    identify: (value) => value && typeof value === "object" && "__jsExpr" in value,
-    resolve: (str) => ({ __jsExpr: str }),
-    stringify(item) {
-        return JSON.stringify(item.value.__jsExpr);
-    }
-};
-
+import { parseDocument, stringify } from "yaml";
 export const PANEL_MCP_BLOCK_BEGIN = "# >>> dsh-skill-mcp-panel:mcp:begin";
 export const PANEL_MCP_BLOCK_END = "# <<< dsh-skill-mcp-panel:mcp:end";
 export const MCP_PLUGIN_NAME = "@deepseek-ai/dsh-mcp-client";
@@ -33,7 +23,7 @@ export async function readPatchFile(path) {
 }
 /** 校验整份 patch 文本：可解析且顶层是数组。不解出/写回任何值。 */
 export async function validatePatchText(raw) {
-    const doc = parseDocument(raw, { logLevel: "silent", customTags: [jsTag] });
+    const doc = parseDocument(raw, { logLevel: "silent" });
     if (doc.errors.length > 0) {
         throw new Error("cordis.patch.yml 解析失败：" + String(doc.errors[0]?.message ?? doc.errors[0]));
     }
@@ -89,7 +79,7 @@ export function extractManagedRows(raw) {
     if (blockStart < 0)
         throw new Error("cordis.patch.yml 受管块格式损坏");
     const blockText = raw.slice(blockStart + 1, end);
-    const doc = parseDocument(blockText, { logLevel: "silent", customTags: [jsTag] });
+    const doc = parseDocument(blockText, { logLevel: "silent" });
     if (doc.errors.length > 0)
         throw new Error("受管块解析失败：" + String(doc.errors[0]?.message ?? doc.errors[0]));
     const parsed = doc.toJS();
@@ -99,7 +89,7 @@ export function extractManagedRows(raw) {
 }
 /** 解析整份 patch 并返回其中所有 MCP 客户端行（不区分是否受管）。 */
 export function listMcpPatchRows(raw) {
-    const doc = parseDocument(raw, { logLevel: "silent", customTags: [jsTag] });
+    const doc = parseDocument(raw, { logLevel: "silent" });
     if (doc.errors.length > 0)
         return [];
     const parsed = doc.toJS();
@@ -111,8 +101,7 @@ export function listMcpPatchRows(raw) {
 export function generateManagedBlock(rows) {
     if (rows.length === 0)
         return "";
-    const doc = new Document([{ insert: rows }], { customTags: [jsTag] });
-    const body = doc.toString({ indent: 2, lineWidth: 0 });
+    const body = stringify([{ insert: rows }], { indent: 2, lineWidth: 0 });
     return PANEL_MCP_BLOCK_BEGIN + "\n" + body + PANEL_MCP_BLOCK_END + "\n";
 }
 /**

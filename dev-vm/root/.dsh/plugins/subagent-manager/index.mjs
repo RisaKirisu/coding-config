@@ -7,18 +7,19 @@ export { isSubagent, normalizeConfig }
 export const name = 'subagent-manager'
 export const inject = ['settings', 'tools', 'webServer', 'llm', 'systemPrompt']
 
-const SETTINGS_NS = 'subagent-model'
-const DEFAULT_CONFIG = Object.freeze({
-  provider: '',
-  model: '',
-  reasoningEffort: '',
+export const Config = z.object({
+  provider: z.string().default('').volatile(),
+  model: z.string().default('').volatile(),
+  reasoningEffort: z.string().default('').volatile(),
 })
 
-const ConfigSchema = z.object({
-  provider: z.string().default(''),
-  model: z.string().default(''),
-  reasoningEffort: z.string().default(''),
-})
+function currentConfig(config) {
+  return normalizeConfig({
+    provider: config.provider.get(),
+    model: config.model.get(),
+    reasoningEffort: config.reasoningEffort.get(),
+  })
+}
 
 
 function json(res, status, value) {
@@ -64,14 +65,14 @@ async function modelDirectory(llm) {
   return { providers, modelsByProvider, reasoningByModel }
 }
 
-function registerRoutes(ctx, scope) {
+function registerRoutes(ctx, config) {
   const routes = [
     ctx.webServer.register({
       kind: 'exact',
       path: '/api/subagent-manager/config',
       handler: async (req, res) => {
         if (req.method === 'GET' || req.method === 'HEAD') {
-          json(res, 200, normalizeConfig(scope.get()))
+          json(res, 200, currentConfig(config))
           return
         }
         if (req.method !== 'POST') {
@@ -80,8 +81,8 @@ function registerRoutes(ctx, scope) {
         }
         try {
           const next = normalizeConfig(await readJson(req))
-          await scope.update(next)
-          json(res, 200, normalizeConfig(scope.get()))
+          await ctx.settings.update('subagent-manager', next)
+          json(res, 200, currentConfig(config))
         } catch (error) {
           json(res, 400, { error: error?.message || String(error) })
         }
@@ -195,14 +196,14 @@ function registerWaitTool(ctx) {
   }))
 }
 
-export function apply(ctx) {
-  const scope = ctx.settings.register(SETTINGS_NS, ConfigSchema, { base: DEFAULT_CONFIG })
+export function apply(ctx, config) {
+  ctx.effect(() => ctx.settings.configure({ auto: false }, ctx.fiber))
 
   ctx.on('agent/request', async (payload, next) => {
     const request = await next()
     if (!isSubagent(payload?.agent)) return request
 
-    const configured = normalizeConfig(scope.get())
+    const configured = currentConfig(config)
     if (!configured.provider || !configured.model) return request
 
     return {
@@ -215,6 +216,6 @@ export function apply(ctx) {
     }
   }, { global: true })
 
-  ctx.effect(() => registerRoutes(ctx, scope), 'subagent-manager: web routes')
+  ctx.effect(() => registerRoutes(ctx, config), 'subagent-manager: web routes')
   registerWaitTool(ctx)
 }

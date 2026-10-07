@@ -48,7 +48,9 @@ ensure_ingress() {
         return
     fi
 
-    nohup "${command[@]}" >/dev/null 2>&1 &
+    local log_dir="$HOME/.local/state/devvm"
+    install -d -m 0700 "$log_dir"
+    nohup "${command[@]}" >>"$log_dir/frps.log" 2>&1 &
     local pid=$!
     sleep 0.2
     if ! kill -0 "$pid" 2>/dev/null; then
@@ -149,16 +151,16 @@ link_root() {
             ln -s "$source" "$target"
         done
 
-        # link: plugins resolve peer deps via this fallback; pnpm does not manage it.
-        [[ -L /root/.dsh/plugins/node_modules ]] \
-            || ln -sfn ../profiles/node_modules /root/.dsh/plugins/node_modules
-
-        profile=/root/.dsh/profiles/web
-        if command -v dsh >/dev/null 2>&1 \
-            && [[ -f "$profile/package.json" ]] \
-            && { [[ ! -f "$profile/node_modules/.pnpm/lock.yaml" ]] \
-                || ! cmp -s "$profile/pnpm-lock.yaml" "$profile/node_modules/.pnpm/lock.yaml"; }; then
-            CI=true DSH_HOME=/root/.dsh dsh plugin --profile web install --frozen-lockfile
+        if command -v dsh >/dev/null 2>&1; then
+            store=/root/workspace/.pnpm-store/v11
+            for name in web headless; do
+                profile="/root/.dsh/profiles/$name"
+                if [[ -f "$profile/package.json" ]] \
+                    && { [[ ! -f "$profile/node_modules/.pnpm/lock.yaml" ]] \
+                        || ! cmp -s "$profile/pnpm-lock.yaml" "$profile/node_modules/.pnpm/lock.yaml"; }; then
+                    CI=true DSH_HOME=/root/.dsh dsh plugin --profile "$name" install --frozen-lockfile --store-dir "$store"
+                fi
+            done
         fi
     ' link-root
 }

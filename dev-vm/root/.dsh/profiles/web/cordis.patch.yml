@@ -1,9 +1,393 @@
+# Profile-owned rc.2 settings; editable fields remain writable through Web.
+- id: llm-pi-ai
+  config:
+    providers:
+      krill-codex:
+        displayName: Krill
+        apiKeyEnv: KRILL_CODEX_API_KEY
+        api: openai-responses
+        baseURL: https://api.krill-code.net/codex/v1
+        models:
+          - id: gpt-6-astra
+            contextWindow: 300000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              off: low
+              minimal: low
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+            compat:
+              chatTemplateKwargs: {}
+              chatTemplateArgs: {}
+          - id: gpt-6.1-sol
+            name: gpt-6.1-sol
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              off: low
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+            compat:
+              chatTemplateKwargs: {}
+              chatTemplateArgs: {}
+        modelOverrides: {}
+        compat:
+          chatTemplateKwargs: {}
+          chatTemplateArgs: {}
+        defaultContextWindow: 262144
+        defaultMaxTokens: 32768
+        defaultInput:
+          - text
+        headers: {}
+        thinkingBudgets: {}
+        streamIdleTimeoutMs: 300000
+        maxRequestImageBytes: 20971520
+        requestImagePixelBudget: 4194304
+        requestImageMaxBytes: 1048576
+      krill-china:
+        displayName: Krill
+        apiKeyEnv: KRILL_CHINA_API_KEY
+        api: openai-responses
+        baseURL: https://api.krill-code.net/coding/v1
+        models:
+          - id: kimi-k3
+            input: []
+            reasoningEfforts:
+              off: null
+              high: high
+              max: max
+            compat:
+              chatTemplateKwargs: {}
+              chatTemplateArgs: {}
+          - id: deepseek-v4.1-flash
+            contextWindow: 300000
+            input: []
+            compat:
+              chatTemplateKwargs: {}
+              chatTemplateArgs: {}
+            reasoningEfforts:
+              off: null
+              high: high
+              max: max
+          - id: GLM-5.3
+            input: []
+            compat:
+              chatTemplateKwargs: {}
+              chatTemplateArgs: {}
+            reasoningEfforts:
+              off: null
+              high: high
+              max: max
+          - id: GLM-5.3-Flash
+            input: []
+            compat:
+              chatTemplateKwargs: {}
+              chatTemplateArgs: {}
+            reasoningEfforts:
+              off: null
+              high: high
+              max: max
+        modelOverrides: {}
+        compat:
+          chatTemplateKwargs: {}
+          chatTemplateArgs: {}
+        defaultContextWindow: 262144
+        defaultMaxTokens: 32768
+        defaultInput:
+          - text
+        headers: {}
+        thinkingBudgets: {}
+        streamIdleTimeoutMs: 300000
+        maxRequestImageBytes: 20971520
+        requestImagePixelBudget: 4194304
+        requestImageMaxBytes: 1048576
+      amazon-bedrock:
+        baseURL: https://bedrock-runtime.us-west-2.amazonaws.com
+        models:
+          - id: arn:aws:bedrock:us-west-2:233532778289:application-inference-profile/zcsopmpsss4d
+            name: Claude Opus 5
+            contextWindow: 1000000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              off: null
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+            compat:
+              chatTemplateKwargs: {}
+              chatTemplateArgs: {}
+          - id: arn:aws:bedrock:us-west-2:233532778289:application-inference-profile/gbb5tf1qqz2r
+            name: Claude Fable 5.1
+            contextWindow: 1000000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              off: null
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+            compat:
+              chatTemplateKwargs: {}
+              chatTemplateArgs: {}
+        apiKeyEnv: AMAZON_BEDROCK_API_KEY
+        modelOverrides: {}
+        compat:
+          chatTemplateKwargs: {}
+          chatTemplateArgs: {}
+        defaultContextWindow: 262144
+        defaultMaxTokens: 32768
+        defaultInput:
+          - text
+        headers: {}
+        thinkingBudgets: {}
+        streamIdleTimeoutMs: 300000
+        maxRequestImageBytes: 20971520
+        requestImagePixelBudget: 4194304
+        requestImageMaxBytes: 1048576
+      proxy-cli:
+        apiKeyEnv: PROXY_CLI_API_KEY
+        api: openai-responses
+        baseURL: http://100.96.0.1:8317/v1
+        models:
+          - id: gemini-3.8-flash-high
+            contextWindow: 300000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              off: null
+              high: high
+            compat:
+              chatTemplateKwargs: {}
+              chatTemplateArgs: {}
+          - id: gpt-6-astra
+            contextWindow: 400000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              off: low
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+            compat:
+              chatTemplateKwargs: {}
+              chatTemplateArgs: {}
+          - id: gpt-6.1-sol
+            name: gpt-6.1-sol
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              off: low
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+            compat:
+              chatTemplateKwargs: {}
+              chatTemplateArgs: {}
+            contextWindow: 400000
+          - id: gpt-6-luna
+            name: gpt-6-luna
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              off: low
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+            compat:
+              chatTemplateKwargs: {}
+              chatTemplateArgs: {}
+          - id: gpt-6-sol
+            name: gpt-6-sol
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              off: low
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+            compat:
+              chatTemplateKwargs: {}
+              chatTemplateArgs: {}
+        modelOverrides: {}
+        compat:
+          chatTemplateKwargs: {}
+          chatTemplateArgs: {}
+        defaultContextWindow: 262144
+        defaultMaxTokens: 32768
+        defaultInput:
+          - text
+        headers: {}
+        thinkingBudgets: {}
+        streamIdleTimeoutMs: 300000
+        maxRequestImageBytes: 20971520
+        requestImagePixelBudget: 4194304
+        requestImageMaxBytes: 1048576
+      openrouter:
+        models:
+          - id: google/gemini-3.7-flash
+            input: []
+            reasoningEfforts:
+              off: null
+              high: high
+              max: max
+            compat:
+              chatTemplateKwargs: {}
+              chatTemplateArgs: {}
+        apiKeyEnv: OPENROUTER_API_KEY
+        modelOverrides: {}
+        compat:
+          chatTemplateKwargs: {}
+          chatTemplateArgs: {}
+        defaultContextWindow: 262144
+        defaultMaxTokens: 32768
+        defaultInput:
+          - text
+        headers: {}
+        thinkingBudgets: {}
+        streamIdleTimeoutMs: 300000
+        maxRequestImageBytes: 20971520
+        requestImagePixelBudget: 4194304
+        requestImageMaxBytes: 1048576
+      krill-claude:
+        displayName: Krill
+        apiKeyEnv: KRILL_CLAUDE_API_KEY
+        api: anthropic-messages
+        baseURL: https://api.krill-ai.net
+        models:
+          - id: claude-fable-5
+            contextWindow: 300000
+            maxTokens: 64000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              off: null
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+            compat:
+              chatTemplateKwargs: {}
+              chatTemplateArgs: {}
+        modelOverrides: {}
+        compat:
+          chatTemplateKwargs: {}
+          chatTemplateArgs: {}
+        defaultContextWindow: 262144
+        defaultMaxTokens: 32768
+        defaultInput:
+          - text
+        headers: {}
+        thinkingBudgets: {}
+        streamIdleTimeoutMs: 300000
+        maxRequestImageBytes: 20971520
+        requestImagePixelBudget: 4194304
+        requestImageMaxBytes: 1048576
+- id: llm-deepseek
+  config:
+    models:
+      - id: deepseek-flash
+        name: DeepSeek-V4.1-Flash
+        description: Fast, efficient, and economical; suited to focused, routine, or
+          parallel tasks.
+        contextWindow: 300000
+        inputModalities:
+          - text
+      - id: deepseek-v4-pro
+        name: DeepSeek-V4-Pro
+        description: Stronger agentic coding, knowledge, and difficult reasoning; suited
+          to complex or quality-critical tasks at higher cost.
+        contextWindow: 1000000
+        inputModalities:
+          - text
+      - id: deepseek-v4-flash-vision-exp
+        name: DeepSeek-V4-Flash-Vision-Exp
+        contextWindow: 1000000
+        inputModalities:
+          - text
+          - image
+        imagePixelBudget: 640000
+        imageMaxBytes: 1048576
+- id: agent-default-model
+  config:
+    provider: krill-codex
+    model: gpt-6.1-sol
+    reasoningEffort: high
+- id: ui-settings-general
+  config:
+    welcomeNoticeVersion: 2026-09-28.1
+- id: agent-preset-registry
+  config:
+    default: standard-bash
+    selectedDefault: standard-bash
+- id: ui-conversation
+  config:
+    busyEnter: steer
+- id: locale
+  config:
+    preference: zh
+- id: ui-theme
+  config:
+    preference: system
+- id: subagent-manager
+  config:
+    provider: proxy-cli
+    model: gpt-6.1-sol
+    reasoningEffort: medium
+- id: build-loop
+  config: {}
+- id: better-sidebar
+  config:
+    agentOpenTools: false
+- id: thinking-effort
+  config:
+    opencodeSession:
+      providers:
+        proxy-cli:
+          models: {}
+    subagentEffort: ""
+- id: subagent-model-selection-settings
+  config:
+    enabled: false
+    allowedModels: []
+- id: ui-sidebar-browser
+  disabled: true
+
 # Your patch layer for this dsh profile, applied after every bundle layer:
 # a top-level YAML array of loader patch entries (id-targeted config
 # overrides, disables, and insert lists; `!!js` expressions allowed).
 - id: ui-permission
   disabled: true
-
 
 # >>> dsh-skill-mcp-panel:mcp:begin
 - insert:
@@ -20,7 +404,14 @@
           maxAttempts: 10
         transport: streamable-http
         url: https://mcp.context7.com/mcp
-        bearerTokenRef: MCP_636F6E7465787437_TOKEN
-        headers: {}
+        headers:
+          Authorization: !!js (() => { const token =
+            process.env.MCP_636F6E7465787437_TOKEN; if (!token) throw new
+            Error('Missing MCP authentication environment variable
+            MCP_636F6E7465787437_TOKEN'); return 'Bearer ' + token; })()
+
 # <<< dsh-skill-mcp-panel:mcp:end
 
+- insert:
+    - id: stream-disconnect-retry
+      name: /root/.dsh/plugins/stream-disconnect-retry/index.mjs

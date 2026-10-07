@@ -1,0 +1,16 @@
+✓ Lockfile passes supply-chain policies (verified 10h ago)
+Progress: resolved 0, reused 86, downloaded 8, added 0
+Progress: resolved 1, reused 86, downloaded 14, added 0
+Progress: resolved 269, reused 246, downloaded 16, added 60
+Progress: resolved 269, reused 246, downloaded 16, added 188
+Progress: resolved 269, reused 246, downloaded 16, added 257
+Packages: +270
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Progress: resolved 269, reused 246, downloaded 16, added 270, done
+[WARN] Issues with peer dependencies found. Run "pnpm peers check" to list them.
+
+dependencies:
++ dsh-context 0.60.0
+
+The integrity of 3765 files was checked in 6.7s.
+Done in 12.2s using pnpm v12.8.1

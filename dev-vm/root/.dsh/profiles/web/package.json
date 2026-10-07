@@ -2,20 +2,23 @@
   "name": "dsh-profile-web",
   "private": true,
   "dependencies": {
-    "@devvm/dsh-build-loop": "link:/root/.dsh/plugins/build-loop",
-    "@devvm/dsh-remote-sync": "link:/root/.dsh/plugins/remote-sync",
-    "@devvm/dsh-style-control": "link:/root/.dsh/plugins/style-control",
-    "@devvm/dsh-subagent-manager": "link:/root/.dsh/plugins/subagent-manager",
-    "@devvm/dsh-voice-input": "link:/root/.dsh/plugins/voice-input",
-    "@hytime/dsh-thinking-effort": "^0.2.4",
-    "dsh-better-sidebar": "^0.19.1",
-    "dsh-skill-mcp-panel": "link:/root/.dsh/plugins/dsh-skill-mcp-panel"
+    "@devvm/dsh-agent-presets": "file:../../plugins/agent-presets",
+    "@devvm/dsh-build-loop": "file:../../plugins/build-loop",
+    "@devvm/dsh-remote-sync": "file:../../plugins/remote-sync",
+    "@devvm/dsh-style-control": "file:../../plugins/style-control",
+    "@devvm/dsh-subagent-manager": "file:../../plugins/subagent-manager",
+    "@devvm/dsh-voice-input": "file:../../plugins/voice-input",
+    "@hytime/dsh-thinking-effort": "0.3.6",
+    "dsh-better-sidebar": "0.24.1",
+    "dsh-context": "^0.60.0",
+    "dsh-skill-mcp-panel": "file:../../plugins/dsh-skill-mcp-panel"
   },
   "dsh": {
     "profile": {
       "bundles": [
         "@deepseek-ai/dsh-base",
         "@deepseek-ai/dsh-web-app",
+        "@devvm/dsh-agent-presets",
         "@hytime/dsh-thinking-effort",
         "dsh-better-sidebar",
         "@devvm/dsh-remote-sync",
@@ -23,7 +26,8 @@
         "@devvm/dsh-voice-input",
         "@devvm/dsh-style-control",
         "dsh-skill-mcp-panel",
-        "@devvm/dsh-build-loop"
+        "@devvm/dsh-build-loop",
+        "dsh-context"
       ]
     }
   }

@@ -14,12 +14,22 @@ export const DEFAULTS = Object.freeze({
   ],
 })
 
-export const ConfigSchema = z.object({
-  provider: z.string().default(DEFAULTS.provider),
-  maxFixRounds: z.natural().default(DEFAULTS.maxFixRounds),
-  reminderTokens: z.natural().default(DEFAULTS.reminderTokens),
-  deniedTools: z.array(z.string()).default(DEFAULTS.deniedTools),
+export const Config = z.object({
+  provider: z.string().pattern(/\S/).default(DEFAULTS.provider).volatile(),
+  maxFixRounds: z.natural().max(Number.MAX_SAFE_INTEGER).default(DEFAULTS.maxFixRounds).volatile(),
+  reminderTokens: z.natural().min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULTS.reminderTokens).volatile(),
+  deniedTools: z.array(z.string()).default(DEFAULTS.deniedTools).volatile(),
 })
+
+/** Read one detached policy from Loader's live configuration references. */
+export function currentConfig(config) {
+  return {
+    provider: config.provider.get(),
+    maxFixRounds: config.maxFixRounds.get(),
+    reminderTokens: config.reminderTokens.get(),
+    deniedTools: [...config.deniedTools.get()],
+  }
+}
 
 function json(res, status, value) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
@@ -32,20 +42,20 @@ async function readJson(req) {
   return chunks.length === 0 ? {} : JSON.parse(Buffer.concat(chunks).toString('utf8'))
 }
 
-/** Register the settings namespace and `/api/build-loop/config` (GET, POST replace, DELETE reset); returns the settings scope. */
-export async function registerSettings(ctx) {
-  const scope = ctx.settings.register('build-loop', ConfigSchema, { base: {}, validate: validateConfig })
+/** Serve the live entry configuration through the existing Build Loop settings page. */
+export function registerSettings(ctx, config) {
+  ctx.effect(() => ctx.settings.configure({ auto: false }, ctx.fiber))
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: '/api/build-loop/config',
     handler: async (req, res) => {
       if (req.method === 'GET' || req.method === 'HEAD') {
-        json(res, 200, { config: scope.get(), defaults: DEFAULTS })
+        json(res, 200, { config: currentConfig(config), defaults: DEFAULTS })
         return
       }
       if (req.method === 'DELETE') {
-        await scope.replace({})
-        json(res, 200, { config: scope.get(), defaults: DEFAULTS })
+        await ctx.settings.replace('build-loop', {})
+        json(res, 200, { config: currentConfig(config), defaults: DEFAULTS })
         return
       }
       if (req.method !== 'POST') {
@@ -55,14 +65,13 @@ export async function registerSettings(ctx) {
       try {
         const next = await readJson(req)
         validateConfig(next)
-        await scope.replace(next)
-        json(res, 200, { config: scope.get(), defaults: DEFAULTS })
+        await ctx.settings.replace('build-loop', next)
+        json(res, 200, { config: currentConfig(config), defaults: DEFAULTS })
       } catch (error) {
         json(res, 400, { error: error?.message || String(error) })
       }
     },
   }), 'build-loop: web routes')
-  return scope
 }
 
 /** Keep only denylist names the parent sees; `tools.restrict` rejects unknown names and the reserved `run_code`. */

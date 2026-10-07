@@ -1,8 +1,8 @@
 ui-onboarding:
   welcomeNoticeVersion: 2026-08-13.1
 agent-default-model:
-  provider: proxy-cli
-  model: "gpt-6-astra"
+  provider: krill-codex
+  model: "gpt-6.1-sol"
   reasoningEffort: high
 llm-pi-ai:
   providers:
@@ -12,36 +12,6 @@ llm-pi-ai:
       api: openai-responses
       baseURL: https://api.krill-code.net/codex/v1
       models:
-        - id: gpt-5.6-sol
-          contextWindow: 300000
-          input:
-            - text
-            - image
-          reasoningEfforts:
-            off: null
-            low: low
-            medium: medium
-            high: high
-            xhigh: xhigh
-            max: max
-          compat:
-            chatTemplateKwargs: {}
-            chatTemplateArgs: {}
-        - id: gpt-5.6-terra
-          contextWindow: 1000000
-          input:
-            - text
-            - image
-          reasoningEfforts:
-            off: null
-            low: low
-            medium: medium
-            high: high
-            xhigh: xhigh
-            max: max
-          compat:
-            chatTemplateKwargs: {}
-            chatTemplateArgs: {}
         - id: gpt-6-astra
           contextWindow: 300000
           input:
@@ -50,6 +20,21 @@ llm-pi-ai:
           reasoningEfforts:
             off: low
             minimal: low
+            low: low
+            medium: medium
+            high: high
+            xhigh: xhigh
+            max: max
+          compat:
+            chatTemplateKwargs: {}
+            chatTemplateArgs: {}
+        - id: gpt-6.1-sol
+          name: gpt-6.1-sol
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            off: low
             low: low
             medium: medium
             high: high
@@ -184,36 +169,6 @@ llm-pi-ai:
       api: openai-responses
       baseURL: http://100.96.0.1:8317/v1
       models:
-        - id: gpt-5.6-terra
-          contextWindow: 1000000
-          input:
-            - text
-            - image
-          reasoningEfforts:
-            off: null
-            low: low
-            medium: medium
-            high: high
-            xhigh: xhigh
-            max: max
-          compat:
-            chatTemplateKwargs: {}
-            chatTemplateArgs: {}
-        - id: gpt-5.6-sol
-          contextWindow: 300000
-          input:
-            - text
-            - image
-          reasoningEfforts:
-            off: null
-            low: low
-            medium: medium
-            high: high
-            xhigh: xhigh
-            max: max
-          compat:
-            chatTemplateKwargs: {}
-            chatTemplateArgs: {}
         - id: gemini-3.8-flash-high
           contextWindow: 300000
           input:
@@ -225,8 +180,8 @@ llm-pi-ai:
           compat:
             chatTemplateKwargs: {}
             chatTemplateArgs: {}
-        - id: gpt-5.6-luna
-          contextWindow: 1000000
+        - id: gpt-6-astra
+          contextWindow: 300000
           input:
             - text
             - image
@@ -240,8 +195,23 @@ llm-pi-ai:
           compat:
             chatTemplateKwargs: {}
             chatTemplateArgs: {}
-        - id: gpt-6-astra
-          contextWindow: 300000
+        - id: gpt-6.1-sol
+          name: gpt-6.1-sol
+          input:
+            - text
+            - image
+          reasoningEfforts:
+            off: null
+            low: low
+            medium: medium
+            high: high
+            xhigh: xhigh
+            max: max
+          compat:
+            chatTemplateKwargs: {}
+            chatTemplateArgs: {}
+        - id: gpt-6-luna
+          name: gpt-6-luna
           input:
             - text
             - image
@@ -347,8 +317,8 @@ ui-theme:
   preference: system
 
 subagent-model:
-  provider: "proxy-cli"
-  model: "gemini-3.8-flash-high"
+  provider: "krill-codex"
+  model: "gpt-6.1-sol"
   reasoningEffort: "high"
 build-loop: {}
 llm-deepseek:
@@ -379,3 +349,8 @@ dsh-better-sidebar:
   workspaceFence: false
   agentOpenTools: false
   browserAllowedLoopback: localhost:8081, localhost:8080, 127.0.0.1:8081
+dsh-thinking-effort:
+  opencodeSession:
+    providers:
+      proxy-cli:
+        models: {}

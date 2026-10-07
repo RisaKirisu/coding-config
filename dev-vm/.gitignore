@@ -9,6 +9,7 @@ root/.config/devvm
 # api keys
 .api-keys
 .credentials.yaml
+root/.dsh/.env
 .ssh
 
 # Node.js

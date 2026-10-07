@@ -2,9 +2,10 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import path from 'node:path'
-import { Context } from '/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/cordis/lib/index.js'
-import { WebServer } from '/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-host-webserver/lib/index.js'
-import { SystemPrompt } from '/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js'
+import { tmpdir } from 'node:os'
+import { Context } from '@deepseek-ai/cordis'
+import { WebServer } from '@deepseek-ai/dsh-host-webserver'
+import { SystemPrompt } from '@deepseek-ai/dsh-system-prompt'
 import {
   DEFAULT_PRESETS,
   defaultStore,
@@ -90,7 +91,7 @@ test('normalizeStore cleans and validates presets and selection pointers', () =>
 })
 
 test('session selections stay independent without changing the global default', async () => {
-  const fixture = await mkdtemp('/root/.dsh/.agents/exploration/style-selection/fixture-')
+  const fixture = await mkdtemp(path.join(tmpdir(), 'dsh-style-selection-'))
   const ctx = new Context()
   const webServerFiber = ctx.plugin(WebServer, {
     host: '127.0.0.1',

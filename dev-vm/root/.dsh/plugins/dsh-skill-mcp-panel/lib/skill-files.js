@@ -80,7 +80,25 @@ export function parseFrontmatter(raw) {
     const name = pick("name");
     if (name === undefined || !SKILL_NAME_RE.test(name))
         return undefined;
-    return { name, description: pick("description") ?? "", whenToUse: pick("whenToUse"), body: body.trim() };
+    const boolPick = (key) => {
+        const value = pick(key);
+        if (value === undefined)
+            return undefined;
+        switch (value.toLowerCase()) {
+            case "true":
+            case "yes":
+            case "on":
+            case "1":
+                return true;
+            case "false":
+            case "no":
+            case "off":
+            case "0":
+                return false;
+        }
+        return undefined;
+    };
+    return { name, description: pick("description") ?? "", whenToUse: pick("whenToUse"), body: body.trim(), modelInvocable: boolPick("disable-model-invocation") !== true, userInvocable: boolPick("user-invocable") !== false };
 }
 /**
  * 面向新技能的严格 frontmatter 校验，与 dsh-skill-filesystem 的接收规则
@@ -182,11 +200,13 @@ const SKIP_DIR_NAMES = new Set(["node_modules", ".git", ".hg", ".svn"]);
 /** 递归深度上限：防御符号链接环导致的无界遍历。 */
 const MAX_RECURSE_DEPTH = 8;
 export async function collectSkillEntries(roots) {
-    const entries = [];
-    for (const root of roots) {
+    // 各根目录互不依赖，并行扫描；每根内保持深度优先顺序。
+    const perRoot = await Promise.all(roots.map(async (root) => {
+        const entries = [];
         await scanDir(root, root.path, "", 0, entries);
-    }
-    return entries;
+        return entries;
+    }));
+    return perRoot.flat();
 }
 /**
  * 递归扫描一层技能目录（pi/Codex 布局兼容）：
@@ -232,6 +252,8 @@ async function scanDir(root, dir, rel, depth, entries) {
                     source: root.source,
                     projectRoot: root.projectRoot,
                     rel: rel ? rel + "/" + item.name : item.name,
+                    modelInvocable: parsed?.modelInvocable ?? true,
+                    userInvocable: parsed?.userInvocable ?? true,
                 });
             }
             else {

@@ -1,6 +1,6 @@
 ---
 name: developer
-description: Developer guidelines. DSH coding agents should load this IMMEDIATELY. Exception - Subagents do NOT load, subagents like build agent, review agent, test audit agent should NOT load this.
+description: Developer guidelines. Subagents, including build, review, and test-audit agents, should NOT load this skill.
 ---
 
 ## Subagent Strategy

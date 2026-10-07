@@ -1,7 +1,8 @@
 /** Tool registration and settings; build policy and execution live with the controller. */
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { Controller } from './controller.mjs'
-import { registerSettings } from './config.mjs'
+import { currentConfig, registerSettings } from './config.mjs'
+export { Config } from './config.mjs'
 import { CONTRACT_SCHEMA, DECISION_SCHEMA, parameters } from './schemas.mjs'
 
 export const name = 'build-loop'
@@ -21,22 +22,22 @@ function dispatch(ctx, exec, background, label, work) {
   return {
     kind: 'background',
     jobId: jobs.start({
-      kind: 'subagent', label, owner: exec.agent,
+      kind: 'subagent', label, owner: exec.agent.session.id,
       run: () => ({
         cancel: (reason) => abort.abort(reason),
         done: work({ ...exec, signal: abort.signal })
-          .then((value) => ({ status: abort.signal.aborted ? 'killed' : 'completed', output: value.text }))
+          .then((value) => ({ status: abort.signal.aborted ? 'killed' : 'completed', result: value.text }))
           .catch((error) => ({ status: abort.signal.aborted ? 'killed' : 'failed', detail: String(error) })),
       }),
     }),
   }
 }
 
-export async function apply(ctx) {
-  const scope = await registerSettings(ctx)
+export function apply(ctx, config) {
+  registerSettings(ctx, config)
   const controller = new Controller(ctx)
   ctx.effect(() => () => controller.workers.close(), 'build-loop workers')
-  registerTools(ctx, scope, controller)
+  registerTools(ctx, { get: () => currentConfig(config) }, controller)
 }
 
 /** Register tool interfaces independently of the HTTP carrier. */

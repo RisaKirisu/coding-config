@@ -6,8 +6,6 @@
  */
 import { z } from "zod";
 import { MANAGED_ROW_ID_PREFIX, MCP_PLUGIN_NAME } from "../patch-editor.js";
-import { credentialRefForServer } from "./credentials.js";
-
 export const SERVER_NAME_RE = /^[A-Za-z0-9_-]{1,32}$/;
 export const DEFAULT_TOOL_CALL_TIMEOUT_MS = 60000;
 export const DEFAULT_RECONNECT = {
@@ -17,22 +15,17 @@ export const DEFAULT_RECONNECT = {
     maxAttempts: 10
 };
 const serverNameSchema = z.string().regex(SERVER_NAME_RE, "serverName 只能包含 1-32 位字母、数字、下划线或连字符");
-const secretValueSchema = z.union([
-    z.string().nullable(),
-    z.object({ __jsExpr: z.string() })
-]);
-const secretMapSchema = z.record(z.string(), secretValueSchema).optional();
+const secretMapSchema = z.record(z.string(), z.string().nullable()).optional();
 const reconnectSchema = z.object({
     enabled: z.boolean().default(DEFAULT_RECONNECT.enabled),
     initialDelayMs: z.number().int().min(1).default(DEFAULT_RECONNECT.initialDelayMs),
     maxDelayMs: z.number().int().min(1).default(DEFAULT_RECONNECT.maxDelayMs),
     maxAttempts: z.number().int().min(1).default(DEFAULT_RECONNECT.maxAttempts)
 }).default({ ...DEFAULT_RECONNECT });
-
 export const stdioServerSchema = z.object({
     serverName: serverNameSchema,
     transport: z.literal("stdio"),
-    command: z.string().min(1),
+    command: z.string().min(1, "命令不能为空"),
     args: z.array(z.string()).default([]),
     env: secretMapSchema,
     cwd: z.string().default(""),
@@ -43,16 +36,32 @@ export const stdioServerSchema = z.object({
 export const httpServerSchema = z.object({
     serverName: serverNameSchema,
     transport: z.literal("streamable-http"),
-    url: z.string().url(),
-    authType: z.enum(["none", "bearer"]).default("none"),
-    bearerToken: z.string().optional(),
+    url: z.string().url("服务器地址必须是合法 URL"),
     headers: secretMapSchema,
     toolCallTimeoutMs: z.number().int().min(1).default(DEFAULT_TOOL_CALL_TIMEOUT_MS),
     failOnStartupError: z.boolean().default(false),
     reconnect: reconnectSchema
 });
 export const mcpServerInputSchema = z.discriminatedUnion("transport", [stdioServerSchema, httpServerSchema]);
-
+/**
+ * 把 zod 的校验失败压成一行「字段：原因」。
+ *
+ * 网关边界（`codec.create().parse`）失败时宿主只回一句泛化的
+ * `wire field "payload" failed boundary validation`，zod 的字段说明到不了前端，
+ * 用户看到的就是天书（典型：名称里带空格）。所以字段校验放在 handler 里做，
+ * 用这个函数生成可读错误，前端原样展示。
+ */
+export function describeSchemaError(error) {
+    const issues = error?.issues;
+    if (!Array.isArray(issues) || issues.length === 0)
+        return String(error?.message ?? error);
+    return issues
+        .map((issue) => {
+        const path = Array.isArray(issue?.path) && issue.path.length > 0 ? issue.path.join(".") : "payload";
+        return path + "：" + String(issue?.message ?? "无效");
+    })
+        .join("；");
+}
 /** 面板行 id ↔ serverName。 */
 export function rowIdForServerName(serverName) {
     return MANAGED_ROW_ID_PREFIX + serverName;
@@ -63,7 +72,7 @@ export function serverNameFromRowId(id) {
     const name = id.slice(MANAGED_ROW_ID_PREFIX.length);
     return SERVER_NAME_RE.test(name) ? name : undefined;
 }
-/** null = 删除，string / object = 覆盖；缺省 key 保留旧值。 */
+/** null = 删除，string = 覆盖；缺省 key 保留旧值。 */
 export function mergeSecretPatch(previous, patch) {
     const merged = { ...(previous ?? {}) };
     for (const [key, value] of Object.entries(patch ?? {})) {
@@ -100,15 +109,11 @@ export function toOfficialConfig(input) {
             cwd: input.cwd
         };
     }
-    const headers = mergeSecretPatch({}, input.headers);
-    const bearerTokenRef = input.authType === "bearer" ? credentialRefForServer(input.serverName) : undefined;
-    delete headers["Authorization"];
     return {
         ...common,
         transport: "streamable-http",
         url: input.url,
-        ...(bearerTokenRef === undefined ? {} : { bearerTokenRef }),
-        headers
+        headers: mergeSecretPatch({}, input.headers)
     };
 }
 /** 面板输入 → cordis.patch.yml 行。 */
@@ -143,10 +148,7 @@ function asBoolean(value, fallback) {
 function secretKeys(value) {
     if (value === null || typeof value !== "object" || Array.isArray(value))
         return [];
-    return Object.keys(value).filter((key) => {
-        const v = value[key];
-        return typeof v === "string" || (v !== null && typeof v === "object" && "__jsExpr" in v);
-    });
+    return Object.keys(value).filter((key) => typeof value[key] === "string");
 }
 /** patch 行 → 脱敏 view。密钥值不返回。 */
 export function patchRowToView(row) {
@@ -158,11 +160,9 @@ export function patchRowToView(row) {
         return undefined;
     const transport = config.transport === "streamable-http" ? "streamable-http" : config.transport === "stdio" ? "stdio" : "unknown";
     const reconnectRaw = config.reconnect !== null && typeof config.reconnect === "object" && !Array.isArray(config.reconnect) ? config.reconnect : {};
-    const authType = (typeof config.bearerTokenRef === "string" || (config.headers && config.headers.Authorization !== undefined)) ? "bearer" : "none";
     return {
         serverName,
         transport,
-        authType,
         enabled: row.disabled !== true,
         entryId: row.id,
         command: transport === "stdio" ? asString(config.command) : undefined,
@@ -214,12 +214,10 @@ export function inputFromPatchRow(row) {
         }
     };
     if (config.transport === "streamable-http") {
-        const authType = (typeof config.bearerTokenRef === "string" || (config.headers && config.headers.Authorization !== undefined)) ? "bearer" : "none";
         return mcpServerInputSchema.parse({
             ...common,
             transport: "streamable-http",
             url: asString(config.url),
-            authType,
             headers: config.headers
         });
     }
@@ -242,12 +240,8 @@ export function applyServerEdit(previous, input, enabled = true) {
     const next = { ...input };
     if (next.transport === "stdio")
         next.env = mergeSecretPatch(oldEnv, next.env);
-    if (next.transport === "streamable-http") {
+    if (next.transport === "streamable-http")
         next.headers = mergeSecretPatch(oldHeaders, next.headers);
-        if (input.authType === "none") {
-            if (next.headers) delete next.headers["Authorization"];
-        }
-    }
     const normalized = mcpServerInputSchema.parse(next);
     return toPatchRow(normalized, enabled);
 }

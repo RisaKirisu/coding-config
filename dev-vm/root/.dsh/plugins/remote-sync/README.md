@@ -13,8 +13,9 @@ reconciles at launch. Nothing outside the DevVM transfers Portable DSH State.
 
 Everything lives under DSH Home (`DSH_HOME`, default `~/.dsh`):
 
-- `sessions/` — append-only session logs (`<root>/<project>/<session-id>/session.jsonl`).
-- `attachments/v1/objects/**` — content-addressed, immutable attachment objects.
+- `sessions/` — committed session generations, including rc.2 `session.v4.jsonl` and `.zstd` files and retained V3 predecessors. Migration locks and temporary successors stay local.
+- `attachments/v1/objects/**` — content-addressed, immutable image objects.
+- `attachments/v1/file-objects/**` and `attachments/v1/files/**` — generic file blobs and alias metadata.
 - `storages/session_projcache/sessions/***` — per-session projection documents: whole-record JSON checkpoints transferred newest-wins in a dedicated projection pass so cold chat titles render immediately without log re-reading.
 - `storages/*.json` — whole-document storage units, excluding `storages/session_projcache/***`.
 
@@ -56,12 +57,22 @@ A missing marker means `seq = 0`. The marker is excluded from every transfer and
 file lives outside DSH Home entirely, and the status file is always written by temporary
 file and rename, so a torn write cannot misreport the position.
 
-A push compares and advances the marker in one remote shell invocation: it reads `seq`,
-requires it to equal the local `head_seq`, writes `seq + 1` with this workstation's
-`writer_id`, and only then transfers. If the sequences differ, the Sync Store is ahead:
-the push becomes session-and-attachment only and the status becomes `remote_ahead`. That
-is not a failure and is not retried. A `head_seq` of `null` — a workstation that has never
-reconciled — is treated the same way, so a fresh registry can never overwrite the store's.
+A push first reads the marker and compares `seq` with the local `head_seq`. When they
+match, it transfers sessions, attachments, projection documents, and storage units. Only
+after all three passes succeed does it compare the marker again and publish `seq + 1`
+with this workstation's `writer_id`, then update the local `head_seq`. A failed transfer
+leaves both sequences unchanged, so retrying cannot mistake its own unfinished push for
+another workstation's work.
+
+If the initial sequences differ, the push sends only sessions, attachments, and projection
+documents and sets `remote_ahead`. A `head_seq` of `null` — a workstation that has never
+reconciled — takes the same branch, so a fresh registry never pushes storage units. If the
+marker changes during a successful transfer, the final comparison refuses to advance it
+and sets `remote_ahead`.
+
+This is not a transaction: files can be partially transferred on failure, transfers are
+not locked against other workstations, and losing the marker-commit response can still
+leave the local sequence behind. No snapshot staging or rollback is performed.
 
 Any other error is retried up to five attempts one second apart before the status becomes
 `failed` with `last_error`. A trigger arriving during an active transfer queues exactly one
@@ -71,7 +82,7 @@ follow-up, which runs whether the active transfer succeeded or failed.
 
 Every direction runs three rsync passes with separate filter lists and no `--delete`:
 
-1. **Union pass** — `sessions/***` and `attachments/v1/objects/***` with
+1. **Union pass** — committed `sessions/***`, `attachments/v1/objects/***`, `attachments/v1/file-objects/***`, and `attachments/v1/files/***` with
    `-az --update --append-verify`. `--update` skips files newer on the receiver.
    `--append-verify` leaves files the same size or longer on the receiver unchanged;
    for a shorter receiver it verifies the existing prefix, appending when it matches
@@ -193,7 +204,7 @@ remote-sync/
 Install it into a DSH profile from the workspace root:
 
 ```sh
-dsh plugin --profile web add link:./root/.dsh/plugins/remote-sync
+dsh plugin --profile web add file:./root/.dsh/plugins/remote-sync
 ```
 
 ## Tests
@@ -206,5 +217,4 @@ over the local transport with an injected zero retry delay.
 node --test root/.dsh/plugins/remote-sync/test.mjs
 ```
 
-One test boots `dsh --profile web` on port 3599 to check the routes and the client bundle,
-so it needs the plugin installed in that profile.
+The suite requires exact rc.2 dependencies. Its Web test boots the staged CLI on an ephemeral loopback port with an explicit isolated home, local Sync Store, and voice/style overrides. Set `DSH_PACKAGE_ENTRY` to the target DSH manifest and `DSH_HOME`/`TMPDIR` to the isolated fixture directories; no production credentials or Sync Store are used.

@@ -16,6 +16,8 @@ This repository uses a single-context domain-doc layout. See `docs/agents/domain
 
 ### Runtime verification
 
+`setup-devvm.sh` pins Smolvm to `1.19.3`; retain exact-version installation rather than a latest-release lookup.
+
 Changes to DevVM or DSH Runtime lifecycle code must cover non-interactive execution, stop-and-relaunch behavior, DSH Status read back from the DevVM after a simulated daemon restart, and Project Log updates. DSH remains `Starting` while its guest PID is alive but its launch token is absent; `Running` requires the token captured from the current launch's ready URL, not merely a live process.
 
 Lifecycle cancellation changes must pass `tests/lifecycle_test.rs` (real HTTP disconnects and process-group cleanup) and the two-client API checks. Per-Project coordination remains owned until interrupted commands are reaped; observed status is read independently of command ownership, without caching. See `readme.md` under Control Daemon & Web UI for cancellation and concurrency semantics.
@@ -28,11 +30,13 @@ Lifecycle test fakes must isolate guest PID files and never evaluate commands ag
 
 For Control Daemon URLs, DSH launch links, browser authentication, or ingress changes, read ADR 0002. With DSH `0.1.5-rc.2`, use `http://control.devvm.localhost:8100` locally and `https://devvm.<remote-domain>` (default: `https://devvm.risak.dev`) over the tailnet: DSH exchanges its launch token for a `SameSite=Strict` cookie, so the Control and Project URLs must be same-site. Raw IP and bare `localhost` URLs remain management-only aliases because their Open DSH navigation is cross-site. Port `8100` reaches the Control Daemon directly locally (or via Host Caddy proxy remotely); Project URLs traverse FRP and Caddy.
 
+The host FRP server appends stdout and stderr to `~/.local/state/devvm/frps.log`; existing server processes retain their original output destination until relaunched. Do not restart the shared server during read-only ingress diagnosis because that interrupts all Projects and clears proxy ownership evidence.
+
 Host ingress has one configuration source: `scripts/Caddyfile.host`. Setup prints it; integration tests load it directly. Read `docs/remote-access.md` before changing setup or ingress. Report HTTP cookie-replay checks separately from browser HTTPS/SameSite verification.
 
 ### Session Sync
 
-The DSH plugin at `root/.dsh/plugins/remote-sync/` is the only Session Sync engine (ADR 0003); the daemon never runs rsync. Plugin tests (`node --test root/.dsh/plugins/remote-sync/test.mjs`) use real rsync over the local transport (no `ssh_host`). First-party plugins in the web profile use pnpm `link:` dependencies, so `node_modules` resolves directly to `root/.dsh/plugins/`; never replace them with `file:` dependencies, whose hard-linked files can become stale after atomic source-file replacement.
+The DSH plugin at `root/.dsh/plugins/remote-sync/` is the only Session Sync engine (ADR 0003); the daemon never runs rsync. Plugin tests (`node --test root/.dsh/plugins/remote-sync/test.mjs`) use real rsync over the local transport (no `ssh_host`). Startup reconciliation runs from the installed Web-profile package so it uses the same plugin version as DSH.
 
 ### Build Loop
 
@@ -40,11 +44,13 @@ The DSH plugin at `root/.dsh/plugins/build-loop/` provides the `build_ticket` to
 
 ### Updating a local DSH plugin
 
-Local plugins (`root/.dsh/plugins/*`, mounted in the DevVM at `/root/.dsh/plugins/*`) are installed into the web profile as symbolic links via pnpm `link:` specifications (`~/.dsh/profiles/web/node_modules/<pkg> -> /root/.dsh/plugins/<pkg>`), with plugin peer dependencies resolving through the `$DSH_HOME/plugins/node_modules -> ../profiles/node_modules` fallback link. Source edits are therefore immediately visible at the installed path. After editing plugin source, inside the DevVM:
+DSH image builds pin `0.2.0-rc.2`. Guest initialization in `devvm` runs native frozen-lockfile installs for Web/headless when installed locks differ. Plugin dependencies belong to package manifests and the profile lockfile; DSH supplies runtime peers through its native resolver. Keep `setup-devvm.sh` generic; DSH dependency installation belongs in the existing guest initialization path. MCP uses native HTTP headers; do not add a bearer-reference transport extension or an MCP source patch. Keep repository-wide DSH integration tests in `tests/`, not `root/.dsh/tests/`.
 
-1. Run the plugin's own tests (`npm test` or `node --test ...` under `/root/.dsh/plugins/<dir>/`).
-2. If you added a module, list it in the plugin's `package.json` `files` and `exports`.
-3. If dependencies or peer dependencies change, re-run `cd ~/.dsh/profiles/web && CI=true DSH_HOME=/root/.dsh dsh plugin --profile web install --store-dir /root/workspace/.pnpm-store/v11`.
-4. Restart the DSH Runtime (`devvm` stop/start). Host bundles are imported once; there is no HMR for them, and `client.js` is served from the profile copy, so a browser refresh alone is not enough.
+Local plugins are native `file:../../plugins/<dir>` dependencies in the Web profile. pnpm installs package contents and ordinary dependencies into the profile; DSH resolves runtime peers without a shared fallback link. Installed packages are snapshots, not live source links.
+
+1. Run the plugin's tests. Verify installation changes with `node --test tests/dsh-plugin-install.test.mjs`, which installs an isolated profile with real DSH/pnpm and imports custom host plugins without source dependency directories or fallback links.
+2. List new runtime modules in the plugin's `package.json` `files` and `exports` as needed.
+3. Refresh source-only edits with `CI=true DSH_HOME=/root/.dsh dsh plugin --profile web install --force --frozen-lockfile --store-dir /root/workspace/.pnpm-store/v11`. For dependency or peer changes, omit `--frozen-lockfile` to regenerate the profile lockfile and retain that lockfile in the repository. An unchanged lockfile does not trigger installation during guest startup.
+4. Let the user restart the DSH Runtime through the existing lifecycle. Package replacements require a fresh process; browser refresh alone does not reload them. Never restart the runtime hosting the current session.
 
 Plugin defaults that are also exposed as settings (for example `build-loop` personas) are shadowed by any value saved in `~/.dsh/settings.yaml`; reset the field from its settings page to pick up a new default.

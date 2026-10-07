@@ -30,6 +30,12 @@ Project hosts normally contain the project name and existing eight-character pat
 
 Host Caddy translates matching Host and Origin headers into internal `.devvm.localhost` routing labels. Those labels do not require remote DNS resolution. Unrelated origins remain unchanged so applications can reject them. Unknown host shapes are rejected. Keep remote Control and Project URLs on HTTPS under the same parent domain for DSH's SameSite=Strict cookie flow.
 
+## FRP server logs
+
+The `devvm` launcher starts one shared FRP server on the host and appends its stdout and stderr to `~/.local/state/devvm/frps.log`. The log directory is created with mode `0700`. Logs are appended across server launches and are not rotated automatically. Guest ingress logs remain separate Project Logs.
+
+An already-running FRP server is reused without changing its output destination. Updating the launcher therefore does not enable logging for an existing process; the new destination takes effect on its next launch. Restarting the shared server temporarily interrupts ingress for all Projects and clears its current proxy registrations.
+
 ## Host Caddy
 
 The only host routing configuration is [scripts/Caddyfile.host](../scripts/Caddyfile.host). Add its site block to the existing host Caddy configuration; do not run a second listener competing for the same address. The Rust daemon does not generate Caddy configuration.
