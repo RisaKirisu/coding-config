@@ -16,11 +16,11 @@ use crate::sync::{load_sync_config, provision_sync_setup, SyncConfig, SyncManage
 use crate::ui::INDEX_HTML;
 use crate::urls::{
     build_local_port_template, build_local_project_url, build_remote_port_template,
-    build_remote_project_url,
+    build_remote_project_url, control_subdomain,
 };
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, uri::Authority, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -96,10 +96,7 @@ pub fn create_router(state: AppState) -> Router {
                 )
             }),
         )
-        .route(
-            "/manifest.webmanifest",
-            get(|| async { app_asset("application/manifest+json", crate::ui::MANIFEST) }),
-        )
+        .route("/manifest.webmanifest", get(manifest_handler))
         .route(
             "/service-worker.js",
             get(|| async {
@@ -144,8 +141,32 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(Arc::new(state))
 }
 
-async fn index_handler() -> Html<&'static str> {
-    Html(INDEX_HTML)
+fn app_name(headers: &HeaderMap, domain: Option<&str>) -> String {
+    let authority = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<Authority>().ok());
+    domain
+        .and_then(|domain| control_subdomain(authority.as_ref()?.host(), domain))
+        .unwrap_or("DevVM")
+        .to_owned()
+}
+
+async fn index_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Html<String> {
+    let name = app_name(&headers, state.config.remote_domain.as_deref());
+    Html(INDEX_HTML.replace("__APP_NAME__", &name))
+}
+
+async fn manifest_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let name = app_name(&headers, state.config.remote_domain.as_deref());
+    let mut manifest: serde_json::Value = serde_json::from_str(crate::ui::MANIFEST)
+        .expect("embedded app manifest must be valid JSON");
+    manifest["name"] = json!(name);
+    manifest["short_name"] = json!(name);
+    app_asset("application/manifest+json", manifest.to_string())
 }
 
 async fn build_project_view(state: &AppState, record: &ProjectRecord) -> ProjectView {

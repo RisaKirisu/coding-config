@@ -260,6 +260,58 @@ async fn test_embedded_ui_served() {
 }
 
 #[tokio::test]
+async fn test_control_app_names_follow_subdomain() {
+    let ctx = setup_test_server().await;
+    let base = format!("http://{}", ctx.server_addr);
+    for (host, name) in [
+        ("devvm.risak.dev", "devvm"),
+        ("devvm-risak.risak.dev", "devvm-risak"),
+        ("devvm-3080.risak.dev:443", "devvm-3080"),
+        ("control.devvm.localhost:8100", "DevVM"),
+        ("devvm2.risak.dev", "DevVM"),
+        ("devvm-.risak.dev", "DevVM"),
+        ("devvm-risak.other.dev", "DevVM"),
+        ("devvm-risak.nested.risak.dev", "DevVM"),
+    ] {
+        let response = ctx
+            .client
+            .get(format!("{base}/manifest.webmanifest"))
+            .header("Host", host)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{host}");
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/manifest+json"
+        );
+        let manifest: Value = response.json().await.unwrap();
+        assert_eq!(manifest["name"], name, "{host}");
+        assert_eq!(manifest["short_name"], name, "{host}");
+        assert_eq!(manifest["id"], "/");
+        assert_eq!(manifest["start_url"], "/");
+        assert_eq!(manifest["scope"], "/");
+        let html = ctx
+            .client
+            .get(&base)
+            .header("Host", host)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(html.contains(&format!("<title>{name}</title>")), "{host}");
+        assert!(
+            html.contains(&format!(
+                "name=\"apple-mobile-web-app-title\" content=\"{name}\""
+            )),
+            "{host}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_project_logs_never_return_the_dsh_token_file() {
     let ctx = setup_test_server().await;
     let project_dir = ctx.home_dir.join("token-log-proj");

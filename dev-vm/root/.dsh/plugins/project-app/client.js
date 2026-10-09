@@ -7,7 +7,15 @@ window.__ModuleLoader__.load({
 
     function apply(ctx) {
       const config = window.__DEVVM_EMBED__;
-      if (window.parent === window || !config?.projectId || !config.controlOrigins.length) return;
+      if (window.parent === window || !config?.projectId || !window.name) return;
+      const controlUrl = new URL(window.name);
+      if (controlUrl.origin !== window.name) return;
+      const controlLabel = controlUrl.hostname.split('.')[0];
+      const validRemote = config.controlDomain && controlUrl.protocol === 'https:' && !controlUrl.port &&
+        /^devvm(?:-[a-z0-9-]{0,56}[a-z0-9])?$/.test(controlLabel) &&
+        controlUrl.hostname === `${controlLabel}.${config.controlDomain.toLowerCase()}`;
+      const controlOrigin = controlUrl.origin;
+      if (!config.controlOrigins.includes(controlOrigin) && !validRemote) return;
       const instanceId = crypto.randomUUID();
       const commands = new Map();
       const drafts = new Map();
@@ -184,7 +192,7 @@ window.__ModuleLoader__.load({
 
       async function receive(event) {
         const message = event.data;
-        if (event.source !== parent || !config.controlOrigins.includes(event.origin) || !message || message.protocol !== 'devvm-embed' || message.version !== 1 || message.projectId !== config.projectId) return;
+        if (event.source !== parent || event.origin !== controlOrigin || !message || message.protocol !== 'devvm-embed' || message.version !== 1 || message.projectId !== config.projectId) return;
         if (message.kind === 'attach') {
           if (typeof message.channelId !== 'string' || attachment && attachment.channelId !== message.channelId) return;
           attachment = {channelId: message.channelId, origin: event.origin};
@@ -265,7 +273,7 @@ window.__ModuleLoader__.load({
         }, 5000);
         const disposeList = ctx.sessions.list.subscribe(observeSelection);
         observeSelection();
-        for (const origin of config.controlOrigins) parent.postMessage({protocol: 'devvm-embed', version: 1, projectId: config.projectId, instanceId, kind: 'available'}, origin);
+        parent.postMessage({protocol: 'devvm-embed', version: 1, projectId: config.projectId, instanceId, kind: 'available'}, controlOrigin);
         return () => {
           disposed = true;
           window.removeEventListener('message', onMessage);

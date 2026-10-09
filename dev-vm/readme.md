@@ -69,7 +69,7 @@ devvm-daemon service status
 Use a named Control Daemon URL that shares the Project URL's parent site:
 
 - **Locally**: Open `http://control.devvm.localhost:8100`.
-- **Over Tailscale**: Open `https://devvm.risak.dev` (or your configured `--remote-domain`).
+- **Over Tailscale**: Open `https://devvm.risak.dev` or an instance alias such as `https://devvm-risak.risak.dev` under your configured `--remote-domain`. Control labels are `devvm` or DNS-valid `devvm-*`; the installed mobile app name equals that label.
 
 `control.devvm.localhost` is not a Caddy route or an explicit daemon hostname. Browsers and modern resolvers map every `.localhost` name to loopback, and the Control Daemon's `127.0.0.1:8100` listener accepts that Host header. Remote access routes through host-side Caddy, which terminates HTTPS on the configured Tailscale IP and proxies to the loopback listeners.
 

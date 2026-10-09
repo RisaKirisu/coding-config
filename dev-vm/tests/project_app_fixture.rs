@@ -24,7 +24,9 @@ async fn serve_project_app_fixture() {
     assert!(root.is_absolute());
     assert!(root.starts_with(std::env::current_dir().unwrap().join(".agents")));
     fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(root.join("tmp")).unwrap();
     let stage = root.parent().unwrap().join("stage");
+    let remote = std::env::var("DEVVM_BROWSER_REMOTE").as_deref() == Ok("1");
     assert!(stage.join("cli/lib/bin.js").is_file());
     let bin_dir = root.join("bin");
     let logs = root.join("logs");
@@ -46,6 +48,7 @@ exec env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$PWD/.os-home" \
   XDG_CONFIG_HOME="$PWD/.os-home/.config" XDG_CACHE_HOME="$PWD/.os-home/.cache" \
   DEVVM_EMBED_PROJECT_ID="${{DEVVM_EMBED_PROJECT_ID:?}}" \
   DEVVM_CONTROL_ORIGINS="${{DEVVM_CONTROL_ORIGINS:?}}" \
+  DEVVM_CONTROL_DOMAIN="${{DEVVM_CONTROL_DOMAIN:-}}" \
   node "{}/cli/lib/bin.js" "${{profile_args[@]}}" \
   --patch "{}/browser.overlay.yml" --host 127.0.0.1 --port "$port" --no-open
 "#,
@@ -70,7 +73,7 @@ exec env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$PWD/.os-home" \
         home_dir: home.clone(),
         devvm_bin: devvm,
         ingress_port: ingress,
-        remote_domain: None,
+        remote_domain: remote.then(|| "devvm.test".into()),
     };
     let router = create_router(AppState {
         config,
@@ -111,7 +114,22 @@ reverse_proxy @project_{dsh_port} 127.0.0.1:{dsh_port} {{
         records.push(json!({"id":id,"name":name,"host":host,"dshPort":dsh_port,"path":path}));
     }
     let caddy_config = root.join("Caddyfile");
-    fs::write(&caddy_config, format!("{{\n admin off\n auto_https off\n}}\n:{ingress} {{\n route {{\n{}\n respond 400\n }}\n}}\n", routes.join("\n"))).unwrap();
+    let auto_https = if remote { "disable_redirects" } else { "off" };
+    let mut caddy_text = format!("{{\n admin off\n auto_https {auto_https}\n skip_install_trust\n}}\nhttp://:{ingress} {{\n route {{\n{}\n respond 400\n }}\n}}\n", routes.join("\n"));
+    if remote {
+        let remote_routes = include_str!("../scripts/Caddyfile.host")
+            .replace("{$REMOTE_DOMAIN:risak.dev}", "devvm.test")
+            .replace("{$REMOTE_DOMAIN_REGEXP:risak\\.dev}", "devvm\\.test")
+            .replace("{$REMOTE_IP:100.67.154.69}", "127.0.0.2")
+            .replace(
+                "tls {\n\t\tdns cloudflare {env.CLOUDFLARE_API_TOKEN}\n\t}",
+                "tls internal",
+            )
+            .replace("127.0.0.1:8100", &format!("127.0.0.1:{port}"))
+            .replace(":8102", &format!(":{ingress}"));
+        caddy_text.push_str(&remote_routes);
+    }
+    fs::write(&caddy_config, caddy_text).unwrap();
     let caddy_log = fs::File::create(root.join("caddy.log")).unwrap();
     let _caddy = CaddyGuard(Some(
         Command::new("/usr/local/bin/caddy")
@@ -133,7 +151,8 @@ reverse_proxy @project_{dsh_port} 127.0.0.1:{dsh_port} {{
         root.join("ready.json"),
         serde_json::to_vec_pretty(&json!({
             "controlUrl":format!("http://control.devvm.localhost:{port}"),
-            "apiUrl":api,"ingressPort":ingress,"projects":records
+            "apiUrl":api,"ingressPort":ingress,"projects":records,
+            "remoteControlUrls": remote.then(|| vec!["https://devvm.devvm.test", "https://devvm-risak.devvm.test", "https://devvm--home.devvm.test", "https://devvm-3080.devvm.test"])
         }))
         .unwrap(),
     )

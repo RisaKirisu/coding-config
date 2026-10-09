@@ -26,7 +26,7 @@ Reported vertical hinges reserve the gap between Project navigation and conversa
 
 ## Native integration and bridge
 
-The [Project-app package](../root/.dsh/plugins/project-app/README.md) is a Web-profile file dependency. Its host entry validates `DEVVM_CONTROL_ORIGINS` as exact URL origins and injects them with `DEVVM_EMBED_PROJECT_ID` through `webserver/index-inject`. The child activates its bridge only inside a parent frame with that metadata. It uses the native module loader, React runtime, slots, and `sessions`, `connection`, `conversation`, `uiWorkspace`, and `layout` services, plus the authenticated `remote.session` namespace.
+The [Project-app package](../root/.dsh/plugins/project-app/README.md) is a Web-profile file dependency. Its host entry validates exact `DEVVM_CONTROL_ORIGINS` and optional `DEVVM_CONTROL_DOMAIN`, then injects them with `DEVVM_EMBED_PROJECT_ID` through `webserver/index-inject`. The parent sets the iframe name to its exact origin and retains `no-referrer`; native login redirects strip referrers but preserve the frame name. The child accepts the claimed origin only when it is exactly listed or is an HTTPS/default-port `devvm` or DNS-valid `devvm-*` Control label under the configured domain. Announcements target that one exact origin, and every incoming message must carry that actual browser-reported origin and come from the parent window. Missing or unauthorized names leave the bridge inactive; a spoofed allowed name cannot receive announcements or attach from another origin. It uses the native module loader, React runtime, slots, and `sessions`, `connection`, `conversation`, `uiWorkspace`, and `layout` services, plus the authenticated `remote.session` namespace.
 
 Messages use this envelope:
 
@@ -74,7 +74,7 @@ States are `accepted`, `waiting_for_cleanup`, `running`, `succeeded`, `failed`, 
 
 App work is daemon-owned after submission. Legacy blocking endpoints remain request-owned. Both share [Operations](../src/lifecycle.rs), Project coordination, cancellation, status observation, and logging. Stop reserves the successor before cancellation/cleanup; predecessor ownership is held until cleanup completes. Cancellation cleanup has no execution deadline. In-memory receipts disappear on daemon restart, while VM/DSH status is read from the runtime. DSH stays Starting until the current launch token exists.
 
-The manifest uses a standalone root scope/start URL and Control-origin identity. The service worker caches only explicit public shell assets; Control APIs, authenticated launch data, and sibling DSH responses remain network-only. Its version hashes compiled shell assets. A waiting update asks users to close DevVM windows and reopen; it never forces an active refresh. Schema migrations must preserve saved text.
+The manifest uses a standalone root scope/start URL and Control-origin identity. On a configured remote Control host, its `name` and `short_name`, the initial document title, and the iOS home-screen title equal the Control subdomain: `devvm` or the full `devvm-*` label. Local and unrelated hosts retain `DevVM`. Each origin has independent install identity, public cache, drafts, and pending text; aliases do not migrate that state. Existing installations may require browser metadata refresh or reinstallation to adopt a changed name. The service worker caches only explicit public shell assets; Control APIs, authenticated launch data, and sibling DSH responses remain network-only. Its version hashes compiled shell assets. A waiting update asks users to close DevVM windows and reopen; it never forces an active refresh. Schema migrations must preserve saved text.
 
 Shell assets are compiled into [the daemon](../src/ui.rs), so shell edits require rebuilding/redeploying that executable. Native package replacements and installed local-plugin snapshots require a fresh target DSH process. [Runtime maintenance](dsh-runtime-maintenance.md) owns image, existing-VM, and release-upgrade procedures.
 
@@ -124,6 +124,13 @@ node tests/project_app_settings.cjs
 [Settings](../tests/project_app_settings.cjs) uses local and non-loopback URLs against the same real Runtime, reads actual profile fields, and checks reload, remote edits, fresh contexts, reconnect, and owned Runtime restart. Its remote cases expose the documented rc.2 limitation; do not count it as a passing regression suite. The fixture adds a test-only non-loopback hostname resolved to its owned Caddy by Chrome.
 
 Evidence is written beside `ready.json`. Create the fixture's `stop` file to stop only its children; it automatically stops after 18 minutes. Prerequisites are Linux, Node 24, the exact pinned CLI/replay, `patch`, `tar`, npm, Chrome, Playwright, and Caddy at the declared executable path. Replay supports one recorded Session per process; prompt scenarios reset only the owned Runtime through real lifecycle controls. Chromium's quota probe requires 31 seconds for cached write allowance to expire.
+
+[Control-host checks](../tests/project_app_control_hosts.cjs) use the same carrier with `DEVVM_BROWSER_REMOTE=1`. It adds the shipped host Caddy routes on the owned address `127.0.0.2:443`, an internal test certificate authority, and the remote domain `devvm.test`. The browser maps that domain to the owned address, accepts the test CA, and verifies base/named/numeric Control aliases, native token redirects and Strict cookies, exact-origin embedding, browser and cached manifests, and rejected labels/untrusted parent origins. Run with the same fixture root and `PLAYWRIGHT_MODULE` as the other checks:
+
+```sh
+DEVVM_BROWSER_FIXTURE_ROOT="$PWD/.agents/project-app-browser/run" \
+PLAYWRIGHT_MODULE=/path/to/playwright node tests/project_app_control_hosts.cjs
+```
 
 Physical Android/Samsung installation, IME and real hinge behavior, suspension/network handoff, microphone/clipboard/download permissions, external-link flows, and the actual remote FRP/Tailscale path remain separate acceptance. Emulated viewport/hinge/font checks do not establish those behaviors.
 

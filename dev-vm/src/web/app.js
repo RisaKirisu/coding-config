@@ -74,7 +74,9 @@ function launchUrl(project) {
   if (!value) return null;
   const url = new URL(value);
   const validLocal = location.hostname === 'control.devvm.localhost' && url.hostname === `3080.${project.project_host}.devvm.localhost` && url.protocol === 'http:';
-  const validRemote = location.hostname.startsWith('devvm.') && url.hostname === `${project.project_host}-3080.${location.hostname.slice(6)}` && url.protocol === 'https:';
+  const controlLabel = location.hostname.split('.')[0];
+  const controlDomain = location.hostname.slice(controlLabel.length + 1);
+  const validRemote = location.protocol === 'https:' && !location.port && /^devvm(?:-[a-z0-9-]{0,56}[a-z0-9])?$/.test(controlLabel) && url.hostname === `${project.project_host}-3080.${controlDomain}` && url.protocol === 'https:';
   if (!validLocal && !validRemote) throw new Error('Project launch address does not match this Control address.');
   return url;
 }
@@ -257,6 +259,7 @@ function createFrame(project, url) {
   const element = document.createElement('iframe');
   element.className = 'project-frame';
   element.title = `DSH — ${project.name}`;
+  element.name = location.origin;
   element.referrerPolicy = 'no-referrer';
   element.allow = 'microphone; clipboard-read; clipboard-write; fullscreen';
   const frame = {element, projectId: project.id, origin: url.origin, channelId: crypto.randomUUID(), instanceId: null, ready: false, connection: 'connecting', sessionId: null, selectingSession: null};

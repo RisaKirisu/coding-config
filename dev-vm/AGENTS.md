@@ -32,11 +32,13 @@ For the Control-origin app, embedded native DSH bridge, durable text, owner patc
 
 ### Control Daemon browser origin
 
-For Control Daemon URLs, DSH launch links, browser authentication, or ingress changes, read ADR 0002. With DSH `0.2.0-rc.2`, use `http://control.devvm.localhost:8100` locally and `https://devvm.<remote-domain>` (default: `https://devvm.risak.dev`) over the tailnet: DSH exchanges its launch token for a `SameSite=Strict` cookie, so the Control and Project URLs must be same-site. Raw IP and bare `localhost` URLs remain management-only aliases because their Open DSH navigation is cross-site. Port `8100` reaches the Control Daemon directly locally (or via Host Caddy proxy remotely); Project URLs traverse FRP and Caddy.
+For Control Daemon URLs, DSH launch links, browser authentication, or ingress changes, read ADR 0002. With DSH `0.2.0-rc.2`, use `http://control.devvm.localhost:8100` locally and HTTPS `devvm` or DNS-valid `devvm-*` Control labels under the configured remote domain over the tailnet: DSH exchanges its launch token for a `SameSite=Strict` cookie, so the Control and Project URLs must be same-site. Raw IP and bare `localhost` URLs remain management-only aliases because their Open DSH navigation is cross-site. Port `8100` reaches the Control Daemon directly locally (or via Host Caddy proxy remotely); Project URLs traverse FRP and Caddy.
 
 The host FRP server appends stdout and stderr to `~/.local/state/devvm/frps.log`; existing server processes retain their original output destination until relaunched. Do not restart the shared server during read-only ingress diagnosis because that interrupts all Projects and clears proxy ownership evidence.
 
 Host ingress has one configuration source: `scripts/Caddyfile.host`. Setup prints it; integration tests load it directly. Read `docs/remote-access.md` before changing setup or ingress. Report HTTP cookie-replay checks separately from browser HTTPS/SameSite verification.
+
+Remote Control validation must stay aligned across host ingress, launch-link validation, manifest naming, and the native bridge. The iframe name carries the claimed exact Control origin across native login redirects while preserving `no-referrer`. The child validates the name against launch-time exact origins/configured domain and requires that actual origin and parent source on every message; never use wildcard `postMessage` targets. Control labels are reserved ahead of Project routes. Verify alias changes with `tests/project_app_control_hosts.cjs` against the owned HTTPS carrier (`DEVVM_BROWSER_REMOTE=1`).
 
 ### Session Sync
 

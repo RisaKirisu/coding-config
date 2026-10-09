@@ -17,6 +17,15 @@ pub fn validate_domain(domain: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Return the single Control subdomain under the configured remote domain.
+pub fn control_subdomain<'a>(host: &'a str, domain: &str) -> Option<&'a str> {
+    let label = host.strip_suffix(domain)?.strip_suffix('.')?;
+    if label.contains('.') || validate_domain(label).is_err() {
+        return None;
+    }
+    (label == "devvm" || label.starts_with("devvm-")).then_some(label)
+}
+
 pub fn build_local_project_url(host: &str, port: u16, ingress: u16, token: Option<&str>) -> String {
     let mut url = format!("http://{port}.{host}.devvm.localhost:{ingress}");
     if let Some(token) = token {
@@ -65,6 +74,41 @@ mod tests {
     use super::*;
     use crate::models::compute_project_host;
     use std::path::Path;
+
+    #[test]
+    fn control_subdomains_match_only_valid_labels_in_the_configured_domain() {
+        for label in [
+            "devvm",
+            "devvm-a",
+            "devvm-home",
+            "devvm--home",
+            "devvm-3080",
+        ] {
+            let host = format!("{label}.risak.dev");
+            assert_eq!(control_subdomain(&host, "risak.dev"), Some(label));
+        }
+        for host in [
+            "devvm2.risak.dev",
+            "devvm-.risak.dev",
+            "devvm-a-.risak.dev",
+            "devvm-a.b.risak.dev",
+            "devvm.risak.dev.evil.test",
+            "app-3080.risak.dev",
+            "devvm.other.dev",
+            "devvm.risak.dev:443",
+        ] {
+            assert_eq!(control_subdomain(host, "risak.dev"), None, "{host}");
+        }
+        let label = format!("devvm-{}", "a".repeat(57));
+        assert_eq!(
+            control_subdomain(&format!("{label}.risak.dev"), "risak.dev"),
+            Some(label.as_str())
+        );
+        assert_eq!(
+            control_subdomain(&format!("{label}a.risak.dev"), "risak.dev"),
+            None
+        );
+    }
 
     #[test]
     fn urls_preserve_routing_identity_and_validate_inputs() {

@@ -26,6 +26,7 @@ install -d -m 0700 "$log_dir"
 rm -f "$pid_file" "$token_file" "$log_dir/dsh.token"
 export DEVVM_EMBED_PROJECT_ID={project_id}
 export DEVVM_CONTROL_ORIGINS='{control_origins}'
+export DEVVM_CONTROL_DOMAIN='{control_domain}'
 setsid bash -c '
   echo $$ > /tmp/devvm-daemon-dsh.pid
   cd /root/workspace && devvm-sync-startup
@@ -341,7 +342,11 @@ fn launch_command(config: &DaemonConfig, project_id: Uuid) -> Result<String, Str
     let origins = serde_json::to_string(&origins).map_err(|error| error.to_string())?;
     Ok(DSH_START_COMMAND
         .replace("{project_id}", &project_id.to_string())
-        .replace("{control_origins}", &origins))
+        .replace("{control_origins}", &origins)
+        .replace(
+            "{control_domain}",
+            config.remote_domain.as_deref().unwrap_or(""),
+        ))
 }
 
 /// The guest distinguishes a live runtime still starting from one that emitted its ready URL.
@@ -421,6 +426,21 @@ async fn run_guest_command(
 #[cfg(test)]
 mod tests {
     use super::{DSH_START_COMMAND, DSH_STATUS_COMMAND, DSH_STOP_COMMAND};
+
+    #[test]
+    fn test_launch_command_provisions_configured_control_domain() {
+        let mut config = crate::config::DaemonConfig::default();
+        config.remote_domain = Some("risak.dev".into());
+        let command = super::launch_command(&config, uuid::Uuid::nil()).unwrap();
+        assert!(command.contains("export DEVVM_CONTROL_DOMAIN='risak.dev'"));
+        assert!(command.contains("https://devvm.risak.dev"));
+        config.remote_domain = None;
+        assert!(super::launch_command(&config, uuid::Uuid::nil())
+            .unwrap()
+            .contains("export DEVVM_CONTROL_DOMAIN=''"));
+        config.remote_domain = Some("risak.dev'".into());
+        assert!(super::launch_command(&config, uuid::Uuid::nil()).is_err());
+    }
 
     #[test]
     fn test_start_command_runs_startup_script_before_dsh_web() {

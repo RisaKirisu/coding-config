@@ -22,9 +22,11 @@ Remote defaults are `risak.dev` and `100.67.154.69`. Setup installs the daemon's
 
 Cloudflare DNS-only A records for `devvm.risak.dev` and `*.risak.dev` point to `100.67.154.69`. Specific records override the wildcard. Only authorized Tailscale clients can reach this address.
 
-- Control: `https://devvm.risak.dev` -> host Caddy -> loopback `8100`.
+- Control: `https://devvm.risak.dev` or `https://devvm-<instance>.risak.dev` -> host Caddy -> loopback `8100`. The single Control label must be DNS-valid and at most 63 characters; `devvm2` and `devvm-` are not accepted.
 - Project: `https://<project-host>-<port>.risak.dev` -> host Caddy -> FRP on loopback `8102` -> guest Caddy -> application.
 - Local: `http://control.devvm.localhost:8100` and `http://<port>.<project-host>.devvm.localhost:8102`.
+
+Add a DNS-only record for each instance Control name pointing to that instance's Tailscale IP. Project DNS records must also resolve to the instance that owns the Project; registering only a Control alias does not change wildcard DNS routing. The `devvm` and `devvm-*` names are reserved for Control routing, which precedes Project routing. Installed mobile app names equal the Control label, such as `devvm-risak`.
 
 Project hosts normally contain the project name and existing eight-character path hash. If the name exceeds 48 characters, use just that hash. The daemon and `devvm` assign the same identity before URL generation and FRP registration; URL formatting never renames it. VM lifecycle names are independent of this routing label.
 

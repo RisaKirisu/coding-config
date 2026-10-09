@@ -5,7 +5,7 @@ https://devvm.{$REMOTE_DOMAIN:risak.dev}, https://*.{$REMOTE_DOMAIN:risak.dev} {
 		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
 	}
 
-	@control host devvm.{$REMOTE_DOMAIN:risak.dev}
+	@control header_regexp control Host (?i)^devvm(?:-[a-z0-9-]{0,56}[a-z0-9])?\.{$REMOTE_DOMAIN_REGEXP:risak\.dev}(:[0-9]+)?$
 	handle @control {
 		reverse_proxy 127.0.0.1:8100
 	}
