@@ -17,13 +17,16 @@ node_modules/
 .pnpm-store/
 
 # DSH runtime state
-root/.dsh/sessions/
-root/.dsh/storages/
+root/.dsh/sessions/*
+!root/.dsh/sessions/.gitkeep
+root/.dsh/storages/*
+!root/.dsh/storages/.gitkeep
 root/.dsh/plugins/subscriptions/
 **/.plugin-manager/logs/
 root/.dsh/.sync-status.json
 root/.dsh/.anonymous-user-id
-root/.dsh/attachments
+root/.dsh/attachments/*
+!root/.dsh/attachments/.gitkeep
 **/thinking-effort-loaded.json
 
 # Project logs

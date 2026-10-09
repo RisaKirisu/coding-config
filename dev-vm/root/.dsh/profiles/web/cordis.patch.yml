@@ -323,8 +323,8 @@
         imageMaxBytes: 1048576
 - id: agent-default-model
   config:
-    provider: deepseek-official
-    model: deepseek-flash
+    provider: proxy-cli
+    model: gpt-6.1-sol
     reasoningEffort: high
 - id: ui-settings-general
   config:

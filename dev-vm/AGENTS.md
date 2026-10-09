@@ -40,6 +40,8 @@ Host ingress has one configuration source: `scripts/Caddyfile.host`. Setup print
 
 ### Session Sync
 
+Preserve the tracked `.gitkeep` mount-point placeholders in `root/.dsh/{sessions,storages,attachments}/` when changing DSH ignore rules. See `readme.md` under DSH State Architecture.
+
 The DSH plugin at `root/.dsh/plugins/remote-sync/` is the only Session Sync engine (ADR 0003); the daemon never runs rsync. Plugin tests (`node --test root/.dsh/plugins/remote-sync/test.mjs`) use real rsync over the local transport (no `ssh_host`). Startup reconciliation runs from the installed Web-profile package so it uses the same plugin version as DSH.
 
 ### Build Loop
