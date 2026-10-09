@@ -25,7 +25,7 @@ Cordis patch rows own complete configurations; successive partial rows can erase
 
 The home keeps `sandbox` available for native PTC, with `sandbox-policy.mode: danger-full-access`, and disables the sandboxed executor/permission/approval entries. Local Bash has a 1,200,000ms default and cap and 20,000 retained output bytes; call/session cwd remains authoritative. These are deployment-owned executor settings.
 
-Web settings storage and remote UI persistence are distinct. Native rc.2 forms use Host mode on loopback pages and memory-only mode on non-loopback pages. Thus Steer/Chinese profile overrides do not establish durable remote UI behavior. There is no supported configuration/Cordis override in this release; see [settings policy admission](dsh-runtime-maintenance.md#settings-policy-admission). Treat remote persistence as an open requirement, not a passed upgrade check.
+Web settings storage and remote UI persistence are distinct. The owner patch makes native forms use Host mode on every authenticated page, so Steer/Chinese profile overrides apply to remote browsers; see [settings policy admission](dsh-runtime-maintenance.md#settings-policy-admission).
 
 ## Native package composition
 
@@ -48,6 +48,6 @@ The Web [manifest](../root/.dsh/profiles/web/package.json) pins Better Sidebar a
 
 Use real published candidate artifacts and owned fixtures. [Frozen installation](../tests/dsh-plugin-install.test.mjs) checks packaging/import isolation; [native tools](../tests/dsh-rc2-tools.test.mjs) checks native tool/MCP integration. Each local plugin retains its focused checks. Native owner rebases require browser delivery/recovery, controls/mobile, and complete patch-state validation, not only package installation.
 
-Settings checks must separate loopback profile-backed forms, custom plugin endpoints, and stock non-loopback form policy. An authenticated connection alone does not make the native remote forms durable. Provider requests, production Context7 access, real guest Browser flows, physical-device behavior, and remote network-path claims need their own actual evidence.
+Settings checks must separate profile-backed native forms from custom plugin endpoints. Provider requests, production Context7 access, real guest Browser flows, physical-device behavior, and remote network-path claims need their own actual evidence.
 
 No release record is proof that an existing VM or hosting process was upgraded. Host setup may rebuild the image; existing VMs retain their global CLI. [Runtime maintenance](dsh-runtime-maintenance.md#deployment) documents explicit same-version old-to-new patches, exact receipts, snapshot refresh with the guest store, and separate existing-VM CLI release replacement. Preserve credentials, profiles, Sessions, attachments, storages, voice/style data, and production Sync state throughout.

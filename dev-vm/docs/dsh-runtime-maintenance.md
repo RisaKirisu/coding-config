@@ -21,15 +21,16 @@ Profile settings belong to the active Runtime profile's `cordis.patch.yml`. Lega
 
 ## Native contract inventory
 
-The [Project-app owner patch](../patches/deepseek-harness-project-app.patch) and [distributed copy](../root/.dsh/devvm-project-app.patch) must be byte-identical. Docker consumes the first; same-version existing-VM updates consume the second. The owner patch covers Session admission/display and embedded UI, and leaves the native settings persistence policy unchanged.
+The [Project-app owner patch](../patches/deepseek-harness-project-app.patch) and [distributed copy](../root/.dsh/devvm-project-app.patch) must be byte-identical. Docker consumes the first; same-version existing-VM updates consume the second. The owner patch covers Session admission/display and embedded UI, and sets native settings forms to Host mode on every authenticated page.
 
-The patch targets eight generated files under `node_modules/@deepseek-ai/` in the global CLI:
+The patch targets nine generated files under `node_modules/@deepseek-ai/` in the global CLI:
 
 | Native owner | Published targets | Required behavior |
 | --- | --- | --- |
 | `dsh-api-session-controller` | `lib/client.js`, `lib/index.js`, `lib/types/client/contract/session.d.ts` | Retained displayed projections, caller request identity, concurrent same-ID admission, accepted-ID recovery |
 | `dsh-client-ui-conversation` | `lib/client.js`, `lib/types/client/contract/input.d.ts`, `lib/types/client/service.d.ts` | Embedded draft provider, awaitable admission/dispatch, captured identities, native prompt/bubble continuity, mobile styling |
 | `dsh-client-ui-layout` | `lib/client.js`, `lib/types/client/service.d.ts` | `setSidebarOpen`, native slot/grid integration, mobile drawer geometry and transitions |
+| `dsh-client-ui-settings` | `lib/client.js` | Host-mode form persistence and describe mirror for every authenticated page, so remote General and Models settings read and save the profile |
 
 The [localhost patch](../patches/deepseek-harness-localhost-subdomains.patch) targets published `dsh-client-connection` client/host artifacts and admits existing `.localhost` facades. Both patches require revalidation for a new DSH release. Zero fuzz validates matching contexts; it does not establish API semantics or visual correctness.
 
@@ -41,15 +42,15 @@ Native CSS integration pins generated class families `wSkVaW`, `uV2eYG`, `pI_x6G
 
 The desired Web fields are `ui-conversation.config.busyEnter: steer` and `locale.config.preference: zh`. They are valid profile overrides.
 
-Busy-Enter is a preference for supported busy submissions. Native idle/non-steering submissions use Queue, and the accelerated chord selects the complement while busy. Preserve that policy and the outbox's captured mode when adapting versions; a delivery-mode label alone does not establish a preference reset. Published rc.2's native `ui-settings` provider selects Host or memory mode from the served page's loopback classification. Its README expressly documents that authenticated non-loopback pages have inert form writes. This causes local-looking language/send selections to disappear when the client state is recreated: locale uses browser-language selection with English fallback, while busy-send uses Queue. The settings probe declares an English browser to make this signal deterministic.
+Busy-Enter is a preference for supported busy submissions. Native idle/non-steering submissions use Queue, and the accelerated chord selects the complement while busy. Preserve that policy and the outbox's captured mode when adapting versions; a delivery-mode label alone does not establish a preference reset. Published rc.2's native `ui-settings` provider selects Host or memory mode from the served page's loopback classification. The owner patch always selects Host mode, so remote pages load and save profile fields, and the Models page receives the shared describe mirror it requires. The settings-document action keeps its loopback gate because it opens the file on the Host machine. The settings probe declares an English browser to make restored preferences distinguishable from defaults.
 
 The native `ui-settings` configuration exposes only the developer-tools `enabled` field. Its client runtime exports `apply`/`inject`; the form/mirror constructors are type-visible but not public runtime exports. The `configForms` consumer API has no persistence setter. Cordis interception supplies configuration only to services that consume it; this provider does not consume an intercepted persistence setting. The native Locale/composer consumers remain bound to those forms.
 
-Remote native preference persistence is therefore unmet under current public configuration/extension APIs. Keep loopback facts and the worker-only `ownsHost` transport fact truthful. Do not treat direct profile edits or process restart as a remote persistence fix. For a new release, inspect its published policy and public configuration before admission. If it offers a supported policy, configure that policy and require [the real settings probe](../tests/project_app_settings.cjs) to pass across non-loopback read/save, reload, fresh contexts, reconnect, and Runtime restart. If no supported policy exists, retain/report the limitation explicitly.
+Because public configuration and extension APIs cannot select the persistence mode, the owner patch changes the `persistence` constant in `dsh-client-ui-settings`. For a new release, inspect its published persistence selection before admission. If it offers a supported policy, configure that policy and remove the hunk; otherwise rebase the hunk. Require [the real settings probe](../tests/project_app_settings.cjs) to pass across non-loopback read/save, reload, fresh contexts, reconnect, and Runtime restart.
 
 ## Deployment
 
-All deployment commands are for the authorized host and target Project VM. Never use them on the Runtime hosting the agent session. Preserve current remote-domain/IP arguments and private environment files.
+The user performs every deployment and update procedure in this section manually: host setup, image build, daemon redeploy, existing-VM patch updates, and existing-VM CLI migration. Agents prepare and validate the sources and hand the commands to the user; they do not run them. The commands are for the authorized host and target Project VM. Never use them on the Runtime hosting the agent session. Preserve current remote-domain/IP arguments and private environment files.
 
 ### Host image and shell
 
@@ -68,7 +69,7 @@ The daemon's shell is compiled into the executable, so redeploy its rebuilt bina
 
 Stop only the target Project's DSH through lifecycle controls, keep its VM running, and preserve its exact deployed patch receipt before updating shared sources. New images carry the receipt at `/opt/devvm-patches/project-app.patch`. A VM updated manually must retain the patch actually applied; an unrelated older receipt cannot validate an upgrade.
 
-First test the complete transition on an owned copy of the target package: current-patch reverse dry run, pristine forward dry run, or exact old reverse followed by current forward, all with zero fuzz. Do not validate only conversation/layout: all eight targets participate. Unknown states must stop before deployment.
+First test the complete transition on an owned copy of the target package: current-patch reverse dry run, pristine forward dry run, or exact old reverse followed by current forward, all with zero fuzz. Do not validate only conversation/layout: all nine targets participate. Unknown states must stop before deployment.
 
 From the target Project's registered host directory, the same-version guest update is:
 
@@ -118,4 +119,4 @@ An image rebuild does not perform this migration. Back up VM-local Sessions/stor
 - Local admission/peers in [Project app](../root/.dsh/plugins/project-app/package.json), [Agent presets](../root/.dsh/plugins/agent-presets/package.json), [Build Loop](../root/.dsh/plugins/build-loop/package.json), [Subagent Manager](../root/.dsh/plugins/subagent-manager/package.json), [Voice Input](../root/.dsh/plugins/voice-input/package.json), [Remote Sync](../root/.dsh/plugins/remote-sync/package.json), [Style Control](../root/.dsh/plugins/style-control/package.json), and [Skill/MCP panel](../root/.dsh/plugins/dsh-skill-mcp-panel/package.json). Their Native API/type admissions must match the actual candidate.
 - Web/headless manifests and locks; the Web compatibility pins for third-party sidebar/thinking-effort/context packages; local ordinary-dependency locks when those dependencies change.
 - Exact-candidate checks in [native tools](../tests/dsh-rc2-tools.test.mjs), [Build Loop upgrade](../root/.dsh/plugins/build-loop/upgrade.test.mjs), [Remote Sync](../root/.dsh/plugins/remote-sync/test.mjs), and [Context7 registration](../root/.dsh/plugins/dsh-skill-mcp-panel/test-context7-registration.mjs). [Installation](../tests/dsh-plugin-install.test.mjs) verifies packaging, not owner/CSS compatibility.
-- Active app/spec/plugin/agent docs and the release integration record. Keep current settings limitations and proof boundaries explicit.
+- Active app/spec/plugin/agent docs and the release integration record. Keep proof boundaries explicit.

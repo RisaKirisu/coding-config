@@ -77,7 +77,7 @@ The named URL is required for one-click DSH launch links under DSH `0.2.0-rc.2`.
 
 The raw-IP and bare-localhost Control URLs remain usable for daemon management, but their Open DSH links have this DSH `0.2.0-rc.2` browser-auth limitation.
 
-The proxy’s loopback Host/Origin facade does not change the browser’s address. Stock rc.2 classifies remote browser hostnames as memory-only for native settings forms, so language/send choices can reset despite saved profile fields. See [the settings persistence limitation](docs/project-app.md#settings-persistence).
+The proxy’s loopback Host/Origin facade does not change the browser’s address. The owner patch makes native settings forms Host-backed on every authenticated page, so remote browsers read and save the same profile fields as local ones. See [settings persistence](docs/project-app.md#settings-persistence).
 
 The Web UI allows you to:
 1. Browse directories beneath `$HOME` and register Projects (creating or reading `.devvm-id`).

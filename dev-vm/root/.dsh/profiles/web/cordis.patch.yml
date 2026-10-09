@@ -3,7 +3,7 @@
   config:
     providers:
       krill-codex:
-        displayName: Krill
+        displayName: Krill OAI
         apiKeyEnv: KRILL_CODEX_API_KEY
         api: openai-responses
         baseURL: https://api.krill-code.net/codex/v1
@@ -39,113 +39,6 @@
             compat:
               chatTemplateKwargs: {}
               chatTemplateArgs: {}
-        modelOverrides: {}
-        compat:
-          chatTemplateKwargs: {}
-          chatTemplateArgs: {}
-        defaultContextWindow: 262144
-        defaultMaxTokens: 32768
-        defaultInput:
-          - text
-        headers: {}
-        thinkingBudgets: {}
-        streamIdleTimeoutMs: 300000
-        maxRequestImageBytes: 20971520
-        requestImagePixelBudget: 4194304
-        requestImageMaxBytes: 1048576
-      krill-china:
-        displayName: Krill
-        apiKeyEnv: KRILL_CHINA_API_KEY
-        api: openai-responses
-        baseURL: https://api.krill-code.net/coding/v1
-        models:
-          - id: kimi-k3
-            input: []
-            reasoningEfforts:
-              off: null
-              high: high
-              max: max
-            compat:
-              chatTemplateKwargs: {}
-              chatTemplateArgs: {}
-          - id: deepseek-v4.1-flash
-            contextWindow: 300000
-            input: []
-            compat:
-              chatTemplateKwargs: {}
-              chatTemplateArgs: {}
-            reasoningEfforts:
-              off: null
-              high: high
-              max: max
-          - id: GLM-5.3
-            input: []
-            compat:
-              chatTemplateKwargs: {}
-              chatTemplateArgs: {}
-            reasoningEfforts:
-              off: null
-              high: high
-              max: max
-          - id: GLM-5.3-Flash
-            input: []
-            compat:
-              chatTemplateKwargs: {}
-              chatTemplateArgs: {}
-            reasoningEfforts:
-              off: null
-              high: high
-              max: max
-        modelOverrides: {}
-        compat:
-          chatTemplateKwargs: {}
-          chatTemplateArgs: {}
-        defaultContextWindow: 262144
-        defaultMaxTokens: 32768
-        defaultInput:
-          - text
-        headers: {}
-        thinkingBudgets: {}
-        streamIdleTimeoutMs: 300000
-        maxRequestImageBytes: 20971520
-        requestImagePixelBudget: 4194304
-        requestImageMaxBytes: 1048576
-      amazon-bedrock:
-        baseURL: https://bedrock-runtime.us-west-2.amazonaws.com
-        models:
-          - id: arn:aws:bedrock:us-west-2:233532778289:application-inference-profile/zcsopmpsss4d
-            name: Claude Opus 5
-            contextWindow: 1000000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              off: null
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-            compat:
-              chatTemplateKwargs: {}
-              chatTemplateArgs: {}
-          - id: arn:aws:bedrock:us-west-2:233532778289:application-inference-profile/gbb5tf1qqz2r
-            name: Claude Fable 5.1
-            contextWindow: 1000000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              off: null
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-            compat:
-              chatTemplateKwargs: {}
-              chatTemplateArgs: {}
-        apiKeyEnv: AMAZON_BEDROCK_API_KEY
         modelOverrides: {}
         compat:
           chatTemplateKwargs: {}
@@ -251,40 +144,15 @@
         maxRequestImageBytes: 20971520
         requestImagePixelBudget: 4194304
         requestImageMaxBytes: 1048576
-      openrouter:
+        displayName: Local OAI
+      proxy-cli-claude:
+        displayName: Local Claude
+        apiKeyEnv: PROXY_CLI_CLAUDE_API_KEY
+        api: anthropic-messages
+        baseURL: http://100.96.0.1:8317
         models:
-          - id: google/gemini-3.7-flash
-            input: []
-            reasoningEfforts:
-              off: null
-              high: high
-              max: max
-            compat:
-              chatTemplateKwargs: {}
-              chatTemplateArgs: {}
-        apiKeyEnv: OPENROUTER_API_KEY
-        modelOverrides: {}
-        compat:
-          chatTemplateKwargs: {}
-          chatTemplateArgs: {}
-        defaultContextWindow: 262144
-        defaultMaxTokens: 32768
-        defaultInput:
-          - text
-        headers: {}
-        thinkingBudgets: {}
-        streamIdleTimeoutMs: 300000
-        maxRequestImageBytes: 20971520
-        requestImagePixelBudget: 4194304
-        requestImageMaxBytes: 1048576
-      krill-claude-kiro:
-        displayName: Krill Claude Kiro
-        apiKeyEnv: KRILL_CLAUDE_API_KEY
-        api: openai-responses
-        baseURL: https://api.krill-code.net/v1
-        models:
-          - id: claude-opus-5-5
-            name: claude-opus-5-5 · Krill Kiro
+          - id: claude-haiku-5-5
+            name: Claude Haiku 5.5
             contextWindow: 1000000
             maxTokens: 128000
             input:
@@ -292,7 +160,45 @@
               - image
             reasoningEfforts:
               off: null
-              minimal: null
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+            compat:
+              chatTemplateKwargs: {}
+              chatTemplateArgs: {}
+          - id: claude-opus-5-5
+            name: Claude Opus 5.5
+            contextWindow: 1000000
+            maxTokens: 128000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              off: null
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+            compat:
+              chatTemplateKwargs: {}
+              chatTemplateArgs: {}
+          - id: claude-sonnet-5-5
+            name: Claude Sonnet 5.5
+            contextWindow: 1000000
+            maxTokens: 128000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              off: null
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
             compat:
               chatTemplateKwargs: {}
               chatTemplateArgs: {}
@@ -323,8 +229,8 @@
         imageMaxBytes: 1048576
 - id: agent-default-model
   config:
-    provider: proxy-cli
-    model: gpt-6.1-sol
+    provider: proxy-cli-claude
+    model: claude-sonnet-5-5
     reasoningEffort: high
 - id: ui-settings-general
   config:
@@ -374,6 +280,17 @@
 
 # >>> dsh-skill-mcp-panel:mcp:begin
 - insert:
+    - id: model-fallback
+      name: "@devvm/dsh-model-fallback"
+      config:
+        fallbacks:
+          - provider: krill-codex
+            model: gpt-6.1-sol
+            reasoningEffort: high
+        retriableErrors:
+          - code: PI_AI_ERROR
+            messageContains: stream disconnected before completion
+            treatAs: TRANSPORT
     - id: panel-mcp-context7
       name: "@deepseek-ai/dsh-mcp-client"
       config:
@@ -388,20 +305,6 @@
         transport: streamable-http
         url: https://mcp.context7.com/mcp
         headers:
-          Authorization: !!js (() => { const token =
-            process.env.MCP_636F6E7465787437_TOKEN; if (!token) throw new
-            Error('Missing MCP authentication environment variable
-            MCP_636F6E7465787437_TOKEN'); return 'Bearer ' + token; })()
-- id: model-fallback
-  name: "@devvm/dsh-model-fallback"
-  config:
-    fallbacks:
-      - provider: krill-codex
-        model: gpt-6.1-sol
-        reasoningEffort: high
-    retriableErrors:
-      - code: PI_AI_ERROR
-        messageContains: stream disconnected before completion
-        treatAs: TRANSPORT
+          Authorization: ctx7sk-ce3cc02b-102b-4af7-8a02-73ed91de488a
 
 # <<< dsh-skill-mcp-panel:mcp:end
