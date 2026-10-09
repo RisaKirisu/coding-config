@@ -47,6 +47,8 @@ Flags:
 
 ## Control Daemon & Web UI
 
+The installable Project app at `/` embeds native DSH with Project navigation, lifecycle controls, Logs, and durable text recovery. The management UI remains at `/manage`. See [Project app](docs/project-app.md) for ownership, native integration, browser verification, and current limitations; [runtime maintenance](docs/dsh-runtime-maintenance.md) records native-version admission and deployment for new/existing VMs.
+
 Run the Control Daemon interactively:
 
 ```sh
@@ -70,9 +72,11 @@ Use a named Control Daemon URL that shares the Project URL's parent site:
 
 `control.devvm.localhost` is not a Caddy route or an explicit daemon hostname. Browsers and modern resolvers map every `.localhost` name to loopback, and the Control Daemon's `127.0.0.1:8100` listener accepts that Host header. Remote access routes through host-side Caddy, which terminates HTTPS on the configured Tailscale IP and proxies to the loopback listeners.
 
-The named URL is required for one-click DSH launch links under DSH `0.1.5-rc.2`. That release exchanges `/?token=<token>` for an `HttpOnly; SameSite=Strict` authority cookie, then redirects to `/`. A Control page opened at `127.0.0.1:8100`, `localhost:8100`, or a raw IP is cross-site relative to `*.devvm.localhost` or `*.risak.dev`; browsers store the cookie but withhold it on the redirect, and DSH responds with `dsh web authentication required`. The corresponding named Control and Project URLs share their parent domain and are same-site, so the redirect carries the cookie and succeeds.
+The named URL is required for one-click DSH launch links under DSH `0.2.0-rc.2`. That release exchanges `/?token=<token>` for an `HttpOnly; SameSite=Strict` authority cookie, then redirects to `/`. A Control page opened at `127.0.0.1:8100`, `localhost:8100`, or a raw IP is cross-site relative to `*.devvm.localhost` or `*.risak.dev`; browsers store the cookie but withhold it on the redirect, and DSH responds with `dsh web authentication required`. The corresponding named Control and Project URLs share their parent domain and are same-site, so the redirect carries the cookie and succeeds.
 
-The raw-IP and bare-localhost Control URLs remain usable for daemon management, but their Open DSH links have this DSH `0.1.5-rc.2` browser-auth limitation.
+The raw-IP and bare-localhost Control URLs remain usable for daemon management, but their Open DSH links have this DSH `0.2.0-rc.2` browser-auth limitation.
+
+The proxy’s loopback Host/Origin facade does not change the browser’s address. Stock rc.2 classifies remote browser hostnames as memory-only for native settings forms, so language/send choices can reset despite saved profile fields. See [the settings persistence limitation](docs/project-app.md#settings-persistence).
 
 The Web UI allows you to:
 1. Browse directories beneath `$HOME` and register Projects (creating or reading `.devvm-id`).
@@ -82,9 +86,9 @@ The Web UI allows you to:
 5. Inspect host-persisted Project Logs (surviving VM stop/deletion). Each Project has one host log directory, `root/.project-logs/<project-id>/` (override with `DEVVM_LOG_DIR`), holding `daemon.log` written by the Control Daemon, plus `dsh.log` and `ingress.log` written inside the DevVM, which sees the directory at `/devvm-root/.project-logs/<project-id>/`. Every line starts with an ISO-8601 UTC timestamp in milliseconds.
 6. View Sync Status (not configured, synchronizing, synchronized, remote ahead, degraded, or failed) as reported by the DSH Runtime, and restart a running DSH Runtime to pull work another workstation pushed. Manual retry lives in the DSH sync indicator, not here.
 
-Lifecycle requests stay open until their commands finish; there is no execution timeout. Commands are coordinated per Project across all UI clients: conflicting starts/restarts return HTTP 409, while Stop VM, Delete VM, or Stop DSH cancels an active start and waits for command cleanup before proceeding. A client disconnect observed by the daemon cancels that client's unfinished operation. Cancellation sends SIGTERM to the host command's process group and waits for exit and captured-output closure before releasing the Project. It does not undo a VM that already started or stop a DSH Runtime after a successful detached launch. A command that ignores SIGTERM continues to hold the Project until it exits; no forced-cleanup deadline is imposed. When using a reverse proxy, disconnect cancellation depends on that proxy closing the upstream request.
+Legacy management lifecycle requests stay open until their commands finish; there is no execution timeout. Commands are coordinated per Project across all UI clients: conflicting starts/restarts return HTTP 409, while Stop VM, Delete VM, or Stop DSH cancels an active start and waits for command cleanup before proceeding. A client disconnect observed by the daemon cancels that client's unfinished operation. Cancellation sends SIGTERM to the host command's process group and waits for exit and captured-output closure before releasing the Project. It does not undo a VM that already started or stop a DSH Runtime after a successful detached launch. A command that ignores SIGTERM continues to hold the Project until it exits; no forced-cleanup deadline is imposed. When using a reverse proxy, disconnect cancellation depends on that proxy closing the upstream request.
 
-The initiating UI shows its local pending action while the request runs; other UIs show observed VM/DSH status. The VM can therefore show Running while its startup command is still configuring the guest. Unregistering changes only the registry and does not cancel a live operation.
+The management UI shows its local pending blocking request; the Project app submits daemon-owned operations and reads active/latest receipts across clients. App operations continue after the submitting connection closes, while legacy blocking requests keep disconnect cancellation. The app correlates uncertain submissions by request UUID within retained records and does not automatically replay them. The VM can therefore show Running while its startup command is still configuring the guest. Unregistering changes only the registry and does not cancel a live operation.
 
 The log viewer merges the three files into one time-ordered list. Each row shows the local time (`HH:MM:SS.mmm`), a badge for its source (`daemon`, `dsh`, or `ingress`), and the message, with error rows tinted red and warnings amber; Caddy's JSON access lines are compacted to `GET /path → 502 (0.2 ms)`. The toolbar carries one chip per source, an `errors only` toggle, and a `Follow` toggle that keeps the view pinned to the newest line — scrolling up more than 24 px turns Follow off so the refresh every two seconds no longer moves the view, and scrolling back to the bottom turns it on again.
 
@@ -108,14 +112,15 @@ Setup prints the single [host Caddy site block](scripts/Caddyfile.host) and its 
 
 You can also use the standalone `devvm` CLI directly from any project directory:
 
-```sh
-devvm shell          # open interactive shell in microVM
-devvm start|stop     # start or stop the microVM
-devvm status         # check microVM status
-devvm exec <cmd>     # run command in microVM (mounts project at /root/workspace)
-devvm rm             # delete microVM
-devvm name           # print machine name
-```
+| Command | Purpose |
+| --- | --- |
+| `devvm shell` | Open an interactive guest shell |
+| `devvm start` | Start the microVM |
+| `devvm stop` | Stop the microVM |
+| `devvm status` | Read microVM status |
+| `devvm exec -- pwd` | Run a guest command; the Project is mounted at `/root/workspace` |
+| `devvm rm` | Delete the microVM |
+| `devvm name` | Print the machine name |
 
 ### Project URLs
 

@@ -181,6 +181,13 @@ RUN set -eux; \
     grep -Fq 'hostname.endsWith(".localhost")' "$server_target"; \
     rm /tmp/deepseek-harness-localhost-subdomains.patch
 
+# Native owners for the Control-origin Project app; exact pinned bundle anchors.
+COPY patches/deepseek-harness-project-app.patch /opt/devvm-patches/project-app.patch
+RUN set -eux; \
+    package_dir=/usr/local/lib/node_modules/@deepseek-ai/dsh; \
+    patch --batch --forward --fuzz=0 --dry-run --strip=1 --directory="$package_dir" < /opt/devvm-patches/project-app.patch; \
+    patch --batch --forward --fuzz=0 --strip=1 --directory="$package_dir" < /opt/devvm-patches/project-app.patch
+
 # Install OpenCode
 RUN npm install -g opencode-ai
 ENV OPENCODE_EXPERIMENTAL_WEBSOCKETS=true \

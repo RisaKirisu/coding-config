@@ -17,6 +17,12 @@ importers:
       '@devvm/dsh-build-loop':
         specifier: file:../../plugins/build-loop
         version: file:../../plugins/build-loop(@deepseek-ai/schemastery@3.18.4)
+      '@devvm/dsh-model-fallback':
+        specifier: file:../../plugins/model-fallback
+        version: file:../../plugins/model-fallback(@deepseek-ai/schemastery@3.18.4)
+      '@devvm/dsh-project-app':
+        specifier: file:../../plugins/project-app
+        version: file:../../plugins/project-app
       '@devvm/dsh-remote-sync':
         specifier: file:../../plugins/remote-sync
         version: file:../../plugins/remote-sync
@@ -149,6 +155,22 @@ packages:
       '@deepseek-ai/dsh-token-meter': 0.2.0-rc.2
       '@deepseek-ai/dsh-tools': 0.2.0-rc.2
       '@deepseek-ai/schemastery': ~3.18.4
+
+  '@devvm/dsh-model-fallback@file:../../plugins/model-fallback':
+    resolution: {directory: ../../plugins/model-fallback, type: directory}
+    peerDependencies:
+      '@deepseek-ai/cordis': ~4.0.4
+      '@deepseek-ai/dsh': 0.2.0-rc.2
+      '@deepseek-ai/dsh-agent': 0.2.0-rc.2
+      '@deepseek-ai/dsh-host-webserver': 0.2.0-rc.2
+      '@deepseek-ai/dsh-llm': 0.2.0-rc.2
+      '@deepseek-ai/dsh-settings': 0.2.0-rc.2
+      '@deepseek-ai/schemastery': ~3.18.4
+
+  '@devvm/dsh-project-app@file:../../plugins/project-app':
+    resolution: {directory: ../../plugins/project-app, type: directory}
+    peerDependencies:
+      '@deepseek-ai/dsh': 0.2.0-rc.2
 
   '@devvm/dsh-remote-sync@file:../../plugins/remote-sync':
     resolution: {directory: ../../plugins/remote-sync, type: directory}
@@ -1292,6 +1314,12 @@ snapshots:
   '@devvm/dsh-build-loop@file:../../plugins/build-loop(@deepseek-ai/schemastery@3.18.4)':
     dependencies:
       '@deepseek-ai/schemastery': 3.18.4
+
+  '@devvm/dsh-model-fallback@file:../../plugins/model-fallback(@deepseek-ai/schemastery@3.18.4)':
+    dependencies:
+      '@deepseek-ai/schemastery': 3.18.4
+
+  '@devvm/dsh-project-app@file:../../plugins/project-app': {}
 
   '@devvm/dsh-remote-sync@file:../../plugins/remote-sync': {}
 

@@ -58,6 +58,17 @@ pub struct ProjectLinks {
     pub port_url_template: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectMemory {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_bytes: Option<u64>,
+    pub formatted: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectView {
     pub id: Uuid,
@@ -68,7 +79,12 @@ pub struct ProjectView {
     pub dsh_status: DshStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_status: Option<SyncStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<ProjectMemory>,
     pub links: ProjectLinks,
+    pub daemon_instance_id: Uuid,
+    pub operation: Option<crate::lifecycle::OperationView>,
+    pub last_operation: Option<crate::lifecycle::OperationView>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -193,9 +209,82 @@ pub fn compute_project_host(project_path: &Path) -> String {
     }
 }
 
+pub fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+
+    if bytes >= GIB {
+        let val = (bytes as f64 / GIB as f64 * 10.0).round() / 10.0;
+        if val.fract() == 0.0 {
+            format!("{val:.0} GiB")
+        } else {
+            format!("{val:.1} GiB")
+        }
+    } else if bytes >= MIB {
+        let val = (bytes as f64 / MIB as f64 * 10.0).round() / 10.0;
+        if val.fract() == 0.0 {
+            format!("{val:.0} MiB")
+        } else {
+            format!("{val:.1} MiB")
+        }
+    } else if bytes >= KIB {
+        let val = (bytes as f64 / KIB as f64 * 10.0).round() / 10.0;
+        if val.fract() == 0.0 {
+            format!("{val:.0} KiB")
+        } else {
+            format!("{val:.1} KiB")
+        }
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+pub fn format_memory_display(
+    host_bytes: Option<u64>,
+    guest_bytes: Option<u64>,
+    limit_bytes: Option<u64>,
+) -> String {
+    let host_str = host_bytes.map(format_bytes).unwrap_or_else(|| "—".to_string());
+    let limit_str = limit_bytes.map(format_bytes).unwrap_or_else(|| "—".to_string());
+    match guest_bytes {
+        Some(gb) => format!("{host_str} ({}) / {limit_str}", format_bytes(gb)),
+        None => format!("{host_str} / {limit_str}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_bytes() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(1024), "1 KiB");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+        assert_eq!(format_bytes(1048576), "1 MiB");
+        assert_eq!(format_bytes(524288000), "500 MiB");
+        assert_eq!(format_bytes(1073741824), "1 GiB");
+        assert_eq!(format_bytes(1610612736), "1.5 GiB");
+        assert_eq!(format_bytes(8589934592), "8 GiB");
+    }
+
+    #[test]
+    fn test_format_memory_display() {
+        assert_eq!(
+            format_memory_display(Some(1610612736), Some(1073741824), Some(8589934592)),
+            "1.5 GiB (1 GiB) / 8 GiB"
+        );
+        assert_eq!(
+            format_memory_display(Some(1610612736), None, Some(8589934592)),
+            "1.5 GiB / 8 GiB"
+        );
+        assert_eq!(
+            format_memory_display(None, Some(1073741824), Some(8589934592)),
+            "— (1 GiB) / 8 GiB"
+        );
+    }
 
     #[test]
     fn test_compute_project_host() {
@@ -217,4 +306,11 @@ mod tests {
             compute_project_host(&PathBuf::from(format!("/other/{}", long_name)))
         );
     }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitOperationRequest {
+    pub action: crate::runtime::LifecycleAction,
+    pub request_id: Uuid,
 }

@@ -1,4 +1,32 @@
-pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
+pub const INDEX_HTML: &str = include_str!("web/index.html");
+pub const APP_CSS: &str = include_str!("web/app.css");
+pub const APP_JS: &str = include_str!("web/app.js");
+pub const TEXT_STORE_JS: &str = include_str!("web/text-store.js");
+pub const SERVICE_WORKER: &str = include_str!("web/service-worker.js");
+pub const MANIFEST: &str = include_str!("web/manifest.webmanifest");
+pub const ICON: &str = include_str!("web/icon.svg");
+
+/// Version the offline shell as one set, changing whenever any shell asset changes.
+pub fn service_worker() -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for asset in [
+        INDEX_HTML,
+        APP_CSS,
+        APP_JS,
+        TEXT_STORE_JS,
+        SERVICE_WORKER,
+        MANIFEST,
+        ICON,
+    ] {
+        hash.update(asset.as_bytes());
+    }
+    hash.update(include_bytes!("web/icon-192.png"));
+    hash.update(include_bytes!("web/icon-512.png"));
+    SERVICE_WORKER.replace("__ASSET_VERSION__", &format!("{:x}", hash.finalize()))
+}
+
+pub const MANAGEMENT_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -196,6 +224,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         .badge-sync-synchronizing { background-color: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
         .badge-sync-degraded,
         .badge-sync-remote_ahead { background-color: #fffbeb; color: #b45309; border-color: #fde68a; }
+        .badge-memory { background-color: #f8fafc; color: #475569; border-color: #cbd5e1; font-variant-numeric: tabular-nums; }
 
         .spinner {
             width: 11px;
@@ -738,6 +767,9 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
             const syncBadge = syncStatus
                 ? `<span class="badge badge-sync-${syncStatus}">${syncSpinner}Sync: ${syncLabel}</span>`
                 : '';
+            const memoryBadge = (project.vm_status === 'running' && project.memory && project.memory.formatted)
+                ? `<span class="badge badge-memory" title="Host footprint (guest in-use) / RAM limit">Memory: ${project.memory.formatted}</span>`
+                : '';
 
             const localDshUrl = project.links && (project.links.local_dsh_url || project.links.dsh_url);
             const tailnetDshUrl = project.links && project.links.tailnet_dsh_url;
@@ -767,7 +799,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
             card.querySelector('[data-project-title]').textContent = project.name;
             card.querySelector('[data-project-path]').textContent = `Path: ${project.path}`;
             card.querySelector('[data-project-identity]').textContent = `ID: ${project.id} • Host: ${project.project_host}`;
-            card.querySelector('[data-project-badges]').innerHTML = `${vmBadge}${dshBadge}${syncBadge}`;
+            card.querySelector('[data-project-badges]').innerHTML = `${vmBadge}${dshBadge}${syncBadge}${memoryBadge}`;
             card.querySelector('[data-project-dynamic-actions]').innerHTML = `${localDshLink}${tailnetDshLink}${dshActionBtn}${dshRestartBtn}${vmActionBtn}`;
         }
 
@@ -1160,7 +1192,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
         // Initial load and periodic polling
         fetchProjects();
-        setInterval(fetchProjects, 5000);
+        setInterval(fetchProjects, 500);
     </script>
 </body>
 </html>

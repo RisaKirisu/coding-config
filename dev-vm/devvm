@@ -223,6 +223,54 @@ case "${1:-shell}" in
         '
         ;;
 
+    memory)
+        if ! running; then
+            exit 1
+        fi
+        machine_info="$(smolvm machine ls --json 2>/dev/null | jq -c --arg name "$NAME" '.[] | select(.name == $name)' 2>/dev/null || true)"
+        if [[ -z "$machine_info" ]]; then
+            exit 1
+        fi
+        limit_mib="$(printf '%s' "$machine_info" | jq -r '.memory_mib // empty')"
+        pid="$(printf '%s' "$machine_info" | jq -r '.pid // empty')"
+
+        host_bytes=""
+        if [[ -n "$pid" && -d "/proc/$pid" ]]; then
+            pages="$(awk '{print $2}' "/proc/$pid/statm" 2>/dev/null || true)"
+            if [[ -n "$pages" ]]; then
+                page_size="$(getconf PAGESIZE 2>/dev/null || echo 4096)"
+                host_bytes=$(( pages * page_size ))
+            fi
+        fi
+        if [[ -z "$host_bytes" && -n "$pid" ]]; then
+            rss_kb="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+            if [[ -n "$rss_kb" && "$rss_kb" =~ ^[0-9]+$ ]]; then
+                host_bytes=$(( rss_kb * 1024 ))
+            fi
+        fi
+
+        guest_bytes=""
+        meminfo="$(smolvm machine exec --name "$NAME" -- /bin/sh -c 'cat /proc/meminfo' 2>/dev/null || true)"
+        if [[ -n "$meminfo" ]]; then
+            total_kb="$(printf '%s\n' "$meminfo" | awk '/^MemTotal:/ {print $2}')"
+            avail_kb="$(printf '%s\n' "$meminfo" | awk '/^MemAvailable:/ {print $2}')"
+            if [[ -n "$total_kb" && -n "$avail_kb" ]]; then
+                used_kb=$(( total_kb - avail_kb ))
+                if (( used_kb >= 0 )); then
+                    guest_bytes=$(( used_kb * 1024 ))
+                fi
+            fi
+        fi
+
+        limit_bytes=""
+        if [[ -n "$limit_mib" && "$limit_mib" =~ ^[0-9]+$ ]]; then
+            limit_bytes=$(( limit_mib * 1048576 ))
+        fi
+
+        printf '{"host_bytes":%s,"guest_bytes":%s,"limit_bytes":%s}\n' \
+            "${host_bytes:-null}" "${guest_bytes:-null}" "${limit_bytes:-null}"
+        ;;
+
     rm|delete)
         smolvm machine stop --name "$NAME" 2>/dev/null || true
         smolvm machine delete --name "$NAME" -f
@@ -233,7 +281,7 @@ case "${1:-shell}" in
         ;;
 
     *)
-        echo "Usage: devvm {start|shell|exec|stop|status|rm|name}"
+        echo "Usage: devvm {start|shell|exec|stop|status|memory|rm|name}"
         exit 1
         ;;
 esac

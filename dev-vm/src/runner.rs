@@ -169,3 +169,52 @@ pub async fn run_vm_delete(
 ) -> Result<(), String> {
     run_devvm_command(config, project_id, project_path, "rm", cancel).await
 }
+
+#[derive(serde::Deserialize)]
+struct RawMemoryOutput {
+    #[serde(default)]
+    host_bytes: Option<u64>,
+    #[serde(default)]
+    guest_bytes: Option<u64>,
+    #[serde(default)]
+    limit_bytes: Option<u64>,
+}
+
+pub async fn check_vm_memory(
+    config: &DaemonConfig,
+    project_path: &Path,
+) -> Option<crate::models::ProjectMemory> {
+    check_vm_memory_with_cancel(config, project_path, &CancellationToken::new()).await
+}
+
+pub(crate) async fn check_vm_memory_with_cancel(
+    config: &DaemonConfig,
+    project_path: &Path,
+    cancel: &CancellationToken,
+) -> Option<crate::models::ProjectMemory> {
+    let mut cmd = Command::new(&config.devvm_bin);
+    cmd.arg("memory")
+        .current_dir(project_path)
+        .stdin(Stdio::null());
+
+    let output = command_output(cmd, cancel).await.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let raw: RawMemoryOutput = serde_json::from_str(stdout.trim()).ok()?;
+    if raw.host_bytes.is_none() && raw.guest_bytes.is_none() && raw.limit_bytes.is_none() {
+        return None;
+    }
+    let formatted = crate::models::format_memory_display(
+        raw.host_bytes,
+        raw.guest_bytes,
+        raw.limit_bytes,
+    );
+    Some(crate::models::ProjectMemory {
+        host_bytes: raw.host_bytes,
+        guest_bytes: raw.guest_bytes,
+        limit_bytes: raw.limit_bytes,
+        formatted,
+    })
+}

@@ -1,0 +1,5 @@
+# @devvm/dsh-model-fallback bundle patch: model fallback rolling plus its Web settings page.
+# The declared id is what the settings page writes its persisted configuration to.
+- insert:
+    - id: model-fallback
+      name: '@devvm/dsh-model-fallback'

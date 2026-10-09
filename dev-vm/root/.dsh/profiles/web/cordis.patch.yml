@@ -193,6 +193,7 @@
               chatTemplateArgs: {}
           - id: gpt-6.1-sol
             name: gpt-6.1-sol
+            contextWindow: 500000
             input:
               - text
               - image
@@ -206,7 +207,6 @@
             compat:
               chatTemplateKwargs: {}
               chatTemplateArgs: {}
-            contextWindow: 400000
           - id: gpt-6-luna
             name: gpt-6-luna
             input:
@@ -277,42 +277,25 @@
         maxRequestImageBytes: 20971520
         requestImagePixelBudget: 4194304
         requestImageMaxBytes: 1048576
-      krill-claude:
-        displayName: Krill
+      krill-claude-kiro:
+        displayName: Krill Claude Kiro
         apiKeyEnv: KRILL_CLAUDE_API_KEY
-        api: anthropic-messages
-        baseURL: https://api.krill-ai.net
+        api: openai-responses
+        baseURL: https://api.krill-code.net/v1
         models:
-          - id: claude-fable-5
-            contextWindow: 300000
-            maxTokens: 64000
+          - id: claude-opus-5-5
+            name: claude-opus-5-5 · Krill Kiro
+            contextWindow: 1000000
+            maxTokens: 128000
             input:
               - text
               - image
             reasoningEfforts:
               off: null
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
+              minimal: null
             compat:
               chatTemplateKwargs: {}
               chatTemplateArgs: {}
-        modelOverrides: {}
-        compat:
-          chatTemplateKwargs: {}
-          chatTemplateArgs: {}
-        defaultContextWindow: 262144
-        defaultMaxTokens: 32768
-        defaultInput:
-          - text
-        headers: {}
-        thinkingBudgets: {}
-        streamIdleTimeoutMs: 300000
-        maxRequestImageBytes: 20971520
-        requestImagePixelBudget: 4194304
-        requestImageMaxBytes: 1048576
 - id: llm-deepseek
   config:
     models:
@@ -340,8 +323,8 @@
         imageMaxBytes: 1048576
 - id: agent-default-model
   config:
-    provider: krill-codex
-    model: gpt-6.1-sol
+    provider: deepseek-official
+    model: deepseek-flash
     reasoningEffort: high
 - id: ui-settings-general
   config:
@@ -409,9 +392,16 @@
             process.env.MCP_636F6E7465787437_TOKEN; if (!token) throw new
             Error('Missing MCP authentication environment variable
             MCP_636F6E7465787437_TOKEN'); return 'Bearer ' + token; })()
+- id: model-fallback
+  name: "@devvm/dsh-model-fallback"
+  config:
+    fallbacks:
+      - provider: krill-codex
+        model: gpt-6.1-sol
+        reasoningEffort: high
+    retriableErrors:
+      - code: PI_AI_ERROR
+        messageContains: stream disconnected before completion
+        treatAs: TRANSPORT
 
 # <<< dsh-skill-mcp-panel:mcp:end
-
-- insert:
-    - id: stream-disconnect-retry
-      name: /root/.dsh/plugins/stream-disconnect-retry/index.mjs

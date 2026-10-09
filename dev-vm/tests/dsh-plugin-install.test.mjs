@@ -8,7 +8,7 @@ import { basename, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const sourceProfile = fileURLToPath(new URL('../root/.dsh/profiles/web/', import.meta.url))
-const cli = realpathSync(execFileSync('which', ['dsh'], { encoding: 'utf8' }).trim())
+const cli = realpathSync(process.env.DEVVM_DSH_CLI || execFileSync('which', ['dsh'], { encoding: 'utf8' }).trim())
 const require = createRequire(cli)
 const anchor = require.resolve('@deepseek-ai/dsh/package.json')
 const { loadProfileDirectory, generateConfigSchema } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-app-boot')))
@@ -23,14 +23,14 @@ test('one native profile install supplies custom plugins and their dependencies 
   }
   const manifest = JSON.parse(readFileSync(join(profileDir, 'package.json'), 'utf8'))
   const packages = Object.entries(manifest.dependencies).filter(([, spec]) => spec.startsWith('file:'))
-  assert.equal(packages.length, 7)
+  assert.equal(packages.length, 8)
   for (const [, spec] of packages) {
     cpSync(resolve(sourceProfile, spec.slice(5)), resolve(profileDir, spec.slice(5)), {
       recursive: true,
       filter: path => basename(path) !== 'node_modules',
     })
   }
-  execFileSync('dsh', ['plugin', '--profile', 'web', 'install', '--frozen-lockfile'], {
+  execFileSync(process.execPath, [cli, 'plugin', '--profile', 'web', 'install', '--frozen-lockfile'], {
     env: { ...process.env, CI: 'true', DSH_HOME: home },
     stdio: 'inherit',
   })
@@ -53,7 +53,7 @@ test('one native profile install supplies custom plugins and their dependencies 
   const names = new Set(packages.map(([name]) => name))
   const entries = profile.layers.filter(layer => names.has(layer.packageName)).flatMap(layer =>
     layer.patches.flatMap(patch => patch.insert ?? []).filter(entry => entry.name === layer.packageName))
-  assert.equal(entries.length, 6)
+  assert.equal(entries.length, 7)
   const schema = await generateConfigSchema(profile, [[{ insert: entries }]], anchor)
   assert.equal(schema['x-cordis'].complete, true, JSON.stringify(schema['x-cordis'].diagnostics))
   assert.deepEqual(schema['x-cordis'].entries.map(entry => entry.name), entries.map(entry => entry.name))

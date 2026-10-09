@@ -20,6 +20,8 @@ node_modules/
 root/.dsh/sessions/
 root/.dsh/storages/
 root/.dsh/plugins/subscriptions/
+**/.plugin-manager/logs/
+root/.dsh/.sync-status.json
 root/.dsh/.anonymous-user-id
 root/.dsh/attachments
 **/thinking-effort-loaded.json
@@ -31,6 +33,8 @@ root/.logs/
 
 # Agent exploration
 .agents/exploration/
+.agents/project-app-browser*/
+.agents/tmp/
 
 # MISC
 .DS_Store

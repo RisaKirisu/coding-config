@@ -1,14 +1,16 @@
-//! Request-owned lifecycle operations. Cancellation is signalled, not implemented by
-//! dropping command futures: ownership is released only after command cleanup finishes.
+//! Lifecycle coordination shared by request-owned and daemon-owned commands.
+//! Ownership is released only after cancelled commands have been reaped.
 use crate::{config::DaemonConfig, logs::append_log_logged};
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::Future,
     io,
     process::{Output, Stdio},
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::process::Command;
+use tokio::{process::Command, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -29,13 +31,66 @@ impl std::fmt::Display for LifecycleError {
     }
 }
 
-#[derive(Default, Clone)]
-pub struct Operations(Arc<Mutex<HashMap<Uuid, Arc<Operation>>>>);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationState {
+    Accepted,
+    WaitingForCleanup,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OperationView {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub request_id: Option<Uuid>,
+    pub action: String,
+    pub state: OperationState,
+    pub accepted_at: u64,
+    pub finished_at: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OperationSnapshot {
+    pub daemon_instance_id: Uuid,
+    pub active: Option<OperationView>,
+    pub recent: Vec<OperationView>,
+}
+
+struct OperationRegistry {
+    instance: Uuid,
+    active: HashMap<Uuid, Arc<Operation>>,
+    recent: HashMap<Uuid, VecDeque<OperationView>>,
+}
+
+#[derive(Clone)]
+pub struct Operations(Arc<Mutex<OperationRegistry>>);
+
+impl Default for Operations {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(OperationRegistry {
+            instance: Uuid::new_v4(),
+            active: HashMap::new(),
+            recent: HashMap::new(),
+        })))
+    }
+}
 
 struct Operation {
     stopping: bool,
     cancel: CancellationToken,
     done: CancellationToken,
+    view: Mutex<OperationView>,
+}
+
+struct StartedOperation {
+    operation: Arc<Operation>,
+    task: JoinHandle<Result<(), LifecycleError>>,
+    receipt: OperationView,
 }
 
 struct OperationGuard {
@@ -46,20 +101,36 @@ struct OperationGuard {
 
 impl Drop for OperationGuard {
     fn drop(&mut self) {
-        let mut operations = self.operations.0.lock().unwrap();
-        if operations
+        let mut registry = self.operations.0.lock().unwrap();
+        if registry
+            .active
             .get(&self.project)
             .is_some_and(|entry| Arc::ptr_eq(entry, &self.operation))
         {
-            operations.remove(&self.project);
+            registry.active.remove(&self.project);
         }
         self.operation.done.cancel();
     }
 }
 
 impl Operations {
-    /// A stop reserves the next slot before cancelling an active start, so no third
-    /// request can launch between cancellation and stop. Other conflicts are rejected.
+    pub fn snapshot(&self, project: Uuid) -> OperationSnapshot {
+        let registry = self.0.lock().unwrap();
+        OperationSnapshot {
+            daemon_instance_id: registry.instance,
+            active: registry
+                .active
+                .get(&project)
+                .map(|operation| operation.view.lock().unwrap().clone()),
+            recent: registry
+                .recent
+                .get(&project)
+                .map(|records| records.iter().cloned().collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Request-owned calls preserve cancellation when the awaiting handler drops.
     pub async fn run<F, Fut>(
         &self,
         config: &DaemonConfig,
@@ -72,43 +143,127 @@ impl Operations {
         F: FnOnce(CancellationToken) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
-        let operation = Arc::new(Operation {
+        let started = self.start(config, project, stopping, label, None, false, work)?;
+        let request_guard = started.operation.cancel.clone().drop_guard();
+        let result = started
+            .task
+            .await
+            .map_err(|error| LifecycleError::Failed(format!("Lifecycle task failed: {error}")))?;
+        request_guard.disarm();
+        result
+    }
+
+    /// Reserve and start the same coordinated work without binding it to a request.
+    pub fn submit<F, Fut>(
+        &self,
+        config: &DaemonConfig,
+        project: Uuid,
+        stopping: bool,
+        label: &'static str,
+        request_id: Uuid,
+        work: F,
+    ) -> Result<OperationView, LifecycleError>
+    where
+        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let started = self.start(
+            config,
+            project,
             stopping,
-            cancel: CancellationToken::new(),
-            done: CancellationToken::new(),
-        });
-        let previous = {
-            let mut operations = self.0.lock().unwrap();
-            if let Some(previous) = operations.get(&project) {
-                if !stopping || previous.stopping {
+            label,
+            Some(request_id),
+            true,
+            work,
+        )?;
+        Ok(started.receipt)
+    }
+
+    /// A stop reserves its successor before cancelling active work; every caller
+    /// shares this map and waits for the predecessor's complete process cleanup.
+    fn start<F, Fut>(
+        &self,
+        config: &DaemonConfig,
+        project: Uuid,
+        stopping: bool,
+        label: &'static str,
+        request_id: Option<Uuid>,
+        detached: bool,
+        work: F,
+    ) -> Result<StartedOperation, LifecycleError>
+    where
+        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let (operation, previous, receipt) = {
+            let mut registry = self.0.lock().unwrap();
+            let previous = registry.active.get(&project).cloned();
+            if let Some(active) = &previous {
+                if !stopping || active.stopping {
                     return Err(LifecycleError::Busy);
                 }
             }
-            operations.insert(project, operation.clone())
+            if let Some(request_id) = request_id {
+                let is_duplicate = previous.as_ref().is_some_and(|active| {
+                    active.view.lock().unwrap().request_id == Some(request_id)
+                }) || registry.recent.get(&project).is_some_and(|records| {
+                    records
+                        .iter()
+                        .any(|record| record.request_id == Some(request_id))
+                });
+                if is_duplicate {
+                    return Err(LifecycleError::Busy);
+                }
+            }
+            let receipt = OperationView {
+                id: Uuid::new_v4(),
+                project_id: project,
+                request_id,
+                action: label.to_owned(),
+                state: if previous.is_some() {
+                    OperationState::WaitingForCleanup
+                } else {
+                    OperationState::Accepted
+                },
+                accepted_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+                finished_at: None,
+                error: None,
+            };
+            let operation = Arc::new(Operation {
+                stopping,
+                cancel: CancellationToken::new(),
+                done: CancellationToken::new(),
+                view: Mutex::new(receipt.clone()),
+            });
+            registry.active.insert(project, operation.clone());
+            (operation, previous, receipt)
         };
         let guard = OperationGuard {
             operations: self.clone(),
             project,
             operation: operation.clone(),
         };
-        let request_guard = operation.cancel.clone().drop_guard();
+        let running = operation.clone();
         let log_dir = config.log_dir.clone();
-        // This task is never aborted on HTTP disconnect. It owns cleanup until the
-        // command is reaped, while the request's drop guard signals cancellation.
+        let registry = self.clone();
         let task = tokio::spawn(async move {
             let _guard = guard;
             if let Some(previous) = previous {
                 previous.cancel.cancel();
                 previous.done.cancelled().await;
             }
-            let result = if operation.cancel.is_cancelled() {
+            let result = if running.cancel.is_cancelled() {
                 Err(LifecycleError::Cancelled)
             } else {
-                work(operation.cancel.clone())
+                running.view.lock().unwrap().state = OperationState::Running;
+                work(running.cancel.clone())
                     .await
                     .map_err(LifecycleError::Failed)
             };
-            if operation.cancel.is_cancelled() {
+            let result = if running.cancel.is_cancelled() {
                 append_log_logged(
                     &log_dir,
                     project,
@@ -118,13 +273,40 @@ impl Operations {
                 Err(LifecycleError::Cancelled)
             } else {
                 result
+            };
+            let finished = {
+                let mut view = running.view.lock().unwrap();
+                view.state = match &result {
+                    Ok(()) => OperationState::Succeeded,
+                    Err(LifecycleError::Cancelled) => OperationState::Cancelled,
+                    Err(_) => OperationState::Failed,
+                };
+                view.finished_at = Some(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64,
+                );
+                view.error = result.as_ref().err().map(ToString::to_string);
+                view.clone()
+            };
+            if detached {
+                if let Err(LifecycleError::Failed(error)) = &result {
+                    tracing::error!(project = %project, operation = %finished.id, "{error}");
+                    append_log_logged(&log_dir, project, "daemon:error", error);
+                }
             }
+            let mut state = registry.0.lock().unwrap();
+            let recent = state.recent.entry(project).or_default();
+            recent.push_front(finished);
+            recent.truncate(16);
+            result
         });
-        let result = task
-            .await
-            .map_err(|error| LifecycleError::Failed(format!("Lifecycle task failed: {error}")))?;
-        request_guard.disarm();
-        result
+        Ok(StartedOperation {
+            operation,
+            task,
+            receipt,
+        })
     }
 }
 

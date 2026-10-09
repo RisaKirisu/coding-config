@@ -1,0 +1,8419 @@
+//! smolvm guest agent.
+//!
+//! This agent runs inside smolvm VMs and handles:
+//! - OCI image pulling via crane
+//! - Layer extraction and storage management
+//! - Overlay filesystem preparation for workloads
+//! - Command execution with optional interactive/TTY support
+//!
+//! Communication is via vsock on port 6000.
+
+use smolvm_protocol::{
+    error_codes, guest_env, ports, AgentRequest, AgentResponse, Envelope, FsNotifyEvent,
+    RegistryAuth, AGENT_READY_MARKER, LAYER_CHUNK_SIZE, PROTOCOL_VERSION,
+};
+use std::io::{Read, Write};
+use std::os::unix::io::AsRawFd;
+use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
+use tracing::{debug, error, info, warn};
+
+mod crun;
+mod shutdown;
+mod shutdown_freeze;
+
+/// Ensures storage disk is mounted exactly once. The mount happens either during
+/// deferred init (the common case) or on the first request that needs storage
+/// (if a request arrives before deferred init reaches the mount step).
+/// This eliminates the race between early ready signaling and storage access.
+static STORAGE_MOUNTED: OnceLock<bool> = OnceLock::new();
+
+fn ensure_storage_mounted() -> bool {
+    *STORAGE_MOUNTED.get_or_init(|| {
+        let t0 = uptime_ms();
+        let ok = mount_storage_disk();
+        // Log after tracing may or may not be initialized — use boot_log for safety.
+        if ok {
+            boot_log(
+                "INFO",
+                &format!("storage disk mounted (duration_ms={})", uptime_ms() - t0),
+            );
+            // Before anything reads /workspace: a pack made with
+            // --include-workspace seeds it onto this (fresh) storage disk.
+            storage::seed_workspace_from_pack();
+        } else {
+            boot_log(
+                "ERROR",
+                "storage disk NOT mounted — image pulls and container overlays will fail",
+            );
+        }
+        ok
+    })
+}
+
+/// Format a structured JSON log line for early boot (before tracing is up).
+fn format_boot_log(level: &str, msg: &str) -> String {
+    let escaped = serde_json::to_string(msg).unwrap_or_else(|_| format!("\"{}\"", msg));
+    format!(
+        r#"{{"level":"{}","message":{},"target":"smolvm_agent::boot"}}"#,
+        level, escaped
+    )
+}
+
+/// Write a structured JSON log line to stderr during early boot,
+/// before tracing_subscriber is initialized. This keeps
+/// agent-console.log as valid JSON throughout.
+/// Also mirrors to /dev/kmsg so messages appear in `dmesg` inside the VM.
+///
+/// These timing lines (`boot agent_entry`, `mounts_done`, `rootfs_done`, etc.)
+/// are intentionally permanent support logs — they are not gated on RUST_LOG
+/// because they run before the tracing subscriber exists. Output goes only to
+/// `agent-console.log` (readable via `~/Library/Caches/smolvm/vms/<id>/`) and
+/// the in-VM kernel ring buffer, neither of which is visible to end users in
+/// normal operation.
+fn boot_log(level: &str, msg: &str) {
+    let line = format_boot_log(level, msg);
+    eprintln!("{}", line);
+    // Mirror to /dev/kmsg so dmesg captures early-boot messages even when
+    // the console-log pipe isn't receiving eprintln! output.
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+            let _ = writeln!(f, "smolvm-agent: {}", line);
+        }
+    }
+}
+mod branchpoint;
+mod credentials;
+mod cuda;
+mod dirwatch;
+mod disk_trim;
+mod dns_proxy;
+mod docker_bridge;
+mod forkpoint;
+mod network;
+mod nsfile;
+mod oci;
+mod paths;
+mod pod;
+mod process;
+#[cfg(target_os = "linux")]
+mod pty;
+mod publish_socket;
+mod retry;
+mod rosetta;
+mod s3mount;
+mod ssh_agent;
+mod storage;
+#[cfg(target_os = "linux")]
+mod timesync;
+mod vsock;
+mod vulkan;
+
+// ============================================================================
+// Configuration Constants
+// ============================================================================
+
+/// Initial buffer size for reading requests from the vsock socket.
+const REQUEST_BUFFER_SIZE: usize = 64 * 1024; // 64KB
+
+/// Maximum allowed message size to prevent DoS via memory exhaustion.
+const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16MB
+
+/// Buffer size for streaming stdout/stderr in interactive mode.
+const IO_BUFFER_SIZE: usize = 4096;
+
+/// Default poll timeout in milliseconds for interactive I/O loop.
+const INTERACTIVE_POLL_TIMEOUT_MS: i32 = 100;
+
+/// Timeout for network connectivity test operations.
+/// Used in diagnostics/troubleshooting functions.
+const NETWORK_TEST_TIMEOUT_SECS: u64 = 10;
+
+/// Poll interval for checking process completion in VM exec.
+const PROCESS_POLL_INTERVAL_MS: u64 = 10;
+
+/// Match mainstream container runtimes and leave enough descriptor headroom
+/// for package managers, browsers, language servers, and concurrent tools.
+pub(crate) const DEFAULT_NOFILE_LIMIT: u64 = 1_048_576;
+
+#[cfg(target_os = "linux")]
+fn raise_nofile_limit() {
+    let desired = libc::rlimit {
+        rlim_cur: DEFAULT_NOFILE_LIMIT as libc::rlim_t,
+        rlim_max: DEFAULT_NOFILE_LIMIT as libc::rlim_t,
+    };
+    // SAFETY: `desired` is initialized and setrlimit copies it synchronously.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &desired) } == 0 {
+        return;
+    }
+
+    // Some kernels cap the hard limit below the conventional 1M default. Use
+    // every descriptor the guest was granted instead of leaving the legacy
+    // soft limit at 1,024.
+    let mut available = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `available` points to writable storage for one rlimit value.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut available) } == 0 {
+        available.rlim_cur = available.rlim_max;
+        // SAFETY: `available` came from getrlimit and only its soft limit was
+        // raised to the already-authorized hard limit.
+        let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &available) };
+    }
+}
+
+/// Get system uptime in milliseconds (for timing relative to boot).
+fn uptime_ms() -> u64 {
+    if let Ok(contents) = std::fs::read_to_string("/proc/uptime") {
+        if let Some(uptime_str) = contents.split_whitespace().next() {
+            if let Ok(uptime_secs) = uptime_str.parse::<f64>() {
+                return (uptime_secs * 1000.0) as u64;
+            }
+        }
+    }
+    0
+}
+
+/// Get uptime via CLOCK_BOOTTIME syscall — works before /proc is mounted.
+#[cfg(target_os = "linux")]
+fn boottime_ms() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts);
+    }
+    (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
+}
+
+/// Decide what to write to `/etc/resolv.conf` on the TSI (no-virtio) path, or
+/// `None` to leave the existing file untouched.
+///
+/// The host delivers a `--dns` override through one of two mechanisms depending
+/// on the boot path: it either forwards it as `guest_env::DNS`, or it writes the
+/// nameserver straight into the rootfs's resolv.conf before boot (the libkrun
+/// backend's `setup_dns`). This one function honors both: an explicit override
+/// wins, and otherwise we only repair a stale loopback/empty resolv.conf (left
+/// by a prior `--allow-host` run that pointed at the local DNS proxy) — we never
+/// clobber a valid nameserver the host already wrote. The old code wrote the
+/// hardcoded public resolvers unconditionally, which both dropped `--dns` and
+/// overwrote `setup_dns`'s value, so `--dns` never took effect on TSI.
+fn tsi_resolv_conf(dns_override: Option<&str>, current: &str) -> Option<String> {
+    match dns_override.map(str::trim) {
+        Some(dns) if !dns.is_empty() => Some(format!("nameserver {dns}\n")),
+        _ if current.contains("127.0.0.1") || current.trim().is_empty() => {
+            Some("nameserver 1.1.1.1\nnameserver 8.8.8.8\n".to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Seed the guest wall clock from `SMOLVM_HOST_TIME_NS` (the host's launch time),
+/// but only when the guest clock is obviously wrong (before 2020). Hypervisors
+/// without a guest-readable paravirt clock (WHP on Windows) boot the guest at
+/// ~1999, breaking all TLS cert validation; this fixes that without fighting an
+/// already-correct kvmclock (KVM) or HVF-seeded clock (macOS).
+#[cfg(target_os = "linux")]
+fn maybe_set_clock_from_host() {
+    const Y2020_SECS: i64 = 1_577_836_800;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if now_secs >= Y2020_SECS {
+        return;
+    }
+    let Ok(ns_str) = std::env::var(smolvm_protocol::guest_env::HOST_TIME_NS) else {
+        return;
+    };
+    let Ok(ns) = ns_str.parse::<u128>() else {
+        return;
+    };
+    let ts = libc::timespec {
+        tv_sec: (ns / 1_000_000_000) as libc::time_t,
+        tv_nsec: (ns % 1_000_000_000) as libc::c_long,
+    };
+    // SAFETY: ts is a valid timespec; the agent runs as PID-1 with CAP_SYS_TIME.
+    let _ = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
+}
+
+fn main() {
+    if process::container_init_requested() {
+        std::process::exit(process::run_container_init());
+    }
+    if forkpoint::worker_ready_helper_requested() {
+        std::process::exit(forkpoint::run_worker_ready_helper());
+    }
+    if forkpoint::helper_requested() {
+        std::process::exit(forkpoint::run_helper());
+    }
+
+    // Namespace file helper. Dispatched here, before the async runtime starts,
+    // because `setns(CLONE_NEWMNT)` is refused for a multithreaded process.
+    if nsfile::helper_requested() {
+        std::process::exit(nsfile::run_helper());
+    }
+
+    // S3 volume mount helper. Same reason as above: it enters the workload
+    // container's mount namespace, and then stays alive serving the FUSE
+    // session for the life of the mount.
+    if s3mount::helper_requested() {
+        std::process::exit(s3mount::run_helper());
+    }
+
+    // Quick --version check (used by init script to detect rootfs updates)
+    if std::env::args().any(|a| a == "--version") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+
+    // Earliest possible timing point — CLOCK_BOOTTIME works before /proc exists.
+    #[cfg(target_os = "linux")]
+    boot_log(
+        "INFO",
+        &format!("boot agent_entry uptime_ms={}", boottime_ms()),
+    );
+
+    // crun exec inherits the agent's descriptor ceiling rather than the
+    // original OCI process limit, so raise PID 1 before launching workloads.
+    #[cfg(target_os = "linux")]
+    raise_nofile_limit();
+
+    // Seed the guest wall clock from the host's launch time when the hypervisor
+    // gives the guest no readable paravirt clock and it boots at ~1999 (WHP on
+    // Windows); without this every TLS handshake fails ("cert not yet valid").
+    // No-op when the clock already looks sane (kvmclock on KVM, HVF on macOS).
+    #[cfg(target_os = "linux")]
+    maybe_set_clock_from_host();
+
+    // Keep the guest clock synced with the host for the machine's whole life:
+    // libkrun's host-side TimesyncThread pushes the host time over a vsock DGRAM
+    // at boot, every 60s, and — critically — right after the host resumes from
+    // sleep (when the frozen VM's clock has fallen behind). Boot-only seeding
+    // above doesn't cover that; without this the guest drifts behind after macOS
+    // sleep until TLS breaks (issue #521).
+    #[cfg(target_os = "linux")]
+    timesync::spawn();
+
+    // CRITICAL: Mount essential filesystems FIRST, before anything else.
+    // When running as init (PID 1), we need these for the system to function.
+    // This must happen before logging (which needs /dev for output).
+    mount_essential_filesystems();
+    boot_log(
+        "INFO",
+        &format!("boot mounts_done uptime_ms={}", uptime_ms()),
+    );
+
+    #[cfg(target_os = "linux")]
+    delegate_root_cgroup_controllers();
+
+    // Create /dev/dri device nodes only when GPU is enabled. The setup
+    // function polls up to 500ms for the virtio-gpu driver to finish probing —
+    // running it on non-GPU machines wastes the full polling window.
+    #[cfg(target_os = "linux")]
+    if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
+        setup_gpu_dev_nodes();
+    }
+
+    // Deliberately NOT under the GPU condition above: nesting and the GPU are
+    // independent, and gating this on --gpu would leave a --nested machine with
+    // no /dev/kvm. Cheap when unused — it returns immediately unless the kernel
+    // registered KVM.
+    #[cfg(target_os = "linux")]
+    setup_kvm_dev_node();
+
+    // Set up persistent rootfs overlay (if /dev/vdb exists).
+    // This does overlayfs + pivot_root before anything else touches the filesystem.
+    setup_persistent_rootfs();
+    forkpoint::setup();
+    boot_log(
+        "INFO",
+        &format!("boot rootfs_done uptime_ms={}", uptime_ms()),
+    );
+
+    // Start seatd AFTER pivot_root so its socket lands at /run/seatd.sock in
+    // the live root. Wayland compositors (Weston, sway) and DRI3-capable X
+    // servers (Xwayland) connect to this socket via libseat to acquire DRM
+    // devices. Without seatd, GPU-accelerated display workloads fail with
+    // "No backend was able to open a seat."
+    #[cfg(target_os = "linux")]
+    if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
+        start_seatd();
+    }
+
+    // CRITICAL: Create vsock listener IMMEDIATELY after mounts.
+    // This must happen before logging setup to minimize time to listener ready.
+    // The kernel boots in ~30ms and host connects immediately after.
+    let listener = match vsock::listen(ports::AGENT_CONTROL) {
+        Ok(l) => l,
+        Err(e) => {
+            boot_log("ERROR", &format!("FAILED to create vsock listener: {}", e));
+            std::process::exit(1);
+        }
+    };
+    boot_log(
+        "INFO",
+        &format!("boot vsock_bound uptime_ms={}", uptime_ms()),
+    );
+
+    // Set up signal handlers for graceful shutdown (sync before exit)
+    setup_signal_handlers();
+
+    // --- Deferred init: runs before the host is allowed to send requests ---
+    //
+    // Keep the ready marker hidden until the guest has completed the boot-time
+    // work that init commands may depend on:
+    // - guest networking
+    // - storage mount
+    // - packed layers
+    // - volume mounts and /workspace setup
+    // - SSH agent / DNS proxy bridges
+    //
+    // `machine run` can reach init very quickly, so signaling readiness too
+    // early creates a race where init starts before the guest is actually ready
+    // to resolve or connect to the network. Named-machine startup has enough
+    // extra host-side work to mostly hide this, but the guest itself should not
+    // report "ready" until the boot prerequisites are complete.
+    // Storage mount is behind a OnceLock (ensure_storage_mounted) so it
+    // happens exactly once — either here or on first storage-dependent request.
+
+    let start_uptime = uptime_ms();
+
+    // Initialize logging after deferred boot work begins; boot_log is still
+    // used for the earliest readiness breadcrumbs.
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("smolvm_agent=info".parse().expect("valid directive")),
+        )
+        .init();
+
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        uptime_ms = start_uptime,
+        "smolvm-agent started, deferred boot work in progress"
+    );
+
+    let t0 = uptime_ms();
+    match network::configure_from_env() {
+        Ok(true) => {
+            info!(
+                duration_ms = uptime_ms() - t0,
+                "guest virtio network configured"
+            );
+        }
+        Ok(false) => {
+            // TSI mode or no network. The overlay may contain a stale
+            // "nameserver 127.0.0.1" written by a previous --allow-host run.
+            // TSI forwards UDP to the resolver directly, so reset resolv.conf to
+            // a known-good value unless the DNS filter proxy is about to
+            // overwrite it with 127.0.0.1 anyway. Honor an explicit `--dns`
+            // override (forwarded by the host as guest_env::DNS) — the virtio
+            // path already derives the guest resolver from the same env var, so
+            // both backends now agree on which nameserver the guest uses. This
+            // is what makes `--dns` work on a network where the public resolvers
+            // (1.1.1.1/8.8.8.8) are blocked.
+            if !dns_proxy::is_enabled() {
+                let dns_override = std::env::var(guest_env::DNS).ok();
+                let current = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+                if let Some(new) = tsi_resolv_conf(dns_override.as_deref(), &current) {
+                    let _ = std::fs::write("/etc/resolv.conf", new);
+                }
+            }
+        }
+        Err(err) => {
+            error!(error = %err, "failed to configure guest network");
+            std::process::exit(1);
+        }
+    }
+
+    // Initialize packed layers support (if SMOLVM_PACKED_LAYERS env var is set)
+    let t0 = uptime_ms();
+    if let Some(packed_dir) = storage::get_packed_layers_dir() {
+        info!(
+            duration_ms = uptime_ms() - t0,
+            packed_dir = %packed_dir.display(),
+            "packed layers initialized"
+        );
+    }
+
+    // Staged mounts keep their working copy on the persistent storage disk.
+    // Mount it before volume initialization instead of using the normal
+    // post-ready overlap, otherwise the later /storage mount can hide a newly
+    // seeded working tree and lose it across restart.
+    if storage::staged_boot_mount_requested() && !ensure_storage_mounted() {
+        error!("staged volume mount requires the guest storage disk");
+        std::process::exit(1);
+    }
+
+    // Initialize volume mounts from SMOLVM_MOUNT_* env vars.
+    // MUST run before the /workspace symlink below — if the user passed
+    // `-v host:/workspace`, the bind mount claims /workspace first and
+    // the symlink's `!exists()` guard correctly skips creation.
+    let t0 = uptime_ms();
+    let boot_mounts = storage::init_volume_mounts();
+    if storage::staged_boot_mount_requested() && storage::boot_volume_mounts_failed() {
+        error!("failed to initialize staged volume mount");
+        std::process::exit(1);
+    }
+    if !boot_mounts.is_empty() {
+        info!(
+            duration_ms = uptime_ms() - t0,
+            mount_count = boot_mounts.len(),
+            "volume mounts initialized at boot"
+        );
+    }
+
+    // Create /workspace symlink for bare VMs (no -v targeting /workspace).
+    // Image-based VMs get /workspace via a bind mount in the container spec,
+    // but bare VMs run directly in the VM rootfs where /workspace doesn't
+    // exist. The symlink makes /workspace available in both modes.
+    // Placed AFTER init_volume_mounts so that `-v host:/workspace` takes
+    // priority — the exists() check sees the bind mount and skips.
+    //
+    // The target `/storage/workspace` is created by the storage mount, which
+    // now runs *after* this block (it was moved below signal_ready_to_host()
+    // to overlap with the host connect). So the symlink is created even when
+    // the target doesn't exist yet — a dangling symlink is fine, it resolves
+    // once storage mounts, which always completes before the accept loop reads
+    // any request. Gating on `workspace_target.exists()` here would silently
+    // skip the symlink for bare VMs and is what regressed `/workspace`.
+    {
+        let workspace_link = std::path::Path::new("/workspace");
+        let workspace_target = std::path::Path::new("/storage/workspace");
+        if !workspace_link.exists() {
+            let _ = std::os::unix::fs::symlink(workspace_target, workspace_link);
+        }
+    }
+
+    // Registry load+reconcile deferred to first container operation via
+    // REGISTRY.ensure_loaded(). On fresh boot, no containers from a previous
+    // instance survive, so this work (~30-50ms for crun list + JSON parse)
+    // is wasted if no container operations are requested.
+
+    // Start SSH agent forwarding bridge if enabled by host
+    if ssh_agent::is_enabled() {
+        info!("SSH agent forwarding enabled, starting guest bridge");
+        ssh_agent::start();
+        // Set env so all child processes (git, ssh, etc.) find the agent socket
+        std::env::set_var("SSH_AUTH_SOCK", ssh_agent::GUEST_SSH_AUTH_SOCK);
+    }
+
+    // Start the Docker socket bridge if enabled by host: the guest listens on a
+    // vsock port and proxies to the in-guest dockerd socket, so the host reaches
+    // it over a Unix socket (DOCKER_HOST=unix://…).
+    if docker_bridge::is_enabled() {
+        info!("Docker socket bridge enabled, starting guest bridge");
+        docker_bridge::start();
+    }
+
+    // Start any user-published Unix-socket bridges (`--expose-socket` /
+    // `--mount-socket`). No-op when none are configured.
+    publish_socket::start_all();
+
+    // Mount the Rosetta 2 runtime and register the binfmt_misc handler if the
+    // host attached it. Must run after pivot_root (the wrapper lives in the
+    // rootfs) and after /proc is mounted (binfmt_misc registration).
+    if rosetta::is_enabled() {
+        info!("Rosetta 2 requested, setting up x86_64 translation");
+        rosetta::setup();
+    }
+
+    // Start DNS filtering proxy if enabled by host (when --allow-host is used)
+    if dns_proxy::is_enabled() {
+        info!("DNS filtering enabled, starting guest proxy");
+        dns_proxy::start();
+    }
+
+    // If the host started us with --gpu, sanity-check that the guest
+    // kernel actually sees a virtio-gpu device. libkrun accepts the
+    // GPU config call regardless of whether the embedded kernel has
+    // the `virtio-gpu` driver compiled in, so the only place this
+    // mismatch surfaces is here. Without this log, the user discovers
+    // the missing GPU much later — when their workload makes a
+    // rendering call and crashes with a confused EGL/Vulkan error.
+    #[cfg(target_os = "linux")]
+    if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
+        log_gpu_status();
+    }
+
+    info!(
+        total_startup_ms = uptime_ms() - start_uptime,
+        uptime_ms = uptime_ms(),
+        "agent init complete, entering accept loop"
+    );
+
+    // Only now is the guest safe to accept host requests for init/exec.
+    // Network is configured above; storage is mounted below while the host is
+    // establishing its vsock connection (~10-30ms), so the accept loop always
+    // sees storage ready without that mount adding to the user-visible boot time.
+    signal_ready_to_host();
+    boot_log(
+        "INFO",
+        &format!("boot ready_sent uptime_ms={}", uptime_ms()),
+    );
+
+    // Mount storage after signaling ready. The accept loop has not started yet,
+    // so no request can arrive before this completes. The OnceLock in
+    // ensure_storage_mounted() also guards any concurrent call from a request
+    // that races in the brief window on very fast hosts.
+    ensure_storage_mounted();
+    if let Err(error) = storage::prune_staged_working_copies(storage::init_volume_mounts()) {
+        warn!(error = %error, "failed to clean stale staged working copies");
+    }
+
+    // With the disks mounted, start reclaiming freed blocks back to the host
+    // sparse files so disk footprint tracks live data (see disk_trim).
+    disk_trim::spawn();
+
+    // Start accepting connections (listener already bound)
+    if let Err(e) = run_server_with_listener(listener) {
+        error!(error = %e, "server error");
+        std::process::exit(1);
+    }
+}
+
+/// Signal to the host that the agent is fully initialized and ready.
+///
+/// Writes a marker file to the virtiofs rootfs. The host polls for this file.
+/// The virtiofs FUSE write is visible on the host filesystem within ~1ms
+/// (hv_gic_set_spi interrupt injection is 0–15µs; no event_manager involvement).
+/// Ring the readiness doorbell: connect to the host (CID 2) on the `AGENT_READY`
+/// vsock port. The host's `accept()` fires the instant this connects, giving an
+/// event-driven readiness signal that — unlike the marker — needs no writable
+/// filesystem, so it works even when the rootfs share is root-owned (packaged
+/// installs). Best-effort: a failure just falls back to the marker/ping.
+/// Returns whether the doorbell was answered — i.e. the host is listening and
+/// has already observed readiness. The caller uses that to decide whether the
+/// marker file is needed at all.
+#[cfg(target_os = "linux")]
+fn ready_doorbell() -> bool {
+    unsafe {
+        let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return false;
+        }
+        let mut addr: libc::sockaddr_vm = std::mem::zeroed();
+        addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+        addr.svm_cid = libc::VMADDR_CID_HOST;
+        addr.svm_port = smolvm_protocol::ports::AGENT_READY;
+        let connected = libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+        ) == 0;
+        libc::close(fd);
+        connected
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ready_doorbell() -> bool {
+    false
+}
+
+fn signal_ready_to_host() {
+    use std::path::Path;
+
+    // Ring the event-driven doorbell first. A successful connect means the host
+    // has *already* observed readiness, so the marker would be write-only state:
+    // nothing reads it, and it is never cleaned up on this path.
+    //
+    // Skipping it matters beyond tidiness. The marker lands in the SHARED agent
+    // rootfs, and under per-VM uid isolation it is created owned by the VM's
+    // dropped uid with mode 0600. `collect_agent_rootfs` must read every byte of
+    // that tree, so each leftover marker is a file that makes `pack create` fail
+    // with EACCES for any other user (BUG-151, #865) — and the host's
+    // `prune_orphaned_ready_markers` cannot remove them on a root-owned packaged
+    // install, by its own admission.
+    //
+    // The marker is still written when the doorbell goes unanswered: an older
+    // host does not bind the listener, and a host whose doorbell vsock port
+    // failed to add falls back to marker/ping. Those hosts keep working.
+    if ready_doorbell() {
+        return;
+    }
+
+    let content = uptime_ms().to_string();
+
+    // The host gives each VM its own marker name (SMOLVM_READY_MARKER) so
+    // concurrent boots don't race on one shared rootfs file and, under uid
+    // isolation, the host can pre-create it owned by this VM's uid. Fall back to
+    // the shared protocol constant if the host didn't set it (older host).
+    let marker =
+        std::env::var(guest_env::READY_MARKER).unwrap_or_else(|_| AGENT_READY_MARKER.to_string());
+
+    // Try /oldroot first (overlay mode: virtiofs is the lower layer after pivot_root)
+    // Before pivot_root: virtiofs is at /, so the / path works.
+    let paths = [format!("/oldroot/{}", marker), format!("/{}", marker)];
+
+    for path in &paths {
+        if Path::new(path).parent().is_some_and(|p| p.exists()) {
+            // Write + fsync so the host sees the marker immediately. A plain
+            // write() can sit in the guest's virtiofs writeback cache for
+            // seconds before the host fs backend observes it, leaving the host's
+            // marker poll empty until the socket-probe grace expires — a
+            // multi-second boot-time regression. fsync forces the FUSE write
+            // through to the host now.
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::File::create(path) {
+                if f.write_all(content.as_bytes()).is_ok() && f.sync_all().is_ok() {
+                    boot_log("INFO", &format!("ready marker written: {path}"));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Helper to create a CString from a static str.
+/// Used by boot functions that call libc mount/mknod/pivot_root.
+#[cfg(target_os = "linux")]
+fn cstr(s: &str) -> std::ffi::CString {
+    std::ffi::CString::new(s).expect("static string without null bytes")
+}
+
+/// A single mount entry for `mount_essential_filesystems`.
+#[cfg(target_os = "linux")]
+struct MountEntry {
+    source: &'static str,
+    target: &'static str,
+    fstype: &'static str,
+    flags: libc::c_ulong,
+    data: Option<&'static str>,
+}
+
+#[cfg(target_os = "linux")]
+impl MountEntry {
+    fn mount(&self) -> Result<(), String> {
+        if let Err(e) = std::fs::create_dir_all(self.target) {
+            // Clean up any partial directories left by create_dir_all
+            let _ = std::fs::remove_dir(self.target);
+            return Err(format!("failed to create {}: {}", self.target, e));
+        }
+
+        // Bind the optional data CString so it lives through the libc::mount call.
+        let data_cstr = self.data.map(cstr);
+        let data_ptr = match &data_cstr {
+            Some(d) => d.as_ptr() as *const libc::c_void,
+            None => std::ptr::null(),
+        };
+
+        // SAFETY: libc::mount with valid CString pointers for filesystem mounting.
+        // All CString values (from cstr() calls and data_cstr) are alive for the
+        // duration of this call.
+        let ret = unsafe {
+            libc::mount(
+                cstr(self.source).as_ptr(),
+                cstr(self.target).as_ptr(),
+                cstr(self.fstype).as_ptr(),
+                self.flags,
+                data_ptr,
+            )
+        };
+
+        if ret != 0 {
+            return Err(format!(
+                "failed to mount {} at {}: {}",
+                self.fstype,
+                self.target,
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Mount essential filesystems (proc, sysfs, devtmpfs, devpts).
+/// This must be done first when running as init (PID 1).
+/// Uses direct syscalls to avoid any overhead.
+#[cfg(target_os = "linux")]
+fn mount_essential_filesystems() {
+    // The guest root filesystem is read-only, and neither libkrun's init.c nor
+    // the kernel mounts /tmp. A writable /tmp is the idiomatic home for
+    // ephemeral runtime files (the registry-auth config, crun console sockets,
+    // the ssh-agent socket, …), so mount a tmpfs over it. Best-effort: a
+    // failure here must not abort boot, and the individual writers that target
+    // /storage still work without it. Runs unconditionally — before the
+    // init.c-already-mounted early return below — because init.c never mounts
+    // /tmp.
+    let tmp = MountEntry {
+        source: "tmpfs",
+        target: "/tmp",
+        fstype: "tmpfs",
+        flags: libc::MS_NOSUID | libc::MS_NODEV,
+        data: Some("mode=1777"),
+    };
+    if let Err(e) = tmp.mount() {
+        warn!("smolvm-agent: failed to mount tmpfs on /tmp: {}", e);
+    }
+
+    // libkrun's init.c mounts /proc, /sys, /dev, /dev/pts before exec'ing
+    // the agent. Skip redundant mounts if already present.
+    if std::path::Path::new("/proc/uptime").exists() {
+        // Ensure /dev/ptmx symlink exists (not set up by init.c)
+        let _ = std::os::unix::fs::symlink("pts/ptmx", "/dev/ptmx");
+        return;
+    }
+
+    let mounts = [
+        MountEntry {
+            source: "proc",
+            target: "/proc",
+            fstype: "proc",
+            flags: 0,
+            data: None,
+        },
+        MountEntry {
+            source: "sysfs",
+            target: "/sys",
+            fstype: "sysfs",
+            flags: 0,
+            data: None,
+        },
+        MountEntry {
+            source: "devtmpfs",
+            target: "/dev",
+            fstype: "devtmpfs",
+            flags: 0,
+            data: None,
+        },
+        MountEntry {
+            source: "devpts",
+            target: "/dev/pts",
+            fstype: "devpts",
+            flags: 0,
+            data: Some("mode=0620,ptmxmode=0666"),
+        },
+    ];
+
+    for entry in &mounts {
+        if let Err(e) = entry.mount() {
+            error!("smolvm-agent: {}", e);
+            return;
+        }
+    }
+
+    // Create /dev/ptmx symlink pointing to pts/ptmx
+    // This ensures openpty() can find the PTY multiplexer
+    let _ = std::os::unix::fs::symlink("pts/ptmx", "/dev/ptmx");
+
+    // Set up loopback interface (non-blocking, best effort)
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if fd >= 0 {
+            // This would require more complex ioctl calls, skip for now
+            // The networking will be set up by TSI anyway
+            libc::close(fd);
+        }
+    }
+}
+
+/// Enable every available cgroup2 controller for child cgroups, once, at boot.
+///
+/// libkrun mounts `/sys/fs/cgroup` read-only with nothing in
+/// `cgroup.subtree_control`, so software that manages its own sub-cgroups —
+/// kubelet, dockerd, systemd — finds an undelegated hierarchy and either
+/// fails or runs unbounded, and users had to hand-write the delegation
+/// before starting it. The root cgroup is exempt from cgroup2's
+/// no-internal-processes rule, so enabling controllers here while the agent
+/// and its containers stay in the root is valid; the cost is one extra level
+/// of hierarchical accounting. Best-effort: on any failure workloads behave
+/// exactly as before.
+#[cfg(target_os = "linux")]
+fn delegate_root_cgroup_controllers() {
+    use std::ffi::CString;
+    let Ok(target) = CString::new("/sys/fs/cgroup") else {
+        return;
+    };
+    // Remount read-write; MS_REMOUNT preserves the mount and omitting
+    // MS_RDONLY clears the read-only flag.
+    let flags = libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+    // SAFETY: `target` is a valid NUL-terminated path; the agent is PID-1 and
+    // holds CAP_SYS_ADMIN. Null source/type/data is valid for a remount.
+    let rc = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            flags,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        boot_log(
+            "WARN",
+            "cgroup2 remount rw failed; controllers not delegated",
+        );
+        return;
+    }
+    let controllers =
+        std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers").unwrap_or_default();
+    let enable: Vec<String> = controllers
+        .split_whitespace()
+        .map(|c| format!("+{c}"))
+        .collect();
+    if enable.is_empty() {
+        return;
+    }
+    match std::fs::write("/sys/fs/cgroup/cgroup.subtree_control", enable.join(" ")) {
+        Ok(()) => boot_log(
+            "INFO",
+            &format!("cgroup2 controllers delegated: {}", controllers.trim()),
+        ),
+        Err(e) => boot_log(
+            "WARN",
+            &format!("cgroup2 controller delegation failed: {e}"),
+        ),
+    }
+}
+
+/// Stub for non-Linux platforms (agent only runs on Linux inside VM).
+#[cfg(not(target_os = "linux"))]
+fn mount_essential_filesystems() {
+    // No-op on non-Linux platforms
+}
+
+/// Create /dev/dri device nodes for virtio-gpu if present.
+///
+/// libkrun's init.c mounts /dev as a basic tmpfs so the kernel's devtmpfs
+/// doesn't auto-populate DRM device nodes. This function reads each render
+/// node and card from /sys/class/drm/ and creates the corresponding
+/// character device node in /dev/dri/ so containers can access the GPU.
+#[cfg(target_os = "linux")]
+fn setup_gpu_dev_nodes() {
+    let sysfs_drm = std::path::Path::new("/sys/class/drm");
+    if !sysfs_drm.exists() {
+        return;
+    }
+
+    // The virtio-gpu driver may not have finished probing when the agent
+    // starts — sysfs entries appear only after probe() completes.  Poll
+    // for up to ~500 ms in 10 ms increments rather than racing with the
+    // driver.  On fast boots the first read already wins; the loop just
+    // handles the small window where the driver is still initialising.
+    let entries = {
+        let mut found = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            let Ok(rd) = std::fs::read_dir(sysfs_drm) else {
+                break;
+            };
+            let candidates: Vec<_> = rd
+                .flatten()
+                .filter(|e| {
+                    let n = e.file_name();
+                    let s = n.to_string_lossy();
+                    s.starts_with("renderD") || s.starts_with("card")
+                })
+                .collect();
+            if !candidates.is_empty() {
+                found = candidates;
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            // SAFETY: nanosleep — always safe
+            unsafe {
+                libc::nanosleep(
+                    &libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 10_000_000,
+                    },
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+        found
+    };
+
+    if entries.is_empty() {
+        return;
+    }
+
+    let _ = std::fs::create_dir_all("/dev/dri");
+
+    for entry in &entries {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Read major:minor from sysfs (e.g. "226:128\n")
+        let dev_file = sysfs_drm.join(&*name_str).join("dev");
+        let Ok(dev_str) = std::fs::read_to_string(&dev_file) else {
+            continue;
+        };
+        let parts: Vec<&str> = dev_str.trim().split(':').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let Ok(major) = parts[0].parse::<u32>() else {
+            continue;
+        };
+        let Ok(minor) = parts[1].parse::<u32>() else {
+            continue;
+        };
+
+        let node_path = format!("/dev/dri/{}", name_str);
+        let Ok(node_cstr) = std::ffi::CString::new(node_path) else {
+            continue;
+        };
+
+        // SAFETY: mknod a character device node with the DRM major:minor from sysfs
+        unsafe {
+            libc::mknod(
+                node_cstr.as_ptr(),
+                libc::S_IFCHR | 0o666,
+                libc::makedev(major, minor),
+            );
+        }
+    }
+}
+
+/// Create `/dev/kvm` when the guest kernel registered it.
+///
+/// With nested virtualization the kernel brings KVM up and registers its misc
+/// device, but a workload container's `/dev` is not devtmpfs, so no node ever
+/// appears and anything needing a hypervisor fails with the misleading "KVM not
+/// available. Ensure KVM kernel module is loaded" -- the module IS there. Same
+/// gap the DRM nodes above work around, and the minor is read the same way.
+#[cfg(target_os = "linux")]
+fn setup_kvm_dev_node() {
+    if std::path::Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let Ok(misc) = std::fs::read_to_string("/proc/misc") else {
+        return; // no kernel support: nothing to expose, and that is not an error
+    };
+    // /proc/misc lines are "<minor> <name>"; KVM is always misc major 10.
+    let Some(minor) = misc.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let minor = parts.next()?.parse::<u32>().ok()?;
+        (parts.next()? == "kvm").then_some(minor)
+    }) else {
+        return;
+    };
+    let Ok(path) = std::ffi::CString::new("/dev/kvm") else {
+        return;
+    };
+    // SAFETY: mknod a character device with KVM's fixed major and the minor the
+    // kernel just reported. 0666 so an unprivileged workload can use it too.
+    let rc = unsafe {
+        libc::mknod(
+            path.as_ptr(),
+            libc::S_IFCHR | 0o666,
+            libc::makedev(10, minor),
+        )
+    };
+    if rc == 0 {
+        tracing::info!(minor, "created /dev/kvm for nested virtualization");
+    }
+}
+
+/// Start the seatd seat manager daemon.
+///
+/// seatd provides the seat management API that Wayland compositors (Weston, sway)
+/// and DRI3-capable X servers (Xwayland) need to access /dev/dri devices.
+/// Without it, GPU-accelerated display workloads fail with:
+///   "No backend was able to open a seat"
+///
+/// seatd runs as a background daemon on a Unix socket at /run/seatd.sock.
+/// It's only started when GPU is enabled — zero overhead otherwise.
+#[cfg(target_os = "linux")]
+fn start_seatd() {
+    use std::process::{Command, Stdio};
+
+    let seatd_path = "/usr/bin/seatd";
+    if !std::path::Path::new(seatd_path).exists() {
+        boot_log(
+            "WARN",
+            "seatd not found in rootfs, GPU display workloads may fail",
+        );
+        return;
+    }
+
+    // seatd needs /run for its socket
+    let _ = std::fs::create_dir_all("/run");
+
+    match Command::new(seatd_path)
+        .args(["-g", "root"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            boot_log("INFO", &format!("seatd started (PID {})", child.id()));
+            // Detach — seatd runs for the lifetime of the VM
+            std::mem::forget(child);
+        }
+        Err(e) => {
+            boot_log("WARN", &format!("failed to start seatd: {}", e));
+        }
+    }
+}
+
+/// Log whether the GPU is accessible in the guest.
+///
+/// Called at startup when `guest_env::GPU` is set. Checks whether the virtio-gpu
+/// render node appeared in `/dev/dri/` after `setup_gpu_dev_nodes` ran. If not,
+/// the kernel was built without `virtio-gpu` or `drm` support and the workload
+/// will fail at Vulkan/EGL init rather than here — log a clear warning so the
+/// user knows to check the kernel config.
+#[cfg(target_os = "linux")]
+fn log_gpu_status() {
+    let render_node = std::path::Path::new("/dev/dri/renderD128");
+    if render_node.exists() {
+        info!("GPU: virtio-gpu render node present at /dev/dri/renderD128");
+    } else {
+        warn!(
+            "GPU: requested but /dev/dri/renderD128 not found — \
+             the guest kernel may lack virtio-gpu/drm support; \
+             Vulkan/EGL workloads will fail"
+        );
+    }
+}
+
+/// Ensure a mount-point directory exists on the agent rootfs, logging a WARN
+/// (rather than failing) if it can't be created.
+///
+/// The boot-critical mount points (/mnt/{overlay,storage,newroot}) are baked
+/// into the rootfs at build time — see the `mkdir` block in
+/// scripts/build-agent-rootfs.sh. This runtime `create_dir_all` is a backstop
+/// for rootfs images that predate that change or are assembled differently.
+///
+/// On a writable rootfs the dir already exists (no-op) or is created here. On a
+/// read-only rootfs the mkdir fails; we surface that as a WARN so the resulting
+/// failed overlay/storage mount is diagnosable instead of presenting as a
+/// silent boot-without-persistence. It also flags drift: a newly added `/mnt`
+/// mount point that wasn't baked into the build script will WARN here on a RO
+/// rootfs rather than fail mysteriously.
+#[cfg(target_os = "linux")]
+fn ensure_mount_dir(path: &str) {
+    if let Err(e) = std::fs::create_dir_all(path) {
+        boot_log(
+            "WARN",
+            &format!(
+                "could not create mount point {} ({}); rootfs may be read-only and \
+                 missing baked-in mount dirs — the following mount will likely fail",
+                path, e
+            ),
+        );
+    }
+}
+
+/// Set up persistent rootfs overlay using overlayfs on /dev/vdb.
+///
+/// If /dev/vdb exists (overlay disk attached by host), this function:
+/// 1. Mounts /dev/vdb as ext4 (formats on first boot)
+/// 2. Creates overlayfs with initramfs as lower layer, /dev/vdb as upper
+/// 3. Moves /proc, /sys, /dev into the new root
+/// 4. Calls pivot_root to switch to the overlayfs root
+///
+/// After pivot_root, the old initramfs stays at /oldroot (needed as
+/// overlay lower layer). All subsequent writes go through overlayfs
+/// and are persisted to /dev/vdb.
+///
+/// If /dev/vdb doesn't exist, this is a no-op (backward compatible).
+#[cfg(target_os = "linux")]
+fn setup_persistent_rootfs() {
+    use std::path::Path;
+
+    const OVERLAY_DEVICE: &str = "/dev/vdb";
+    const OVERLAY_MOUNT: &str = "/mnt/overlay";
+    const STORAGE_DEVICE: &str = "/dev/vda";
+    const STORAGE_TEMP_MOUNT: &str = "/mnt/storage";
+    const NEWROOT: &str = "/mnt/newroot";
+
+    // pivot_root requires that the current root mount is NOT shared.
+    // The kernel mounts virtiofs as shared:1 by default.  We must make it
+    // private before pivot_root will accept it.
+    //
+    // Strategy:
+    // 1. Try MS_PRIVATE|MS_REC directly (works if CAP_SYS_ADMIN + not locked).
+    // 2. If that fails, unshare the mount namespace first (creates a private
+    //    copy of the namespace for this process), then retry.
+    let root = cstr("/");
+    // SAFETY: mount with MS_PRIVATE|MS_REC on root — no fstype needed
+    let ms_private_ret = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            root.as_ptr(),
+            std::ptr::null(),
+            libc::MS_PRIVATE | libc::MS_REC,
+            std::ptr::null(),
+        )
+    };
+    if ms_private_ret != 0 {
+        boot_log(
+            "WARN",
+            &format!(
+                "MS_PRIVATE on / failed ({}), trying unshare",
+                std::io::Error::last_os_error()
+            ),
+        );
+        // SAFETY: unshare mount namespace so we get a private copy
+        let unshare_ret = unsafe { libc::unshare(libc::CLONE_NEWNS) };
+        if unshare_ret != 0 {
+            boot_log(
+                "WARN",
+                &format!(
+                    "unshare(CLONE_NEWNS) failed ({}), pivot_root may fail",
+                    std::io::Error::last_os_error()
+                ),
+            );
+        }
+        // Retry MS_PRIVATE after unshare (now we own the namespace)
+        unsafe {
+            libc::mount(
+                std::ptr::null(),
+                root.as_ptr(),
+                std::ptr::null(),
+                libc::MS_PRIVATE | libc::MS_REC,
+                std::ptr::null(),
+            );
+        }
+    }
+
+    // If overlay device doesn't exist, no overlay disk attached — skip.
+    // On devtmpfs, the kernel creates /dev/vdb automatically when libkrun
+    // attaches a second virtio-blk disk. No mknod needed.
+    if !Path::new(OVERLAY_DEVICE).exists() {
+        return;
+    }
+
+    ensure_mount_dir(OVERLAY_MOUNT);
+
+    // Probe and mount storage disk in parallel with the overlay ext4 operations.
+    // Spawning here (before the /dev/vdb ext4 mount) lets storage work overlap
+    // with both the virtiofs activity between probe and mount (~27ms gap) and
+    // the /dev/vdb ext4 mount itself (~10ms, req=4–17). On warm boots this
+    // removes storage mount latency from the critical path entirely.
+    let storage_handle = if Path::new(STORAGE_DEVICE).exists() {
+        ensure_mount_dir(STORAGE_TEMP_MOUNT);
+        Some(std::thread::spawn(|| {
+            // Resize before mount — template may be smaller than device.
+            // Skip if filesystem already fills the device (subsequent boots).
+            // If resize fails (e.g. macOS-created template with incompatible features),
+            // skip mount — mount_storage_disk() will handle mkfs fallback.
+            if !ext4_already_full_size(STORAGE_DEVICE)
+                && !resize_ext4_if_needed(STORAGE_DEVICE, "storage")
+            {
+                boot_log(
+                    "WARN",
+                    "storage: resize failed, deferring to mount_storage_disk",
+                );
+                return false;
+            }
+
+            let dev = cstr(STORAGE_DEVICE);
+            let mnt = cstr(STORAGE_TEMP_MOUNT);
+            let ext4 = cstr("ext4");
+            // SAFETY: mount /dev/vda as ext4 at /mnt/storage with noatime
+            let mounted = unsafe {
+                libc::mount(
+                    dev.as_ptr(),
+                    mnt.as_ptr(),
+                    ext4.as_ptr(),
+                    libc::MS_NOATIME,
+                    std::ptr::null(),
+                ) == 0
+            };
+            if !mounted {
+                let err = std::io::Error::last_os_error();
+                boot_log(
+                    "WARN",
+                    &format!(
+                        "storage: parallel mount failed ({}), deferring to mount_storage_disk",
+                        err
+                    ),
+                );
+            }
+            mounted
+        }))
+    } else {
+        None
+    };
+
+    // Resize ext4 on the UNMOUNTED device before mounting. The host copies
+    // from a small template (~512MB) then extends the sparse file. resize2fs
+    // on a mounted device fails with "Resource busy" — must resize first.
+    // Skip if filesystem already fills the device (subsequent boots).
+    // If resize fails (macOS-created template), the mount+mkfs fallback below handles it.
+    if !ext4_already_full_size(OVERLAY_DEVICE) {
+        let _ = resize_ext4_if_needed(OVERLAY_DEVICE, "overlay");
+    }
+
+    // Try to mount overlay disk (should be pre-formatted ext4)
+    let dev = cstr(OVERLAY_DEVICE);
+    let mnt = cstr(OVERLAY_MOUNT);
+    let ext4 = cstr("ext4");
+    // SAFETY: mount /dev/vdb as ext4 at /mnt/overlay with noatime
+    let mounted = unsafe {
+        libc::mount(
+            dev.as_ptr(),
+            mnt.as_ptr(),
+            ext4.as_ptr(),
+            libc::MS_NOATIME,
+            std::ptr::null(),
+        ) == 0
+    };
+
+    if !mounted {
+        // First boot — format the disk
+        let _ = std::process::Command::new("mkfs.ext4")
+            .args([
+                "-F",
+                "-q",
+                "-O",
+                "^has_journal",
+                "-L",
+                "smolvm-overlay",
+                OVERLAY_DEVICE,
+            ])
+            .status();
+
+        let dev = cstr(OVERLAY_DEVICE);
+        let mnt = cstr(OVERLAY_MOUNT);
+        let ext4 = cstr("ext4");
+        // SAFETY: retry mount after formatting with noatime
+        if unsafe {
+            libc::mount(
+                dev.as_ptr(),
+                mnt.as_ptr(),
+                ext4.as_ptr(),
+                libc::MS_NOATIME,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            boot_log("ERROR", "failed to mount overlay disk after formatting");
+            // Clean up the parallel storage mount so mount_storage_disk() fallback
+            // does not hit EBUSY from an already-mounted /dev/vda.
+            if let Some(handle) = storage_handle {
+                if handle.join().unwrap_or(false) {
+                    let mnt = cstr(STORAGE_TEMP_MOUNT);
+                    // SAFETY: umount /mnt/storage that the parallel thread mounted
+                    unsafe {
+                        libc::umount(mnt.as_ptr());
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    // Create overlay directories
+    let _ = std::fs::create_dir_all(format!("{}/upper", OVERLAY_MOUNT));
+    let _ = std::fs::create_dir_all(format!("{}/work", OVERLAY_MOUNT));
+    ensure_mount_dir(NEWROOT);
+
+    // Mount overlayfs: initramfs (lower, read-only) + persistent disk (upper)
+    let overlay_src = cstr("overlay");
+    let newroot = cstr(NEWROOT);
+    let overlay_type = cstr("overlay");
+    // Simple overlayfs without index/redirect_dir/uuid — these options trigger
+    // ext4 xattr writes + journal flushes on every mount. On macOS/HVF each
+    // ext4 journal flush (FUA/barrier) serializes to an APFS fsync (~10-30ms).
+    // With 15-30 flushes per mount, they add 200-900ms to every boot.
+    //
+    // These options also do NOT enable Docker overlay2 on this overlay — the
+    // lower layer is the initramfs (ramfs) which has no file-handle support,
+    // so the kernel falls back to index=off for any overlay2 upper dir on this
+    // root regardless. Docker's data root is on /storage/ (bare ext4), not here.
+    let overlay_opts = cstr(&format!(
+        "lowerdir=/,upperdir={}/upper,workdir={}/work",
+        OVERLAY_MOUNT, OVERLAY_MOUNT
+    ));
+    // SAFETY: mount overlayfs with the specified options
+    let result = unsafe {
+        libc::mount(
+            overlay_src.as_ptr(),
+            newroot.as_ptr(),
+            overlay_type.as_ptr(),
+            0,
+            overlay_opts.as_ptr() as *const libc::c_void,
+        )
+    };
+    if result != 0 {
+        let err = std::io::Error::last_os_error();
+        boot_log("ERROR", &format!("failed to mount overlayfs ({})", err));
+        // Clean up parallel storage mount to avoid double-mount in
+        // mount_storage_disk() fallback path.
+        if let Some(handle) = storage_handle {
+            if handle.join().unwrap_or(false) {
+                let mnt = cstr(STORAGE_TEMP_MOUNT);
+                // SAFETY: umount the temp storage mount
+                unsafe {
+                    libc::umount(mnt.as_ptr());
+                }
+            }
+        }
+        return;
+    }
+
+    // pivot_root also requires the new root mount not to be shared.
+    // Make the overlayfs mount private immediately after creating it.
+    // SAFETY: mount(NULL, newroot, NULL, MS_PRIVATE|MS_REC, NULL)
+    unsafe {
+        libc::mount(
+            std::ptr::null(),
+            newroot.as_ptr(),
+            std::ptr::null(),
+            libc::MS_PRIVATE | libc::MS_REC,
+            std::ptr::null(),
+        );
+    }
+
+    // Create mount point directories in new root and move special mounts
+    for dir in &["proc", "sys", "dev"] {
+        let _ = std::fs::create_dir_all(format!("{}/{}", NEWROOT, dir));
+        let src = cstr(&format!("/{}", dir));
+        let dst = cstr(&format!("{}/{}", NEWROOT, dir));
+        // SAFETY: mount --move for each special filesystem
+        unsafe {
+            libc::mount(
+                src.as_ptr(),
+                dst.as_ptr(),
+                std::ptr::null(),
+                libc::MS_MOVE,
+                std::ptr::null(),
+            );
+        }
+    }
+
+    // Join parallel storage mount and move it into new root.
+    // On subsequent boots, the ext4 mount succeeds and overlaps with the
+    // overlayfs setup above. On first boot from macOS template, mount fails
+    // and mount_storage_disk() handles it with full fsck/mkfs recovery.
+    if let Some(handle) = storage_handle {
+        match handle.join() {
+            Ok(true) => {
+                let _ = std::fs::create_dir_all(format!("{}/storage", NEWROOT));
+                let src = cstr(STORAGE_TEMP_MOUNT);
+                let dst = cstr(&format!("{}/storage", NEWROOT));
+                // SAFETY: mount --move /mnt/storage to newroot/storage
+                let result = unsafe {
+                    libc::mount(
+                        src.as_ptr(),
+                        dst.as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_MOVE,
+                        std::ptr::null(),
+                    )
+                };
+                if result != 0 {
+                    let err = std::io::Error::last_os_error();
+                    boot_log(
+                        "WARN",
+                        &format!(
+                        "storage: mount-move to newroot failed ({}), will retry after pivot_root",
+                        err
+                    ),
+                    );
+                    // Unmount temp so mount_storage_disk() can try fresh
+                    let mnt = cstr(STORAGE_TEMP_MOUNT);
+                    unsafe {
+                        libc::umount(mnt.as_ptr());
+                    }
+                }
+            }
+            Ok(false) => {
+                // Thread reported failure — mount_storage_disk() will handle it
+            }
+            Err(_) => {
+                boot_log("WARN", "storage: parallel mount thread panicked");
+            }
+        }
+    }
+
+    // Prepare for pivot_root
+    let _ = std::fs::create_dir_all(format!("{}/oldroot", NEWROOT));
+
+    if std::env::set_current_dir(NEWROOT).is_err() {
+        boot_log("ERROR", "failed to chdir to new root");
+        return;
+    }
+
+    // pivot_root — switch to overlayed root.
+    // Old root stays at /oldroot (needed as overlay lower layer, ~44MB RAM).
+    let dot = cstr(".");
+    let oldroot = cstr("oldroot");
+    // SAFETY: pivot_root syscall with valid path arguments
+    let result = unsafe { libc::syscall(libc::SYS_pivot_root, dot.as_ptr(), oldroot.as_ptr()) };
+    if result != 0 {
+        let err = std::io::Error::last_os_error();
+        boot_log("ERROR", &format!("pivot_root failed: {}", err));
+        return;
+    }
+
+    // Set working directory to new root
+    let _ = std::env::set_current_dir("/");
+
+    boot_log("INFO", "persistent rootfs overlay active (pivot_root done)");
+}
+
+/// Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+fn setup_persistent_rootfs() {
+    // No-op on non-Linux platforms
+}
+
+/// Set up signal handlers to sync filesystem on SIGTERM/SIGINT.
+/// Best effort only; graceful host shutdown requires confirmed quiescence.
+#[cfg(target_os = "linux")]
+fn setup_signal_handlers() {
+    // SAFETY: Signal handler that calls sync() - sync is async-signal-safe
+    unsafe extern "C" fn handle_term_signal(sig: libc::c_int) {
+        // Intent: INTENT.md; fixed bounded JSON, no allocation/locks/credentials.
+        // FD2 is the existing krun-stderr/agent-console channel; emit before shutdown.
+        let receipt: &[u8] = match sig {
+            libc::SIGTERM => b"{\"event\":\"smol_hotfork_agent_signal\",\"signal\":15}\n",
+            libc::SIGINT => b"{\"event\":\"smol_hotfork_agent_signal\",\"signal\":2}\n",
+            _ => b"{\"event\":\"smol_hotfork_agent_signal\",\"signal\":\"unexpected\"}\n",
+        };
+        let _ = libc::write(libc::STDERR_FILENO, receipt.as_ptr().cast(), receipt.len());
+        // sync() is async-signal-safe, so we can call it from a signal handler
+        libc::sync();
+        // Exit cleanly
+        libc::_exit(0);
+    }
+
+    // SAFETY: Setting up signal handlers with valid function pointers
+    unsafe {
+        // Handle SIGTERM (sent by VM stop)
+        libc::signal(
+            libc::SIGTERM,
+            handle_term_signal as *const () as libc::sighandler_t,
+        );
+        // Handle SIGINT (Ctrl+C, if attached to console)
+        libc::signal(
+            libc::SIGINT,
+            handle_term_signal as *const () as libc::sighandler_t,
+        );
+        // Note: We do NOT install a SIGCHLD handler here because it would
+        // race with Child::wait() in synchronous exec paths. Instead,
+        // background exec children are reaped by reap_background_children()
+        // called periodically in the accept loop.
+    }
+}
+
+/// Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+fn setup_signal_handlers() {
+    // No-op on non-Linux platforms
+}
+
+#[cfg(target_os = "linux")]
+/// Resize an ext4 filesystem on an unmounted device to fill the block device.
+///
+/// The host creates disks by copying a small pre-formatted template (~512MB)
+/// then extending the sparse file to the target size (e.g. 20GB). The ext4
+/// filesystem inside still thinks it's 512MB. This function expands it to
+/// fill the full block device.
+///
+/// MUST be called BEFORE mounting — resize2fs on a mounted device fails with
+/// "Resource busy" because the kernel holds the block device exclusively.
+///
+/// Tries resize2fs directly first. Only falls back to e2fsck if resize2fs
+/// fails (e.g., due to actual corruption). ext4 journal replay handles
+/// `needs_recovery` on mount in ~1-2ms, so a full e2fsck is unnecessary
+/// on the happy path. Uses boot_log instead of tracing because this runs
+/// before tracing_subscriber is initialized.
+fn resize_ext4_if_needed(device: &str, label: &str) -> bool {
+    use std::process::Command;
+
+    // Try resize2fs directly — skip e2fsck on the happy path.
+    // ext4 journal replay handles needs_recovery on mount, so resize2fs
+    // usually succeeds without a prior fsck.
+    match Command::new("resize2fs").arg(device).output() {
+        Ok(output) if output.status.success() => {
+            let msg = String::from_utf8_lossy(&output.stderr);
+            if msg.contains("Nothing to do") {
+                boot_log(
+                    "DEBUG",
+                    &format!("{} filesystem already at full device size", label),
+                );
+            } else {
+                boot_log(
+                    "INFO",
+                    &format!("{} filesystem resized to fill block device", label),
+                );
+            }
+            return true;
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            boot_log(
+                "WARN",
+                &format!(
+                    "{} resize2fs failed (exit {}): {}, trying e2fsck",
+                    label,
+                    output.status.code().unwrap_or(-1),
+                    stderr.trim()
+                ),
+            );
+        }
+        Err(e) => {
+            boot_log("WARN", &format!("{} resize2fs not found: {}", label, e));
+            return false;
+        }
+    }
+
+    // Fallback: resize2fs failed, run e2fsck -y (without -f) then retry.
+    // Without -f, e2fsck skips clean filesystems instantly. With needs_recovery,
+    // it replays the journal (~10ms) instead of a full forced scan (~128ms).
+    match Command::new("e2fsck").args(["-y", device]).output() {
+        Ok(output) => {
+            let code = output.status.code().unwrap_or(-1);
+            // e2fsck exit codes (bit flags, may be OR'd together):
+            //   0 = clean
+            //   1 = errors corrected
+            //   2 = errors corrected, reboot needed (unsafe to proceed)
+            //   4 = errors left uncorrected
+            //   8 = operational error
+            if code >= 2 {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                boot_log(
+                    "WARN",
+                    &format!(
+                        "{} e2fsck could not fully repair (exit {}): {}",
+                        label,
+                        code,
+                        stderr.trim()
+                    ),
+                );
+                return false;
+            }
+            if code == 1 {
+                boot_log("INFO", &format!("{} e2fsck fixed errors", label));
+            }
+        }
+        Err(e) => {
+            boot_log("WARN", &format!("{} e2fsck not found: {}", label, e));
+            return false;
+        }
+    }
+
+    // Retry resize2fs after e2fsck
+    match Command::new("resize2fs").arg(device).output() {
+        Ok(output) if output.status.success() => {
+            boot_log(
+                "INFO",
+                &format!("{} filesystem resized after e2fsck", label),
+            );
+            true
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            boot_log(
+                "WARN",
+                &format!(
+                    "{} resize2fs still failed after e2fsck (exit {}): {}",
+                    label,
+                    output.status.code().unwrap_or(-1),
+                    stderr.trim()
+                ),
+            );
+            false
+        }
+        Err(e) => {
+            boot_log("WARN", &format!("{} resize2fs failed: {}", label, e));
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+/// Check if ext4 filesystem already fills the block device.
+///
+/// Reads the ext4 superblock (at offset 1024) to get block_count and block_size,
+/// then compares against the device size. Returns true if the filesystem already
+/// spans the full device, meaning resize2fs would be a no-op. This avoids the
+/// ~5ms cost of spawning resize2fs on every subsequent boot.
+///
+/// Returns false (conservative, triggers resize path) on any error: unformatted
+/// device, non-ext4 filesystem, corrupt superblock, or I/O failure.
+fn ext4_already_full_size(device: &str) -> bool {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = match File::open(device) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+
+    // For block devices, metadata().len() returns 0. Use seek to find size.
+    let dev_size = match f.seek(SeekFrom::End(0)) {
+        Ok(s) if s > 0 => s,
+        _ => return false,
+    };
+
+    // ext4 superblock starts at byte offset 1024. We need:
+    //   offset  4: s_blocks_count_lo (4 bytes)
+    //   offset 24: s_log_block_size  (4 bytes)
+    //   offset 56: s_magic           (2 bytes) — must be 0xEF53
+    let mut sb = [0u8; 64];
+    if f.seek(SeekFrom::Start(1024)).is_err() || f.read_exact(&mut sb).is_err() {
+        return false;
+    }
+
+    // Validate ext4 magic number before trusting any fields.
+    let magic = u16::from_le_bytes([sb[56], sb[57]]);
+    if magic != 0xEF53 {
+        return false;
+    }
+
+    let log_block_size = u32::from_le_bytes([sb[24], sb[25], sb[26], sb[27]]);
+    // Sanity check: log_block_size > 6 means block_size > 64 MB, not valid ext4.
+    if log_block_size > 6 {
+        return false;
+    }
+    let block_size: u64 = 1024u64 << log_block_size;
+
+    let blocks_lo = u32::from_le_bytes([sb[4], sb[5], sb[6], sb[7]]) as u64;
+    let fs_size = blocks_lo * block_size;
+
+    // Allow 1 block of slack — filesystem may not use the very last block.
+    // Note: only uses s_blocks_count_lo (sufficient for disks up to 16 TB at 4K blocks).
+    fs_size + block_size >= dev_size
+}
+
+#[cfg(target_os = "linux")]
+/// Check /proc/mounts to see if anything is mounted at the given path.
+fn is_mounted_at(mount_point: &str) -> bool {
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        return mounts
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some(mount_point));
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+/// Create required subdirectories under the storage mount point.
+fn create_storage_dirs(mount_point: &str) {
+    let dirs = [
+        "layers",
+        "configs",
+        "manifests",
+        "overlays",
+        "workspace",
+        "containers/run",
+        "containers/logs",
+        "containers/exit",
+        "containers/crun",
+    ];
+    for dir in dirs {
+        let _ = std::fs::create_dir_all(std::path::Path::new(mount_point).join(dir));
+    }
+}
+
+/// Mount ext4 /dev/vda at /storage using direct syscall (avoids ~3-5ms fork+exec).
+#[cfg(target_os = "linux")]
+fn try_mount_storage_ext4() -> bool {
+    let dev = cstr("/dev/vda");
+    let mnt = cstr("/storage");
+    let ext4 = cstr("ext4");
+    // SAFETY: mount /dev/vda as ext4 at /storage with noatime
+    unsafe {
+        libc::mount(
+            dev.as_ptr(),
+            mnt.as_ptr(),
+            ext4.as_ptr(),
+            libc::MS_NOATIME,
+            std::ptr::null(),
+        ) == 0
+    }
+}
+
+/// Mount the storage disk at /storage. Returns true if successfully mounted.
+///
+/// Three-attempt fallback chain:
+/// 1. resize + mount (works on subsequent boots with Linux-native FS)
+/// 2. fsck + resize + mount (may fix minor corruption)
+/// 3. mkfs + mount (first boot from macOS template, or unrecoverable)
+#[cfg(target_os = "linux")]
+fn mount_storage_disk() -> bool {
+    use std::process::Command;
+
+    const STORAGE_DEVICE: &str = "/dev/vda";
+    const STORAGE_MOUNT: &str = "/storage";
+
+    // Create mount point if needed
+    let _ = std::fs::create_dir_all(STORAGE_MOUNT);
+
+    // Check if device exists
+    if !std::path::Path::new(STORAGE_DEVICE).exists() {
+        let dev_path = cstr(STORAGE_DEVICE);
+        // SAFETY: mknod with block device type, major 253 minor 0
+        unsafe {
+            libc::mknod(
+                dev_path.as_ptr(),
+                libc::S_IFBLK | 0o660,
+                libc::makedev(253, 0),
+            );
+        }
+    }
+
+    // Check if already mounted (pre-mounted during setup_persistent_rootfs)
+    if is_mounted_at(STORAGE_MOUNT) {
+        debug!("storage already mounted at /storage");
+        create_storage_dirs(STORAGE_MOUNT);
+        return true;
+    }
+
+    // --- Attempt 1: resize (if needed) + mount (works on subsequent boots) ---
+    let resized =
+        ext4_already_full_size(STORAGE_DEVICE) || resize_ext4_if_needed(STORAGE_DEVICE, "storage");
+    if resized && try_mount_storage_ext4() {
+        info!("storage disk mounted after resize");
+        create_storage_dirs(STORAGE_MOUNT);
+        return true;
+    }
+
+    // --- Attempt 2: fsck + resize + mount ---
+    if resized {
+        warn!("mount failed after resize, attempting fsck repair");
+    } else {
+        warn!("resize failed, attempting fsck repair before mount");
+    }
+
+    let fsck_ok = match Command::new("fsck.ext4")
+        .args(["-y", "-f", STORAGE_DEVICE])
+        .status()
+    {
+        Ok(status) => {
+            let code = status.code().unwrap_or(-1);
+            if code <= 1 {
+                info!(exit_code = code, "fsck completed");
+                true
+            } else {
+                warn!(exit_code = code, "fsck could not fully repair filesystem");
+                false
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "fsck.ext4 not available");
+            false
+        }
+    };
+
+    if fsck_ok {
+        let _ = resize_ext4_if_needed(STORAGE_DEVICE, "storage");
+        if try_mount_storage_ext4() {
+            info!("storage disk mounted after fsck repair");
+            create_storage_dirs(STORAGE_MOUNT);
+            return true;
+        }
+        warn!("mount still failed after fsck, will format");
+    }
+
+    // --- Attempt 3: mkfs (last resort, destroys data) ---
+    info!("formatting storage disk (first boot or unrecoverable)");
+    match Command::new("mkfs.ext4")
+        .args(["-F", "-q", "-O", "^has_journal", STORAGE_DEVICE])
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            error!(exit_code = status.code().unwrap_or(-1), "mkfs.ext4 failed");
+            return false;
+        }
+        Err(e) => {
+            error!(error = %e, "mkfs.ext4 not available");
+            return false;
+        }
+    }
+
+    if try_mount_storage_ext4() {
+        info!("storage disk mounted after format");
+        create_storage_dirs(STORAGE_MOUNT);
+        return true;
+    }
+
+    error!("CRITICAL: could not mount storage disk after all recovery attempts");
+    false
+}
+
+/// Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+fn mount_storage_disk() -> bool {
+    false
+}
+
+/// Most requests doing real work at once (exec, run, file transfer, pull…).
+/// Bounds the load on the vsock channel. Taken per request, not per
+/// connection, so a held-open exec stream occupies a slot only while it runs.
+const MAX_CONCURRENT_WORK: usize = 32;
+
+/// Most connection threads at once. Above [`MAX_CONCURRENT_WORK`], so the
+/// host's liveness pings are still accepted and answered when every work slot
+/// is taken: with the old per-connection limit, 8 open exec streams starved
+/// the ping and the machine read as not running.
+const MAX_CONNECTION_THREADS: usize = 64;
+
+/// Work slots shared by every connection.
+static WORK_SLOTS: std::sync::LazyLock<ConnectionSemaphore> =
+    std::sync::LazyLock::new(|| ConnectionSemaphore::new(MAX_CONCURRENT_WORK));
+
+/// Whether a request waits for a work slot. Liveness pings and shutdown never
+/// queue behind real work.
+fn needs_work_slot(request: &AgentRequest) -> bool {
+    !matches!(request, AgentRequest::Ping | AgentRequest::Shutdown { .. })
+}
+
+/// A counting semaphore for bounding concurrent connection handlers.
+struct ConnectionSemaphore {
+    inner: std::sync::Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+}
+
+impl ConnectionSemaphore {
+    fn new(n: usize) -> Self {
+        Self {
+            inner: std::sync::Arc::new((std::sync::Mutex::new(n), std::sync::Condvar::new())),
+        }
+    }
+
+    fn acquire(&self) -> ConnectionPermit {
+        let (lock, cvar) = &*self.inner;
+        let mut count = lock.lock().unwrap();
+        while *count == 0 {
+            count = cvar.wait(count).unwrap();
+        }
+        *count -= 1;
+        ConnectionPermit {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+/// RAII guard that releases a semaphore slot when dropped.
+struct ConnectionPermit {
+    inner: std::sync::Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.inner;
+        *lock.lock().unwrap() += 1;
+        cvar.notify_one();
+    }
+}
+
+/// Run the vsock server with a pre-created listener.
+/// The listener is created early (before initialization) to ensure the kernel
+/// has a listener ready when the host connects.
+fn run_server_with_listener(
+    listener: vsock::VsockListener,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut first_connection = true;
+    let listen_start = uptime_ms();
+    let semaphore = std::sync::Arc::new(ConnectionSemaphore::new(MAX_CONNECTION_THREADS));
+
+    info!(uptime_ms = uptime_ms(), "entering vsock accept loop");
+
+    loop {
+        // Reap any exited background children to prevent zombie accumulation.
+        reap_background_children();
+
+        match listener.accept() {
+            Ok(mut stream) => {
+                if first_connection {
+                    info!(
+                        wait_for_first_connection_ms = uptime_ms() - listen_start,
+                        uptime_ms = uptime_ms(),
+                        "first connection accepted"
+                    );
+                    first_connection = false;
+                }
+                info!("accepted connection");
+
+                // Acquire a thread slot before spawning; blocks only if
+                // MAX_CONNECTION_THREADS threads are already running. Real work
+                // is bounded separately, per request (see WORK_SLOTS).
+                let permit = semaphore.acquire();
+
+                // Service the connection in its own thread so a long-running
+                // exec doesn't block subsequent requests on the same listener.
+                // Before this landed, a single held-open `machine exec` would
+                // stall the 250ms state probe, flip the VM to Unreachable,
+                // and make every following exec fail with "not running".
+                std::thread::spawn(move || {
+                    let _permit = permit;
+                    if let Err(e) = handle_connection(&mut stream) {
+                        warn!(error = %e, "connection error");
+                    }
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, "accept error");
+            }
+        }
+    }
+}
+
+/// Patch `timeout_ms` on request variants where serde may have silently dropped
+/// the field due to the flatten + internally-tagged enum limitation.
+/// Re-extracts the value from the raw JSON payload.
+fn patch_timeout_ms(request: &mut AgentRequest, raw: &[u8]) {
+    let needs_patch = matches!(
+        request,
+        AgentRequest::VmExec {
+            timeout_ms: None,
+            ..
+        } | AgentRequest::Run {
+            timeout_ms: None,
+            ..
+        }
+    );
+    if !needs_patch {
+        return;
+    }
+
+    if let Ok(map) = serde_json::from_slice::<serde_json::Value>(raw) {
+        if let Some(ms) = map.get("timeout_ms").and_then(|v| v.as_u64()) {
+            match request {
+                AgentRequest::VmExec { timeout_ms, .. } | AgentRequest::Run { timeout_ms, .. } => {
+                    *timeout_ms = Some(ms);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Handle a single connection.
+/// Replay host-originated filesystem changes as guest fsnotify events.
+///
+/// Writes one `"<mask_hex> <path>\n"` line per event to `/proc/smolvm-fsnotify`
+/// (provided by the libkrunfw kernel patch), which resolves the path and fires
+/// the matching fsnotify event on the guest inode. Because the container's view
+/// of a `-v` mount is a bind of the same virtiofs inode, a watcher inside the
+/// container wakes up exactly as if the change had happened in the guest.
+///
+/// Best-effort: a path that no longer resolves (e.g. a delete arriving after the
+/// host watcher already saw the unlink) is skipped, not fatal. Returns the count
+/// of events that fired.
+fn handle_fsnotify(events: &[FsNotifyEvent]) -> AgentResponse {
+    const PROC_PATH: &str = "/proc/smolvm-fsnotify";
+
+    let mut file = match std::fs::OpenOptions::new().write(true).open(PROC_PATH) {
+        Ok(f) => f,
+        Err(e) => {
+            // Kernel without the patch (older libkrunfw): degrade gracefully so
+            // hosts on new + old kernels both work — the mount still serves
+            // reads, only event delivery is unavailable.
+            debug!(error = %e, "fsnotify inject unavailable ({PROC_PATH} missing)");
+            return AgentResponse::ok_with_data(
+                serde_json::json!({ "fired": 0, "supported": false }),
+            );
+        }
+    };
+
+    let mut fired = 0u32;
+    for ev in events {
+        // Each write() is one event; the kernel handler parses exactly one line.
+        let line = format!("{:x} {}\n", ev.mask, ev.path);
+        match file.write_all(line.as_bytes()) {
+            Ok(()) => fired += 1,
+            Err(e) => {
+                debug!(path = %ev.path, mask = ev.mask, error = %e, "fsnotify inject skipped")
+            }
+        }
+    }
+
+    AgentResponse::ok_with_data(serde_json::json!({ "fired": fired, "supported": true }))
+}
+
+fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::error::Error>> {
+    let mut buf = vec![0u8; REQUEST_BUFFER_SIZE];
+
+    // Per-connection streaming-upload session. `Option<WriteSession>`
+    // guarantees cleanup via Drop when the connection closes, when
+    // the session is replaced, or when a protocol violation (e.g.,
+    // another request type arriving mid-stream) takes it.
+    let mut write_session: Option<WriteSession> = None;
+
+    loop {
+        // Read length header
+        let mut header = [0u8; 4];
+        match stream.read_exact(&mut header) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                debug!("connection closed");
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        let len = u32::from_be_bytes(header) as usize;
+
+        // Validate message size to prevent DoS via memory exhaustion
+        if len > MAX_MESSAGE_SIZE {
+            warn!(
+                len = len,
+                max = MAX_MESSAGE_SIZE,
+                "message too large, rejecting"
+            );
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("message size {} exceeds maximum {}", len, MAX_MESSAGE_SIZE),
+                    error_codes::MESSAGE_TOO_LARGE,
+                ),
+            )?;
+            continue;
+        }
+
+        if len > buf.len() {
+            buf.resize(len, 0);
+        }
+
+        // Read payload
+        stream.read_exact(&mut buf[..len])?;
+
+        // Parse request (Envelope wraps the request with an optional trace_id).
+        // Falls back to bare AgentRequest for backward compatibility with old hosts.
+        let (mut request, trace_id) =
+            match serde_json::from_slice::<Envelope<AgentRequest>>(&buf[..len]) {
+                Ok(env) => (env.body, env.trace_id),
+                Err(_) => match serde_json::from_slice::<AgentRequest>(&buf[..len]) {
+                    Ok(req) => (req, None),
+                    Err(e) => {
+                        warn!(error = %e, "invalid request");
+                        send_response(
+                            stream,
+                            &AgentResponse::error(
+                                format!("invalid request: {}", e),
+                                error_codes::INVALID_REQUEST,
+                            ),
+                        )?;
+                        continue;
+                    }
+                },
+            };
+
+        // Work around serde flatten + internally-tagged enum limitation:
+        // fields with #[serde(default)] can be silently dropped during
+        // deserialization. Re-extract timeout_ms from the raw JSON.
+        patch_timeout_ms(&mut request, &buf[..len]);
+
+        let _span = if let Some(ref tid) = trace_id {
+            tracing::info_span!("request", trace_id = %tid, method = %request.log_summary())
+        } else {
+            tracing::info_span!("request", method = %request.log_summary())
+        };
+        let _guard = _span.enter();
+
+        debug!(method = %request.log_summary(), "received request");
+
+        // A fork clone resumes this already-initialized agent with fresh
+        // virtiofs devices. Repair hidden/stale boot mounts before replying to
+        // even a Ping, so fork readiness cannot race the inherited workload's
+        // first access to a dead golden mount (notably /opt/smolvm-ring).
+        if let Err(error) = storage::repair_boot_volume_mounts() {
+            warn!(%error, "failed to restore boot volume mounts");
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("restore boot volume mounts: {error}"),
+                    error_codes::INTERNAL_ERROR,
+                ),
+            )?;
+            continue;
+        }
+
+        // A Stdin/Resize frame at the TOP level is a stray leftover from a
+        // just-ended interactive session: that session's async FrameWriter can
+        // flush a still-queued EOF-stdin or resize frame during teardown, after
+        // the session's own request/response already completed. It has no
+        // interactive session to apply to (interactive Run/VmExec/PodStart
+        // consume their own stdin/resize internally), and it is fire-and-forget
+        // — the host never awaits a response to it. Drop it silently; replying
+        // with an error here instead desynchronizes the stream, because the host
+        // reads that error as the response to its NEXT request (e.g. a detached
+        // workload launch during a remote-volume start), failing it spuriously.
+        if matches!(
+            &request,
+            AgentRequest::Stdin { .. } | AgentRequest::Resize { .. }
+        ) {
+            debug!("ignoring stray stdin/resize outside an interactive session");
+            continue;
+        }
+
+        // Held until this request is answered; released before the next one
+        // on the same connection is read.
+        let _work = needs_work_slot(&request).then(|| WORK_SLOTS.acquire());
+
+        if let AgentRequest::Shutdown { progress } = request {
+            shutdown::respond(stream, progress, || {
+                // Serialize shutdown requests without blocking progress for a
+                // second caller waiting for the first flush to finish.
+                static FLUSH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+                let _guard = FLUSH
+                    .lock()
+                    .map_err(|_| std::io::Error::other("storage synchronization lock poisoned"))?;
+                shutdown_freeze::freeze_internal_filesystems()
+            })?;
+            return Ok(());
+        }
+
+        // Check if this is an interactive run request
+        if let AgentRequest::Run {
+            interactive: true, ..
+        }
+        | AgentRequest::Run { tty: true, .. } = &request
+        {
+            // Handle interactive session
+            handle_interactive_run(stream, request)?;
+            continue;
+        }
+
+        // Detached run — start container in background and return its container ID.
+        if let AgentRequest::Run { detached: true, .. } = &request {
+            handle_run_detached(stream, request)?;
+            continue;
+        }
+
+        // Check if this is an interactive VM exec request
+        if let AgentRequest::VmExec {
+            interactive: true, ..
+        }
+        | AgentRequest::VmExec { tty: true, .. } = &request
+        {
+            // Handle interactive VM exec session
+            handle_interactive_vm_exec(stream, request)?;
+            continue;
+        }
+
+        // PodStart streams the pod container's (or exec process's) I/O on
+        // this connection — Started → Stdout/Stderr → Exited, with Stdin and
+        // Resize handled by the interactive pumps — like interactive Run.
+        if let AgentRequest::PodStart { .. } = &request {
+            pod::handle_pod_start(stream, request)?;
+            continue;
+        }
+
+        // Handle Pull with progress streaming
+        if let AgentRequest::Pull {
+            ref image,
+            ref oci_platform,
+            ref auth,
+            ref proxy,
+            ref no_proxy,
+        } = request
+        {
+            handle_streaming_pull(
+                stream,
+                image,
+                oci_platform.as_deref(),
+                auth.as_ref(),
+                proxy.as_deref(),
+                no_proxy.as_deref(),
+            )?;
+            continue;
+        }
+
+        // Handle ExportLayer with chunked streaming
+        if let AgentRequest::ExportLayer {
+            ref image_digest,
+            layer_index,
+        } = request
+        {
+            handle_streaming_export_layer(stream, image_digest, layer_index)?;
+            continue;
+        }
+
+        // Handle FileRead with chunked streaming (replaces the old
+        // single-shot FileData path that capped files at ~16 MiB).
+        if let AgentRequest::FileRead { ref path } = request {
+            handle_streaming_file_read(stream, path)?;
+            continue;
+        }
+
+        if let AgentRequest::ArchiveDirectory { ref path } = request {
+            handle_streaming_archive_directory(stream, path)?;
+            continue;
+        }
+
+        if let AgentRequest::FlattenLayers {
+            ref lowerdirs,
+            output: None,
+        } = request
+        {
+            handle_streaming_flatten_layers(stream, lowerdirs)?;
+            continue;
+        }
+
+        // Streaming file upload: Begin opens a session, Chunk appends
+        // or finalizes. Any other request type closes the session
+        // implicitly (Drop runs on the Option assignment to None).
+        if let AgentRequest::FileWriteBegin {
+            path,
+            mode,
+            uid,
+            gid,
+            total_size,
+        } = request
+        {
+            // Drop any leftover session now (Drop cleans its tmp file) before
+            // starting a new one. `take()` makes the drop explicit and keeps the
+            // value from looking like a dead store.
+            let _ = write_session.take();
+            let (new_session, response) = handle_file_write_begin(path, mode, uid, gid, total_size);
+            write_session = new_session;
+            send_response(stream, &response)?;
+            continue;
+        }
+        if let AgentRequest::FileWriteChunk { data, done } = request {
+            let (new_session, response) =
+                handle_file_write_chunk(write_session.take(), &data, done);
+            write_session = new_session;
+            send_response(stream, &response)?;
+            continue;
+        }
+
+        // Any other request mid-session is a protocol error. Drop the
+        // session (Drop cleans the staging file) and proceed — the
+        // operator's new request is honored rather than failed; the
+        // alternative (error out) buys no safety since the drop
+        // already handled cleanup.
+        if write_session.is_some() {
+            debug!(
+                method = %request.log_summary(),
+                "dropping in-flight FileWrite session: non-chunk request arrived"
+            );
+            write_session = None;
+        }
+
+        // Handle regular request. Pass the stream's fd so long-running
+        // commands (exec, run) can detect client disconnect and kill their
+        // children instead of blocking the accept loop.
+        let client_fd = stream.as_raw_fd();
+        let response = handle_request(request, Some(client_fd));
+
+        // Check for client disconnection BEFORE writing — if the peer is gone,
+        // write_all may succeed (kernel buffers) but the next read_exact would
+        // block forever waiting for bytes that will never arrive. Close the
+        // connection now and let the accept loop pick up the next client.
+        if process::is_peer_closed(client_fd) {
+            debug!("client disconnected during request, closing connection");
+            return Ok(());
+        }
+
+        if let Err(e) = send_response(stream, &response) {
+            debug!(error = %e, "send_response failed (client disconnected?)");
+            return Ok(());
+        }
+
+        // Check for shutdown
+        if matches!(response, AgentResponse::Ok { .. }) {
+            if let AgentResponse::Ok { data: Some(ref d) } = response {
+                if d.get("shutdown").and_then(|v| v.as_bool()) == Some(true) {
+                    info!("shutdown requested");
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// Handle a single non-interactive request.
+///
+/// `client_fd` is the vsock file descriptor of the requesting client. It's
+/// used by long-running handlers (Run, VmExec) to detect when the client
+/// disconnects so the child process can be killed promptly — freeing the
+/// accept loop for the next request instead of waiting for the orphan.
+fn handle_request(
+    request: AgentRequest,
+    client_fd: Option<std::os::unix::io::RawFd>,
+) -> AgentResponse {
+    // Ensure storage is mounted for operations that need it.
+    // Ping, NetworkTest, VmExec, and Shutdown don't access /storage.
+    match &request {
+        AgentRequest::Ping
+        | AgentRequest::NetworkTest { .. }
+        | AgentRequest::VmExec { .. }
+        | AgentRequest::Shutdown { .. } => {}
+        _ => {
+            ensure_storage_mounted();
+        }
+    }
+
+    match request {
+        AgentRequest::Ping => {
+            let capabilities = vec![
+                smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string(),
+                smolvm_protocol::QUIESCED_SHUTDOWN_CAPABILITY.to_string(),
+            ];
+            AgentResponse::Pong {
+                version: PROTOCOL_VERSION,
+                capabilities,
+            }
+        }
+
+        AgentRequest::FsNotify { events } => handle_fsnotify(&events),
+
+        // Pull is handled separately in handle_streaming_pull for progress streaming
+        AgentRequest::Pull { .. } => unreachable!("Pull handled before match"),
+
+        AgentRequest::Query { image } => handle_query(&image),
+
+        AgentRequest::ListImages => handle_list_images(),
+
+        AgentRequest::GarbageCollect { dry_run, purge_all } => handle_gc(dry_run, purge_all),
+
+        AgentRequest::PrepareOverlay { image, workload_id } => {
+            handle_prepare_overlay(&image, &workload_id)
+        }
+
+        AgentRequest::CleanupOverlay { workload_id } => handle_cleanup_overlay(&workload_id),
+
+        AgentRequest::FormatStorage => handle_format_storage(),
+
+        AgentRequest::ListDirectory { path } => handle_list_directory(&path),
+
+        AgentRequest::StorageStatus => handle_storage_status(),
+        AgentRequest::MemoryStatus => handle_memory_status(),
+
+        AgentRequest::BranchpointWait { timeout_ms } => {
+            let markers = branchpoint::Markers::standard();
+            match branchpoint::wait_ready(&markers, std::time::Duration::from_millis(timeout_ms)) {
+                Ok(contents) => AgentResponse::Ok {
+                    data: Some(serde_json::json!({ "contents": contents })),
+                },
+                Err(e) => branchpoint_error(e),
+            }
+        }
+        AgentRequest::BranchpointArm => {
+            branchpoint_outcome(branchpoint::arm(&branchpoint::Markers::standard()))
+        }
+        AgentRequest::BranchpointPark => {
+            branchpoint_outcome(branchpoint::park(&branchpoint::Markers::standard()))
+        }
+        AgentRequest::BranchpointRelease { env_dotenv } => branchpoint_outcome(
+            branchpoint::release(&branchpoint::Markers::standard(), env_dotenv.as_deref()),
+        ),
+        AgentRequest::BranchpointActivate {
+            env_dotenv,
+            env_sourceable,
+            env_path,
+            branch_env_path,
+            require_dir,
+            env_dir,
+            activation_token,
+        } => match branchpoint::activate(
+            &branchpoint::Markers::standard(),
+            &env_dotenv,
+            &env_sourceable,
+            std::path::Path::new(&env_path),
+            std::path::Path::new(&branch_env_path),
+            require_dir.as_deref().map(std::path::Path::new),
+            std::path::Path::new(&env_dir),
+            &activation_token,
+        ) {
+            Ok(outcome) => AgentResponse::Ok {
+                data: Some(serde_json::json!({
+                    "already_done": matches!(outcome, branchpoint::Activation::AlreadyDone)
+                })),
+            },
+            Err(e) => branchpoint_error(e),
+        },
+        AgentRequest::BranchpointWaitWorkerReady { token, timeout_ms } => {
+            branchpoint_outcome(branchpoint::wait_worker_ready(
+                &branchpoint::Markers::standard(),
+                &token,
+                std::time::Duration::from_millis(timeout_ms),
+            ))
+        }
+        AgentRequest::FlattenLayers { lowerdirs, output } => match output {
+            Some(output) => handle_flatten_layers(&lowerdirs, &output),
+            // Streaming goes through `handle_connection`'s explicit dispatch so
+            // it can emit multiple responses per request.
+            None => AgentResponse::error(
+                "streaming flatten must be handled at connection level",
+                error_codes::INTERNAL_ERROR,
+            ),
+        },
+
+        AgentRequest::NetworkTest { url } => {
+            info!(url = %url, "testing network connectivity directly from agent");
+
+            // Extract host:port for TCP test from URL
+            let tcp_target = extract_host_port(&url).unwrap_or_else(|| "1.1.1.1:80".to_string());
+
+            // Test 1: Pure syscall TCP connect test (bypass C library)
+            let syscall_result = test_tcp_syscall(&tcp_target);
+
+            // Test 2: Try wget (busybox/musl)
+            let wget_result = match std::process::Command::new("wget")
+                .args(["-q", "-O-", "-T", "10", &url])
+                .output()
+            {
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    serde_json::json!({
+                        "tool": "wget",
+                        "success": output.status.success(),
+                        "exit_code": output.status.code(),
+                        "stdout_len": output.stdout.len(),
+                        "stderr": stderr,
+                    })
+                }
+                Err(e) => serde_json::json!({
+                    "tool": "wget",
+                    "error": format!("{}", e),
+                }),
+            };
+
+            // Test 3: Try crane (Go static binary) - fetch manifest
+            let crane_result = match std::process::Command::new("crane")
+                .args(["manifest", "alpine:latest"])
+                .env("HOME", "/root")
+                .output()
+            {
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    serde_json::json!({
+                        "tool": "crane",
+                        "success": output.status.success(),
+                        "exit_code": output.status.code(),
+                        "stdout_len": output.stdout.len(),
+                        "stderr": stderr,
+                    })
+                }
+                Err(e) => serde_json::json!({
+                    "tool": "crane",
+                    "error": format!("{}", e),
+                }),
+            };
+
+            AgentResponse::Ok {
+                data: Some(serde_json::json!({
+                    "syscall_tcp": syscall_result,
+                    "wget": wget_result,
+                    "crane": crane_result,
+                })),
+            }
+        }
+
+        AgentRequest::Shutdown { .. } => AgentResponse::error(
+            "shutdown must use the connection-level quiescence handler",
+            error_codes::INTERNAL_ERROR,
+        ),
+
+        // VM-level background exec — spawn and return PID immediately
+        AgentRequest::VmExec {
+            command,
+            env,
+            workdir,
+            background: true,
+            ..
+        } => handle_vm_exec_background(&command, &env, workdir.as_deref()),
+
+        // VM-level exec (direct command execution in VM, not container)
+        AgentRequest::VmExec {
+            command,
+            env,
+            workdir,
+            timeout_ms,
+            interactive: false,
+            tty: false,
+            stdin_data,
+            ..
+        } => handle_vm_exec(
+            &command,
+            &env,
+            workdir.as_deref(),
+            timeout_ms,
+            client_fd,
+            stdin_data.as_deref(),
+        ),
+
+        AgentRequest::VmExec { .. } => {
+            // Interactive mode should be handled by handle_interactive_vm_exec
+            AgentResponse::error(
+                "interactive VM exec not handled here",
+                error_codes::INTERNAL_ERROR,
+            )
+        }
+
+        AgentRequest::Run {
+            image,
+            command,
+            env,
+            workdir,
+            user,
+            mounts,
+            timeout_ms,
+            interactive: false,
+            tty: false,
+            detached: false,
+            unprivileged,
+            persistent_overlay_id,
+            stdin_data,
+            background,
+            s3_volumes,
+        } => {
+            if background {
+                handle_run_background(
+                    &image,
+                    &command,
+                    &env,
+                    workdir.as_deref(),
+                    user.as_deref(),
+                    &mounts,
+                    persistent_overlay_id.as_deref(),
+                    unprivileged,
+                    &s3_volumes,
+                )
+            } else {
+                handle_run(
+                    &image,
+                    &command,
+                    &env,
+                    workdir.as_deref(),
+                    user.as_deref(),
+                    &mounts,
+                    timeout_ms,
+                    persistent_overlay_id.as_deref(),
+                    stdin_data.as_deref(),
+                    client_fd,
+                    unprivileged,
+                    &s3_volumes,
+                )
+            }
+        }
+
+        AgentRequest::Run { .. } => {
+            // Interactive mode should be handled by handle_interactive_run
+            AgentResponse::error(
+                "interactive mode not handled here",
+                error_codes::INTERNAL_ERROR,
+            )
+        }
+
+        AgentRequest::Stdin { .. } | AgentRequest::Resize { .. } => AgentResponse::error(
+            "stdin/resize only valid during interactive session",
+            error_codes::INVALID_REQUEST,
+        ),
+
+        AgentRequest::ExportLayer { .. } => {
+            // Streaming export is handled by handle_streaming_export_layer
+            AgentResponse::error("export layer not handled here", error_codes::INTERNAL_ERROR)
+        }
+
+        AgentRequest::FileWrite {
+            path,
+            data,
+            mode,
+            uid,
+            gid,
+        } => handle_file_write(&path, &data, mode, uid, gid),
+
+        // Streaming uploads go through `handle_connection`'s
+        // per-connection session state so they can't land here.
+        AgentRequest::FileWriteBegin { .. } | AgentRequest::FileWriteChunk { .. } => {
+            AgentResponse::error(
+                "streaming file write must be handled at connection level",
+                error_codes::INTERNAL_ERROR,
+            )
+        }
+
+        // Streaming read goes through `handle_connection`'s explicit
+        // dispatch so it can emit multiple responses per request.
+        AgentRequest::FileRead { .. } | AgentRequest::ArchiveDirectory { .. } => {
+            AgentResponse::error(
+                "streaming read must be handled at connection level",
+                error_codes::INTERNAL_ERROR,
+            )
+        }
+
+        // Pod-container lifecycle (containerd shim v2 datapath, see pod.rs).
+        AgentRequest::PodCreate {
+            id,
+            rootfs_rel,
+            spec_json,
+            tty,
+        } => pod::handle_pod_create(&id, &rootfs_rel, &spec_json, tty),
+
+        // PodStart streams on the connection; routed in handle_connection.
+        AgentRequest::PodStart { .. } => AgentResponse::error(
+            "pod start must be handled at connection level",
+            error_codes::INTERNAL_ERROR,
+        ),
+
+        AgentRequest::PodExec {
+            id,
+            exec_id,
+            process_json,
+            tty,
+        } => pod::handle_pod_exec(&id, &exec_id, &process_json, tty),
+
+        AgentRequest::PodSignal {
+            id,
+            exec_id,
+            signal,
+            all,
+        } => pod::handle_pod_signal(&id, exec_id.as_deref(), signal, all),
+
+        AgentRequest::PodPids { id } => pod::handle_pod_pids(&id),
+
+        AgentRequest::PodStats { id } => pod::handle_pod_stats(&id),
+
+        AgentRequest::PodDelete { id, exec_id } => pod::handle_pod_delete(&id, exec_id.as_deref()),
+    }
+}
+
+// ============================================================================
+// File I/O Handlers
+// ============================================================================
+
+/// Unique-per-call staging suffix. Using the PID + a counter avoids
+/// collisions when two connections write to the same path and avoids
+/// the predictable-filename class of symlink races.
+fn staging_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(".smolvm-upload.{}.{}", std::process::id(), n)
+}
+
+/// Ensure `path`'s parent exists, returning an AgentResponse on error
+/// (so the two file-write entry points don't duplicate this block).
+fn ensure_parent_dir(path: &std::path::Path) -> std::result::Result<(), AgentResponse> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Err(AgentResponse::error(
+                    format!("failed to create directory {}: {}", parent.display(), e),
+                    error_codes::FILE_IO_FAILED,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply a Unix mode, logging but not failing if the permissions
+/// can't be set (matches prior single-shot behavior).
+#[cfg(unix)]
+fn apply_mode_best_effort(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+        info!(path = %path.display(), error = %e, "failed to set file mode (non-fatal)");
+    }
+}
+#[cfg(not(unix))]
+fn apply_mode_best_effort(_path: &std::path::Path, _mode: u32) {}
+
+#[derive(Clone, Copy, Debug)]
+enum FilePathAccess {
+    Read,
+    Write,
+}
+
+fn invalid_guest_path_error(path: &str, reason: &str) -> AgentResponse {
+    AgentResponse::error(
+        format!("invalid guest path {}: {}", path, reason),
+        error_codes::INVALID_REQUEST,
+    )
+}
+
+fn normalize_guest_path(path: &str) -> std::result::Result<String, AgentResponse> {
+    if path.is_empty() {
+        return Err(invalid_guest_path_error(path, "path is empty"));
+    }
+
+    let normalized = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{}", path)
+    };
+
+    let p = std::path::Path::new(&normalized);
+    for component in p.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(invalid_guest_path_error(
+                    path,
+                    "parent traversal is not allowed",
+                ));
+            }
+            std::path::Component::CurDir => {
+                return Err(invalid_guest_path_error(
+                    path,
+                    "current-dir segments are not allowed",
+                ));
+            }
+            std::path::Component::Prefix(_) => {
+                return Err(invalid_guest_path_error(
+                    path,
+                    "path prefixes are not allowed",
+                ));
+            }
+            std::path::Component::RootDir | std::path::Component::Normal(_) => {}
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn active_persistent_overlay_merged_root() -> Option<std::path::PathBuf> {
+    let overlays_dir = std::path::Path::new("/storage/overlays");
+    let entries = std::fs::read_dir(overlays_dir).ok()?;
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("persistent-")
+        {
+            continue;
+        }
+        let merged = entry.path().join("merged");
+        if merged.join("bin").exists() || merged.join("usr").exists() {
+            return Some(merged);
+        }
+    }
+    None
+}
+
+fn ensure_descendant_after_canonicalize(
+    path: &std::path::Path,
+    root: &std::path::Path,
+    original_path: &str,
+    access: FilePathAccess,
+) -> std::result::Result<(), AgentResponse> {
+    if matches!(access, FilePathAccess::Write) && !root.exists() {
+        std::fs::create_dir_all(root).map_err(|e| {
+            AgentResponse::error(
+                format!("failed to create root {}: {}", root.display(), e),
+                error_codes::FILE_IO_FAILED,
+            )
+        })?;
+    }
+
+    let root_canon = root.canonicalize().map_err(|e| {
+        AgentResponse::error(
+            format!("failed to canonicalize root {}: {}", root.display(), e),
+            error_codes::FILE_IO_FAILED,
+        )
+    })?;
+
+    match access {
+        FilePathAccess::Read => {
+            let path_canon = path.canonicalize().map_err(|e| {
+                AgentResponse::error(
+                    format!("failed to canonicalize target {}: {}", original_path, e),
+                    error_codes::FILE_IO_FAILED,
+                )
+            })?;
+            if !path_canon.starts_with(&root_canon) {
+                return Err(invalid_guest_path_error(
+                    original_path,
+                    "resolved path escapes allowed root",
+                ));
+            }
+        }
+        FilePathAccess::Write => {
+            let parent = path.parent().ok_or_else(|| {
+                invalid_guest_path_error(original_path, "target has no parent directory")
+            })?;
+
+            std::fs::create_dir_all(parent).map_err(|e| {
+                AgentResponse::error(
+                    format!("failed to create directory {}: {}", parent.display(), e),
+                    error_codes::FILE_IO_FAILED,
+                )
+            })?;
+
+            let parent_canon = parent.canonicalize().map_err(|e| {
+                AgentResponse::error(
+                    format!("failed to canonicalize parent {}: {}", parent.display(), e),
+                    error_codes::FILE_IO_FAILED,
+                )
+            })?;
+            if !parent_canon.starts_with(&root_canon) {
+                return Err(invalid_guest_path_error(
+                    original_path,
+                    "resolved parent escapes allowed root",
+                ));
+            }
+
+            if path.exists() {
+                let path_canon = path.canonicalize().map_err(|e| {
+                    AgentResponse::error(
+                        format!("failed to canonicalize target {}: {}", original_path, e),
+                        error_codes::FILE_IO_FAILED,
+                    )
+                })?;
+                if !path_canon.starts_with(&root_canon) {
+                    return Err(invalid_guest_path_error(
+                        original_path,
+                        "resolved path escapes allowed root",
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_guest_io_path_with_roots(
+    path: &str,
+    access: FilePathAccess,
+    overlay_merged_root: Option<&std::path::Path>,
+    workspace_root: &std::path::Path,
+) -> std::result::Result<std::path::PathBuf, AgentResponse> {
+    let normalized = normalize_guest_path(path)?;
+
+    let Some(overlay_root) = overlay_merged_root else {
+        return Ok(std::path::PathBuf::from(normalized));
+    };
+
+    let (target, allowed_root): (std::path::PathBuf, &std::path::Path) = if let Some(relative) =
+        normalized.strip_prefix("/workspace/").or_else(|| {
+            if normalized == "/workspace" {
+                Some("")
+            } else {
+                None
+            }
+        }) {
+        (workspace_root.join(relative), workspace_root)
+    } else {
+        let relative = normalized.strip_prefix('/').unwrap_or(&normalized);
+        (overlay_root.join(relative), overlay_root)
+    };
+
+    ensure_descendant_after_canonicalize(&target, allowed_root, &normalized, access)?;
+    Ok(target)
+}
+
+/// Resolve guest file I/O path with strict boundary checks.
+///
+/// For image-based persistent VMs, paths are mapped into the active
+/// `persistent-*` overlay's `merged` root (except `/workspace`, which
+/// maps to `/storage/workspace`, the bind-mount source). Both read and
+/// write flows enforce canonicalized descendant checks against the
+/// selected root to prevent traversal and symlink escapes.
+fn resolve_guest_io_path(
+    path: &str,
+    access: FilePathAccess,
+) -> std::result::Result<std::path::PathBuf, AgentResponse> {
+    let overlay = active_persistent_overlay_merged_root();
+    resolve_guest_io_path_with_roots(
+        path,
+        access,
+        overlay.as_deref(),
+        std::path::Path::new("/storage/workspace"),
+    )
+}
+
+/// Shared between single-shot [`handle_file_write`] and the streaming
+/// finalize step. The atomic-rename pattern is the thing both paths
+/// need to guarantee: partial contents never appear at `path` under
+/// any error or kill scenario.
+fn install_file_atomic(
+    path: &str,
+    data: &[u8],
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> AgentResponse {
+    let resolved = match resolve_guest_io_path(path, FilePathAccess::Write) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let target = resolved.as_path();
+    if let Err(resp) = ensure_parent_dir(target) {
+        return resp;
+    }
+
+    let tmp_name = format!(
+        "{}{}",
+        target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        staging_suffix()
+    );
+    let tmp_path = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join(&tmp_name))
+        .unwrap_or_else(|| std::path::PathBuf::from(&tmp_name));
+
+    if let Err(e) = std::fs::write(&tmp_path, data) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return AgentResponse::error(
+            format!("failed to write {}: {}", tmp_path.display(), e),
+            error_codes::FILE_IO_FAILED,
+        );
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, target) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return AgentResponse::error(
+            format!("failed to rename onto {}: {}", path, e),
+            error_codes::FILE_IO_FAILED,
+        );
+    }
+
+    if let Some(m) = mode {
+        apply_mode_best_effort(target, m);
+    }
+    // Ownership was requested explicitly, so a failure is an error, not a
+    // best-effort shrug — a non-root workload silently unable to read its own
+    // upload is exactly the bug this exists to prevent.
+    if uid.is_some() || gid.is_some() {
+        if let Err(e) = std::os::unix::fs::chown(target, uid, gid) {
+            return AgentResponse::error(
+                format!("failed to chown {}: {}", path, e),
+                error_codes::FILE_IO_FAILED,
+            );
+        }
+    }
+    info!(path = %path, size = data.len(), "file written");
+    AgentResponse::Ok { data: None }
+}
+
+/// Write a file where the workload will see it (single-shot path).
+///
+/// Routes into the workload container when one is running, so an upload lands in
+/// the filesystem the workload actually reads. Writing in the agent's own
+/// namespace puts the file in the overlay's *upper* layer, beneath a live
+/// overlayfs, where the merged view never picks it up — the upload reported
+/// success and `exec` could not see the file (BUG-240).
+///
+/// With no running workload the local write is correct and is kept: overlayfs
+/// reads `upper` at mount time, so seeding it before the container starts is
+/// exactly how the file becomes visible once it does.
+fn handle_file_write(
+    path: &str,
+    data: &[u8],
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> AgentResponse {
+    match nsfile::GuestNs::for_workload() {
+        nsfile::GuestNs::Container(ns) => match ns.write(path, data, mode, uid, gid) {
+            Ok(()) => AgentResponse::Ok { data: None },
+            Err(e) => AgentResponse::error(
+                format!("failed to write {} in the workload container: {}", path, e),
+                error_codes::FILE_IO_FAILED,
+            ),
+        },
+        // Seeding the VM's own namespace, which `install_file_atomic` maps into
+        // the machine's overlay. Correct with no workload running, and a
+        // deliberate branch rather than a fallthrough.
+        nsfile::GuestNs::Root(_) => install_file_atomic(path, data, mode, uid, gid),
+    }
+}
+
+/// State for an in-progress streaming file upload on one connection.
+///
+/// One session lives inside `handle_connection`'s stack, so it's
+/// scoped to a single client. `Drop` cleans up the staging file if
+/// the connection drops (or the session is replaced) before the
+/// final chunk arrives — this is how we guarantee no partial file
+/// ever appears at the target path.
+struct WriteSession {
+    /// User-requested target path inside the guest.
+    target: std::path::PathBuf,
+    /// Staging file we append to; renamed to `target` on done.
+    tmp_path: std::path::PathBuf,
+    /// Handle we keep open for the lifetime of the session.
+    tmp_file: std::fs::File,
+    /// Permissions to apply after rename.
+    mode: Option<u32>,
+    /// Owner uid to apply after rename.
+    uid: Option<u32>,
+    /// Owner gid to apply after rename.
+    gid: Option<u32>,
+    /// Running total — compared against `total_size` as a DoS guard.
+    bytes_written: u64,
+    /// Caller-declared total; the agent refuses chunks that would
+    /// push `bytes_written` past it.
+    total_size: u64,
+}
+
+impl WriteSession {
+    /// Open a fresh staging file for `target`.
+    fn open(
+        target: std::path::PathBuf,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        total_size: u64,
+    ) -> std::io::Result<Self> {
+        if let Some(parent) = target.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let tmp_name = format!(
+            "{}{}",
+            target
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            staging_suffix()
+        );
+        let tmp_path = target
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.join(&tmp_name))
+            .unwrap_or_else(|| std::path::PathBuf::from(&tmp_name));
+
+        let tmp_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        Ok(Self {
+            target,
+            tmp_path,
+            tmp_file,
+            mode,
+            uid,
+            gid,
+            bytes_written: 0,
+            total_size,
+        })
+    }
+
+    /// Append a chunk; returns AgentResponse on error.
+    fn write_chunk(&mut self, data: &[u8]) -> std::result::Result<(), AgentResponse> {
+        let new_total = self.bytes_written.saturating_add(data.len() as u64);
+        if new_total > self.total_size {
+            return Err(AgentResponse::error(
+                format!(
+                    "chunk overflows declared total_size ({} > {})",
+                    new_total, self.total_size
+                ),
+                error_codes::INVALID_REQUEST,
+            ));
+        }
+        use std::io::Write;
+        if let Err(e) = self.tmp_file.write_all(data) {
+            return Err(AgentResponse::error(
+                format!("failed to write chunk to staging file: {}", e),
+                error_codes::FILE_IO_FAILED,
+            ));
+        }
+        self.bytes_written = new_total;
+        Ok(())
+    }
+
+    /// Fsync, rename onto target, apply mode. Consumes the session.
+    ///
+    /// Takes `&mut self` rather than `self` so we can do a
+    /// `mem::take` on `tmp_path` to disarm the Drop-based cleanup
+    /// after the rename has moved the file onto its final path.
+    /// (Moving individual fields out of a struct with Drop isn't
+    /// allowed — `mem::take` swaps in a default `PathBuf` so the
+    /// subsequent Drop is a no-op.)
+    ///
+    /// Linux + macOS allow renaming an open file, so we don't need
+    /// to close the handle first; it drops naturally when this
+    /// function returns via the by-value caller pattern.
+    fn finalize(&mut self) -> AgentResponse {
+        use std::io::Write;
+        if let Err(e) = self.tmp_file.flush() {
+            return AgentResponse::error(
+                format!("failed to flush staging file: {}", e),
+                error_codes::FILE_IO_FAILED,
+            );
+        }
+        if let Err(e) = self.tmp_file.sync_all() {
+            return AgentResponse::error(
+                format!("failed to sync staging file: {}", e),
+                error_codes::FILE_IO_FAILED,
+            );
+        }
+        // A running workload reads the CONTAINER filesystem, not the agent's
+        // namespace — finalize through the ns helper there, mirroring the
+        // single-shot path (writing here would land in the overlay's upper
+        // beneath a live overlayfs, invisible to the workload: BUG-240's
+        // streaming twin). The staged bytes are piped, never re-buffered.
+        match std::fs::File::open(&self.tmp_path) {
+            Ok(mut staged) => {
+                if let nsfile::GuestNs::Container(ns) = nsfile::GuestNs::for_workload() {
+                    // Session Drop still cleans the staging file.
+                    return match ns.write_reader(
+                        &self.target.to_string_lossy(),
+                        &mut staged,
+                        self.mode,
+                        self.uid,
+                        self.gid,
+                    ) {
+                        Ok(()) => {
+                            info!(
+                                path = %self.target.display(),
+                                size = self.bytes_written,
+                                "file written into workload container"
+                            );
+                            AgentResponse::Ok { data: None }
+                        }
+                        Err(e) => AgentResponse::error(
+                            format!(
+                                "failed to write {} in the workload container: {}",
+                                self.target.display(),
+                                e
+                            ),
+                            error_codes::FILE_IO_FAILED,
+                        ),
+                    };
+                }
+            }
+            Err(e) => {
+                return AgentResponse::error(
+                    format!("failed to reopen staging file: {}", e),
+                    error_codes::FILE_IO_FAILED,
+                );
+            }
+        }
+        // Disarm Drop before rename; if the rename fails we'll
+        // re-arm below by restoring the path.
+        let tmp = std::mem::take(&mut self.tmp_path);
+        if let Err(e) = std::fs::rename(&tmp, &self.target) {
+            // Re-arm Drop so the staging file still gets cleaned up
+            // when the session is dropped by the caller.
+            self.tmp_path = tmp;
+            return AgentResponse::error(
+                format!("failed to rename onto {}: {}", self.target.display(), e),
+                error_codes::FILE_IO_FAILED,
+            );
+        }
+        if let Some(m) = self.mode {
+            apply_mode_best_effort(&self.target, m);
+        }
+        if self.uid.is_some() || self.gid.is_some() {
+            if let Err(e) = std::os::unix::fs::chown(&self.target, self.uid, self.gid) {
+                return AgentResponse::error(
+                    format!("failed to chown {}: {}", self.target.display(), e),
+                    error_codes::FILE_IO_FAILED,
+                );
+            }
+        }
+        info!(
+            path = %self.target.display(),
+            size = self.bytes_written,
+            "file written (streaming)"
+        );
+        AgentResponse::Ok { data: None }
+    }
+}
+
+impl Drop for WriteSession {
+    fn drop(&mut self) {
+        // If finalize consumed the session, `tmp_path` was emptied.
+        if !self.tmp_path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.tmp_path);
+        }
+    }
+}
+
+/// Open a streaming upload session. Called from the connection loop.
+///
+/// Returns the new session plus the response to send back. On error
+/// the session is not created.
+fn handle_file_write_begin(
+    path: String,
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    total_size: u64,
+) -> (Option<WriteSession>, AgentResponse) {
+    if total_size > smolvm_protocol::FILE_TRANSFER_MAX_TOTAL {
+        return (
+            None,
+            AgentResponse::error(
+                format!(
+                    "total_size {} exceeds maximum {}",
+                    total_size,
+                    smolvm_protocol::FILE_TRANSFER_MAX_TOTAL
+                ),
+                error_codes::INVALID_REQUEST,
+            ),
+        );
+    }
+    let resolved = match resolve_guest_io_path(&path, FilePathAccess::Write) {
+        Ok(p) => p,
+        Err(resp) => return (None, resp),
+    };
+    match WriteSession::open(resolved, mode, uid, gid, total_size) {
+        Ok(session) => (Some(session), AgentResponse::Ok { data: None }),
+        Err(e) => (
+            None,
+            AgentResponse::error(
+                format!("failed to open staging file: {}", e),
+                error_codes::FILE_IO_FAILED,
+            ),
+        ),
+    }
+}
+
+/// Append a chunk to the open session (if any). Called from the
+/// connection loop. On `done`, the session is consumed and the file
+/// is finalized.
+///
+/// Returns the (possibly consumed) session plus the response.
+fn handle_file_write_chunk(
+    session: Option<WriteSession>,
+    data: &[u8],
+    done: bool,
+) -> (Option<WriteSession>, AgentResponse) {
+    let Some(mut s) = session else {
+        return (
+            None,
+            AgentResponse::error(
+                "no FileWriteBegin issued on this connection",
+                error_codes::INVALID_REQUEST,
+            ),
+        );
+    };
+    if let Err(resp) = s.write_chunk(data) {
+        // Session is dropped by returning None, cleaning the tmp file.
+        return (None, resp);
+    }
+    if done {
+        let resp = s.finalize();
+        // On success `tmp_path` was cleared so Drop is a no-op;
+        // on failure the session Drop will still clean the staging
+        // file when `s` falls out of scope here.
+        (None, resp)
+    } else {
+        (Some(s), AgentResponse::Ok { data: None })
+    }
+}
+
+/// Stream a reader's bytes to the client as a sequence of
+/// `AgentResponse::DataChunk` responses.
+///
+/// Shared between `FileRead` (reader = open file) and `ExportLayer`
+/// (reader = `tar` child stdout). Each chunk is at most `chunk_size`
+/// bytes; EOF is always signaled with a trailing `done: true` frame
+/// (possibly empty) so the client's receive loop terminates uniformly.
+///
+/// On read error, emits a structured Error response with the
+/// caller-supplied `error_code` (so operators can distinguish
+/// "file-IO failed" from "export failed" in logs and status codes)
+/// and returns the `io::Error` to the caller for producer-specific
+/// cleanup (e.g., killing a child process).
+fn send_data_chunks<R: Read>(
+    stream: &mut impl Write,
+    reader: &mut R,
+    chunk_size: usize,
+    error_context: &str,
+    error_code: &'static str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    send_data_chunks_body(stream, reader, chunk_size, error_context, error_code)?;
+    send_response(
+        stream,
+        &AgentResponse::DataChunk {
+            data: vec![],
+            done: true,
+        },
+    )?;
+    Ok(())
+}
+
+/// Send data chunks without the terminal frame so a producer can verify its
+/// final status before reporting a successful end-of-stream.
+fn send_data_chunks_body<R: Read>(
+    stream: &mut impl Write,
+    reader: &mut R,
+    chunk_size: usize,
+    error_context: &str,
+    error_code: &'static str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut buf = vec![0u8; chunk_size];
+    loop {
+        // Fill as much of the buffer as possible in one chunk.
+        // Partial reads are common when the source is a pipe
+        // (e.g. tar subprocess) — we keep reading until the buffer
+        // is full or EOF arrives.
+        let mut pending = 0;
+        while pending < buf.len() {
+            match reader.read(&mut buf[pending..]) {
+                Ok(0) => break,
+                Ok(n) => pending += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    send_response(
+                        stream,
+                        &AgentResponse::error(format!("{}: {}", error_context, e), error_code),
+                    )?;
+                    return Err(Box::new(e));
+                }
+            }
+        }
+
+        if pending == 0 {
+            return Ok(());
+        }
+
+        send_response(
+            stream,
+            &AgentResponse::DataChunk {
+                data: buf[..pending].to_vec(),
+                done: false,
+            },
+        )?;
+    }
+}
+
+/// Stream a file from the guest filesystem to the host as a
+/// sequence of `DataChunk` responses. Called from the connection
+/// loop (not the generic `handle_request` match) so it can emit
+/// multiple responses per request.
+fn handle_streaming_file_read(
+    stream: &mut impl ReadWrite,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Read from the workload container when one is running, mirroring the write
+    // side. Reading here — in the agent's namespace — sees the overlay's upper
+    // layer, so a file the container itself created came back 404 (BUG-240).
+    // Both directions must move together: fixing only writes would break the
+    // upload-then-download round trip, which is self-consistent today.
+    if let nsfile::GuestNs::Container(ns) = nsfile::GuestNs::for_workload() {
+        match ns.open(path) {
+            Ok(mut cf) => {
+                info!(path = %path, size = cf.size, "streaming file read (container)");
+                return send_data_chunks(
+                    stream,
+                    &mut cf.reader,
+                    smolvm_protocol::LAYER_CHUNK_SIZE,
+                    "failed to read file",
+                    error_codes::FILE_IO_FAILED,
+                );
+            }
+            Err(e) => {
+                send_response(
+                    stream,
+                    &AgentResponse::error(
+                        format!("failed to read {} in the workload container: {}", path, e),
+                        error_codes::FILE_IO_FAILED,
+                    ),
+                )?;
+                return Ok(());
+            }
+        }
+    }
+    let resolved = match resolve_guest_io_path(path, FilePathAccess::Read) {
+        Ok(p) => p,
+        Err(resp) => {
+            send_response(stream, &resp)?;
+            return Ok(());
+        }
+    };
+    let mut file = match std::fs::File::open(&resolved) {
+        Ok(f) => f,
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("failed to open {}: {}", path, e),
+                    error_codes::FILE_IO_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    // Only stream regular files. Directories and special files (e.g. /dev/zero,
+    // FIFOs) `open()` successfully but misbehave on read — a directory fails with
+    // EISDIR *after* the chunk stream has started (desyncing the wire and bricking
+    // the connection), and an unbounded device never EOFs (hangs the caller). We
+    // must reject them with a clean error BEFORE the first DataChunk frame.
+    let metadata = match file.metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("failed to stat {}: {}", path, e),
+                    error_codes::FILE_IO_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    if !metadata.is_file() {
+        // Say "is a directory" specifically. A caller that asked for a path
+        // without knowing what it is can then ask for the listing instead,
+        // which it cannot do if a directory, a socket and a device all report
+        // the same thing.
+        let detail = if metadata.is_dir() {
+            format!("is a directory: {}", path)
+        } else {
+            format!("not a regular file: {}", path)
+        };
+        send_response(
+            stream,
+            &AgentResponse::error(detail, error_codes::FILE_IO_FAILED),
+        )?;
+        return Ok(());
+    }
+    let size = metadata.len();
+    info!(path = %path, size, "streaming file read");
+    send_data_chunks(
+        stream,
+        &mut file,
+        smolvm_protocol::LAYER_CHUNK_SIZE,
+        "failed to read file",
+        error_codes::FILE_IO_FAILED,
+    )
+}
+
+/// Stream a tar archive of a directory directly over vsock.
+///
+/// This deliberately runs in the agent namespace: boot-time staged mounts are
+/// visible there even when an image workload is active, and no temporary
+/// archive needs to traverse virtiofs or occupy the guest disk.
+fn handle_streaming_archive_directory(
+    stream: &mut impl ReadWrite,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve through the same containment check single-file reads use, rather
+    // than trusting the requested path. `normalize_guest_path` alone is lexical:
+    // it rejects `..` but happily accepts a path whose final component is a
+    // symlink, and `tar -C` follows that symlink, so a workload could leave a
+    // link in its workspace and have a caller archive whatever it pointed at.
+    // The resolver maps the path under the workspace or overlay root and
+    // canonicalizes it, so a link out of those roots is refused here.
+    let resolved = match resolve_guest_io_path(path, FilePathAccess::Read) {
+        Ok(resolved) => resolved,
+        Err(response) => {
+            send_response(stream, &response)?;
+            return Ok(());
+        }
+    };
+    let directory = resolved.as_path();
+    if !directory.is_dir() {
+        send_response(
+            stream,
+            &AgentResponse::error(
+                format!("not a directory: {path}"),
+                error_codes::FILE_IO_FAILED,
+            ),
+        )?;
+        return Ok(());
+    }
+
+    let mut child = match std::process::Command::new("tar")
+        .args(["-cf", "-", "-C"])
+        .arg(directory)
+        .arg(".")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("failed to start directory archive: {error}"),
+                    error_codes::FILE_IO_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    let mut stdout = child.stdout.take().expect("piped tar stdout");
+    let result = send_data_chunks_body(
+        stream,
+        &mut stdout,
+        smolvm_protocol::LAYER_CHUNK_SIZE,
+        "failed to read directory archive",
+        error_codes::FILE_IO_FAILED,
+    );
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    result?;
+    match child.wait() {
+        Ok(status) if status.success() => send_response(
+            stream,
+            &AgentResponse::DataChunk {
+                data: Vec::new(),
+                done: true,
+            },
+        ),
+        Ok(status) => send_response(
+            stream,
+            &AgentResponse::error(
+                format!("directory archive exited with {status}"),
+                error_codes::FILE_IO_FAILED,
+            ),
+        ),
+        Err(error) => send_response(
+            stream,
+            &AgentResponse::error(
+                format!("failed to wait for directory archive: {error}"),
+                error_codes::FILE_IO_FAILED,
+            ),
+        ),
+    }
+}
+
+/// Handle an interactive run session with streaming I/O.
+fn handle_interactive_run(
+    stream: &mut impl ReadWrite,
+    request: AgentRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_storage_mounted();
+    let (
+        image,
+        command,
+        env,
+        workdir,
+        user,
+        mounts,
+        timeout_ms,
+        tty,
+        persistent_overlay_id,
+        unprivileged,
+        s3_volumes,
+    ) = match request {
+        AgentRequest::Run {
+            image,
+            command,
+            env,
+            workdir,
+            user,
+            mounts,
+            timeout_ms,
+            tty,
+            persistent_overlay_id,
+            unprivileged,
+            s3_volumes,
+            ..
+        } => (
+            image,
+            command,
+            env,
+            workdir,
+            user,
+            mounts,
+            timeout_ms,
+            tty,
+            persistent_overlay_id,
+            unprivileged,
+            s3_volumes,
+        ),
+        _ => {
+            send_response(
+                stream,
+                &AgentResponse::error("expected Run request", error_codes::INVALID_REQUEST),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let is_persistent = persistent_overlay_id.is_some();
+    let mounts = storage::merged_with_boot_mounts(&mounts);
+    info!(image = %image, command = ?command, tty = tty, persistent = is_persistent, "starting interactive run");
+
+    // Prepare the overlay and get the rootfs path
+    let prepared = match &persistent_overlay_id {
+        Some(id) => storage::prepare_for_run_persistent(&image, id),
+        None => storage::prepare_for_run(&image),
+    };
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            send_response(stream, &AgentResponse::from_err(e, error_codes::RUN_FAILED))?;
+            return Ok(());
+        }
+    };
+
+    // Setup virtiofs mounts at staging area (crun will bind-mount them via OCI spec)
+    // Helper: only clean up ephemeral overlays, not persistent ones
+    let maybe_cleanup = |wid: &str| {
+        if !is_persistent {
+            let _ = storage::cleanup_overlay(wid);
+        }
+    };
+
+    if let Err(e) = storage::setup_mounts(&prepared.rootfs_path, &mounts) {
+        maybe_cleanup(&prepared.workload_id);
+        send_response(
+            stream,
+            &AgentResponse::from_err(e, error_codes::MOUNT_FAILED),
+        )?;
+        return Ok(());
+    }
+
+    // SSH agent forwarding: mirror `handle_run`'s injection. The #542 fix wired
+    // SSH_AUTH_SOCK into the exec/run env because the keep-alive `crun exec` path
+    // builds a fresh process env rather than inheriting the container's — but it
+    // only did so for the non-interactive handler. Interactive sessions reach the
+    // same keep-alive container (an ephemeral `machine run` also carries a
+    // persistent overlay id, so `-i`/`-t` joins it too), so without this the
+    // variable is silently absent for every interactive session and the
+    // container-spec injection alone never reaches it. No-op when forwarding is
+    // off; never overrides a user-supplied value.
+    let mut env = env;
+    ssh_agent::inject_into_env(&mut env);
+
+    // Resolve the container's launch settings from the image's OCI config (with
+    // request overrides). Required to call spawn_interactive_command, so the
+    // interactive path can't drop the image's Env/WorkingDir/User either.
+    let launch =
+        match ResolvedLaunch::resolve(&image, command, env, workdir, user, s3_volumes.clone()) {
+            Ok(l) => l,
+            Err(e) => {
+                maybe_cleanup(&prepared.workload_id);
+                send_response(
+                    stream,
+                    &AgentResponse::error(e.to_string(), error_codes::INVALID_REQUEST),
+                )?;
+                return Ok(());
+            }
+        };
+
+    // Spawn the command with crun
+    let (mut child, pty_master) = match spawn_interactive_command(
+        &prepared.rootfs_path,
+        &launch,
+        &mounts,
+        tty,
+        persistent_overlay_id.as_deref(),
+        unprivileged,
+        &s3_volumes,
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            maybe_cleanup(&prepared.workload_id);
+            send_response(
+                stream,
+                &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
+            )?;
+            return Ok(());
+        }
+    };
+
+    // Send Started response
+    send_response(stream, &AgentResponse::Started)?;
+
+    // Run the appropriate interactive I/O loop
+    let exit_code = match pty_master {
+        #[cfg(target_os = "linux")]
+        Some(pty) => match run_interactive_loop_pty(stream, &mut child, pty, timeout_ms) {
+            Ok(exit_code) => exit_code,
+            Err(e) => {
+                maybe_cleanup(&prepared.workload_id);
+                return Err(e);
+            }
+        },
+        _ => match run_interactive_loop(stream, &mut child, timeout_ms) {
+            Ok(exit_code) => exit_code,
+            Err(e) => {
+                maybe_cleanup(&prepared.workload_id);
+                return Err(e);
+            }
+        },
+    };
+
+    // Send Exited response
+    send_response(
+        stream,
+        &AgentResponse::Exited {
+            exit_code,
+            oom: false,
+        },
+    )?;
+    maybe_cleanup(&prepared.workload_id);
+
+    Ok(())
+}
+
+/// The fully-resolved launch settings for an image container: the image's OCI
+/// config (Entrypoint/Cmd, Env, WorkingDir, User) merged with the request.
+///
+/// Fields are private and the ONLY constructor is [`ResolvedLaunch::resolve`],
+/// which performs the merge — and [`write_oci_bundle`], the single path that
+/// creates an OCI container, requires a `&ResolvedLaunch`. So every container
+/// launch necessarily honors the image config: the detached and interactive
+/// paths both go through it, and a *future* launch path won't compile without
+/// resolving. That's what keeps Env/WorkingDir/User from being silently dropped
+/// on some path — the failure mode this type exists to make impossible.
+///
+/// Defined on all platforms: the shared `handle_interactive_run` constructs one,
+/// and the macOS build compiles the agent (as stubs) for `cargo test`.
+struct ResolvedLaunch {
+    command: Vec<String>,
+    env: Vec<(String, String)>,
+    workdir: Option<String>,
+    user: Option<String>,
+}
+
+impl ResolvedLaunch {
+    /// Merge the request's launch params with the image's OCI config:
+    /// - **command**: the request's, else the image's `ENTRYPOINT` + `CMD`
+    ///   (errors if neither exists), so a service-style image runs as authored.
+    /// - **env**: the image's `Env` (notably `PATH`) with the request layered on
+    ///   top — the request wins per key.
+    /// - **workdir / user**: the request's, else the image's — an image `CMD` is
+    ///   relative to its `WORKDIR`, and its `USER` is the uid it expects to run as.
+    fn resolve(
+        image: &str,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        user: Option<String>,
+        s3_volumes: Vec<smolvm_protocol::S3Volume>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let info = storage::query_image(image)?.ok_or_else(|| -> Box<dyn std::error::Error> {
+            format!("image not found: {image}").into()
+        })?;
+        let command = if command.is_empty() {
+            let mut resolved = info.entrypoint;
+            resolved.extend(info.cmd);
+            if resolved.is_empty() {
+                if !s3_volumes.is_empty() {
+                    // Remote volumes mount inside the workload container, which
+                    // exec/shell join. An image with no entrypoint would
+                    // otherwise downgrade to a bare-agent boot with nowhere for
+                    // the mount to live — give it a keep-alive workload so the
+                    // FUSE mount persists and is reachable.
+                    vec!["sleep".to_string(), "infinity".to_string()]
+                } else {
+                    // The host's workload launcher matches on this exact phrase
+                    // to downgrade a metadata-less image (e.g. a bare rootfs
+                    // directory) to a bare-agent boot instead of failing the
+                    // machine start — keep the wording stable.
+                    return Err(format!(
+                        "no command given and image '{image}' defines no entrypoint or cmd"
+                    )
+                    .into());
+                }
+            } else {
+                resolved
+            }
+        } else {
+            command
+        };
+        // Nothing is wrapped around the workload any more: remote volumes are
+        // mounted natively between the container's create and start, so the
+        // image's own entrypoint runs exactly as written.
+        Ok(Self {
+            command,
+            env: merge_image_env(info.env, env),
+            workdir: workdir.or(info.workdir),
+            user: user.or(info.user),
+        })
+    }
+}
+
+/// Layer the request's env over an image's OCI `Env` (each `"KEY=VAL"`): the
+/// request wins on key conflicts, image entries fill in the rest — matching how
+/// a container runtime composes image + run-time environment.
+fn merge_image_env(
+    image_env: Vec<String>,
+    request_env: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let request_keys: std::collections::HashSet<&str> =
+        request_env.iter().map(|(k, _)| k.as_str()).collect();
+    let mut merged: Vec<(String, String)> = image_env
+        .iter()
+        .filter_map(|entry| entry.split_once('='))
+        .filter(|(k, _)| !request_keys.contains(*k))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    merged.extend(request_env);
+    merged
+}
+
+/// Write an OCI bundle (`config.json`) and return a freshly generated container ID.
+///
+/// Shared by [`handle_run_detached`] and [`spawn_interactive_command`] to avoid
+/// duplicating the identity-resolve → spec-build → mount-wiring → write sequence.
+/// The only caller-controlled variation is `tty` (detached: always `false`).
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn write_oci_bundle(
+    rootfs_path: &std::path::Path,
+    bundle_path: &std::path::Path,
+    launch: &ResolvedLaunch,
+    mounts: &[(String, String, bool)],
+    tty: bool,
+    unprivileged: bool,
+    container_init: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let workdir_str = launch.workdir.as_deref().unwrap_or("/");
+    let identity = oci::resolve_process_identity(rootfs_path, launch.user.as_deref())?;
+    let mut spec = oci::OciSpec::new(
+        &launch.command,
+        &launch.env,
+        workdir_str,
+        tty,
+        &identity,
+        unprivileged,
+    );
+
+    if tty {
+        // Give the PTY a non-zero starting size. The host follows up with a
+        // Resize message carrying the real terminal dimensions as soon as
+        // the interactive session starts.
+        spec.process.console_size = Some(oci::OciConsoleSize {
+            height: 24,
+            width: 80,
+        });
+    }
+
+    // Interactive and detached containers use this bundle writer instead of
+    // storage::run_command(). Mirror that path's GPU wiring so `-i`/`-t`
+    // shells see /dev/dri when the VM was started with --gpu.
+    spec.add_gpu_devices_if_available();
+    spec.add_kvm_device_if_available();
+
+    if container_init {
+        const INIT_SOURCE: &str = "/usr/local/bin/smolvm-agent";
+        const INIT_DESTINATION: &str = "/run/smolvm/init";
+        storage::ensure_file_mount_target_under_root(rootfs_path, INIT_DESTINATION)?;
+        spec.add_bind_mount(INIT_SOURCE, INIT_DESTINATION, true);
+    }
+
+    for (tag, container_path, read_only) in mounts {
+        let virtiofs_mount = storage::volume_bind_source(tag);
+        spec.add_bind_mount(
+            &virtiofs_mount.to_string_lossy(),
+            container_path,
+            *read_only,
+        );
+    }
+
+    storage::add_workspace_fallback(&mut spec, mounts);
+    storage::add_storage_fallback(&mut spec, mounts, unprivileged);
+
+    ssh_agent::inject_into_container(&mut spec);
+    publish_socket::inject_into_container(&mut spec);
+    rosetta::inject_into_container(&mut spec);
+    forkpoint::inject_into_container(&mut spec);
+    cuda::inject_into_container(&mut spec, rootfs_path);
+    vulkan::inject_into_container(&mut spec, rootfs_path);
+    credentials::inject_into_container(&mut spec, rootfs_path, mounts);
+    spec.write_to(bundle_path)
+        .map_err(|e| format!("failed to write OCI spec: {}", e))?;
+
+    Ok(oci::generate_container_id())
+}
+
+/// Handle a detached run request: start a container in the background and
+/// return its container ID to the caller.
+///
+/// The container ID is saved to `main_container_id_path(workload_id)` so that
+/// subsequent `machine exec` calls can join the container via `crun exec`
+/// instead of creating a new isolated container.
+///
+/// Requires `persistent_overlay_id` to be set — detached containers must
+/// persist across exec sessions, which requires a named overlay.
+#[cfg(target_os = "linux")]
+fn handle_run_detached(
+    stream: &mut impl ReadWrite,
+    request: AgentRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::path::Path;
+
+    ensure_storage_mounted();
+
+    let (
+        image,
+        command,
+        env,
+        workdir,
+        user,
+        mounts,
+        persistent_overlay_id,
+        unprivileged,
+        s3_volumes,
+    ) = match request {
+        AgentRequest::Run {
+            image,
+            command,
+            env,
+            workdir,
+            user,
+            mounts,
+            persistent_overlay_id,
+            unprivileged,
+            s3_volumes,
+            ..
+        } => (
+            image,
+            command,
+            env,
+            workdir,
+            user,
+            mounts,
+            persistent_overlay_id,
+            unprivileged,
+            s3_volumes,
+        ),
+        _ => {
+            send_response(
+                stream,
+                &AgentResponse::error("expected Run request", error_codes::INVALID_REQUEST),
+            )?;
+            return Ok(());
+        }
+    };
+
+    // An empty command is allowed here: it means "run the image's own
+    // ENTRYPOINT/CMD". We resolve it from the image config below, after the
+    // image has been prepared (so its config is guaranteed present).
+    let mounts = storage::merged_with_boot_mounts(&mounts);
+
+    let overlay_id = match persistent_overlay_id {
+        Some(id) => id,
+        None => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    "detached mode requires persistent_overlay_id",
+                    error_codes::INVALID_REQUEST,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+
+    info!(
+        image = %image,
+        command = ?command,
+        overlay_id = %overlay_id,
+        "starting detached container"
+    );
+
+    let progress = |phase: &str, bytes: u64| {
+        let message = if bytes == 0 {
+            phase.to_string()
+        } else {
+            format!("{phase} ({} MiB)", bytes / (1024 * 1024))
+        };
+        let _ = send_response(
+            stream,
+            &AgentResponse::Progress {
+                message,
+                percent: None,
+                layer: None,
+            },
+        );
+    };
+    let prepared =
+        match storage::prepare_for_run_persistent_with_progress(&image, &overlay_id, progress) {
+            Ok(p) => p,
+            Err(e) => {
+                send_response(stream, &AgentResponse::from_err(e, error_codes::RUN_FAILED))?;
+                return Ok(());
+            }
+        };
+
+    // Resolve the container's launch settings from the image's OCI config
+    // (command, Env, WorkingDir, User) with the request layered on top.
+    // `write_oci_bundle` requires a `ResolvedLaunch`, so the image config can't be
+    // silently dropped here or on any other launch path.
+    // `resolve` only needs to know WHETHER volumes exist (to pick a keep-alive
+    // command); the mount step below needs the values themselves.
+    let launch =
+        match ResolvedLaunch::resolve(&image, command, env, workdir, user, s3_volumes.clone()) {
+            Ok(l) => l,
+            Err(e) => {
+                send_response(
+                    stream,
+                    &AgentResponse::error(e.to_string(), error_codes::INVALID_REQUEST),
+                )?;
+                return Ok(());
+            }
+        };
+    info!(image = %image, command = ?launch.command, workdir = ?launch.workdir, user = ?launch.user, "resolved launch from request + image config");
+
+    if let Err(e) = storage::setup_mounts(&prepared.rootfs_path, &mounts) {
+        send_response(
+            stream,
+            &AgentResponse::from_err(e, error_codes::MOUNT_FAILED),
+        )?;
+        return Ok(());
+    }
+
+    let rootfs_path = Path::new(&prepared.rootfs_path);
+    let bundle_path = match rootfs_path.parent() {
+        Some(p) => p.join("bundle"),
+        None => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    "invalid rootfs path: no parent",
+                    error_codes::INTERNAL_ERROR,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+
+    if !bundle_path.exists() {
+        send_response(
+            stream,
+            &AgentResponse::error(
+                format!("bundle directory not found: {}", bundle_path.display()),
+                error_codes::INTERNAL_ERROR,
+            ),
+        )?;
+        return Ok(());
+    }
+
+    let workload_id = format!("persistent-{}", overlay_id);
+
+    // Detached containers always run non-interactively (tty: false).
+    let container_id = match write_oci_bundle(
+        rootfs_path,
+        &bundle_path,
+        &launch,
+        &mounts,
+        false,
+        unprivileged,
+        false,
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::from_err(e, error_codes::INTERNAL_ERROR),
+            )?;
+            return Ok(());
+        }
+    };
+
+    info!(
+        container_id = %container_id,
+        workload_id = %workload_id,
+        "running detached container"
+    );
+    send_response(
+        stream,
+        &AgentResponse::Progress {
+            message: "starting detached container".to_string(),
+            percent: None,
+            layer: None,
+        },
+    )?;
+
+    // Use `crun create` + `crun start` (two-step OCI lifecycle) instead of
+    // `crun run --detach` which hangs in the smolvm VM environment. The
+    // two-step approach registers the container state so `crun exec` can join
+    // it, and `crun start` returns immediately once the container is running.
+    let create_output = crun::CrunCommand::create(&bundle_path, &container_id).output();
+    match create_output {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!(
+                        "crun create failed: {}",
+                        crun::create_failure_reason(&container_id, &output)
+                    ),
+                    error_codes::SPAWN_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
+            )?;
+            return Ok(());
+        }
+    }
+
+    // Mount S3 volumes BETWEEN create and start. The container's namespaces
+    // exist after `create` but its PID 1 has not run yet, so mounting here means
+    // the workload's very first instruction already sees the bucket — a workload
+    // that reads its data directory immediately cannot race the mount. It also
+    // means the workload command itself is never rewritten: the image's own
+    // entrypoint runs exactly as its author wrote it.
+    if !s3_volumes.is_empty() {
+        if let Err(e) = s3mount::mount_all(&container_id, &s3_volumes) {
+            let _ = crun::CrunCommand::kill(&container_id, "SIGKILL").status();
+            let _ = crun::CrunCommand::delete(&container_id, true).output();
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("mount remote volume: {e}"),
+                    error_codes::SPAWN_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    }
+
+    let start_output = crun::CrunCommand::start(&container_id).output();
+    match start_output {
+        Ok(output) if output.status.success() => {
+            // Save the container ID so subsequent execs can join this container.
+            // If the write fails, kill the container and return an error — exec
+            // join won't work without the persisted ID.
+            let id_path = paths::main_container_id_path(&workload_id);
+            if let Err(e) = std::fs::write(&id_path, container_id.as_bytes()) {
+                let _ = crun::CrunCommand::kill(&container_id, "SIGKILL").status();
+                let _ = crun::CrunCommand::delete(&container_id, true).output();
+                send_response(
+                    stream,
+                    &AgentResponse::error(
+                        format!("failed to persist container ID: {}", e),
+                        error_codes::INTERNAL_ERROR,
+                    ),
+                )?;
+                return Ok(());
+            }
+            info!(
+                container_id = %container_id,
+                "detached container started via create+start"
+            );
+            send_response(
+                stream,
+                &AgentResponse::Completed {
+                    exit_code: 0,
+                    stdout: container_id.into_bytes(),
+                    stderr: vec![],
+                },
+            )?;
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Clean up the created-but-not-started container
+            let _ = crun::CrunCommand::delete(&container_id, true).output();
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("crun start failed: {}", stderr.trim()),
+                    error_codes::SPAWN_FAILED,
+                ),
+            )?;
+        }
+        Err(e) => {
+            let _ = crun::CrunCommand::delete(&container_id, true).output();
+            send_response(
+                stream,
+                &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Non-Linux stub: the agent only runs on Linux; this exists so the host-side
+/// `cargo check` on macOS compiles the dispatch in `handle_connection`.
+#[cfg(not(target_os = "linux"))]
+fn handle_run_detached(
+    stream: &mut impl ReadWrite,
+    _request: AgentRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    send_response(
+        stream,
+        &AgentResponse::error(
+            "detached mode not supported on this platform",
+            error_codes::INTERNAL_ERROR,
+        ),
+    )?;
+    Ok(())
+}
+
+/// Check whether a crun container is currently running from its persisted
+/// status record and the live process identity.
+///
+/// Returns `false` on any error (missing state files, parse failures, etc.)
+/// so callers fall through to starting a fresh container.
+#[cfg(target_os = "linux")]
+pub fn is_container_running(container_id: &str) -> bool {
+    crun_container_pid(container_id).is_some()
+}
+
+/// Init PID of a container that is registered, started, and whose process is
+/// genuinely alive — `None` otherwise.
+///
+/// Carries the liveness check [`is_container_running`] is now defined in terms
+/// of, and hands the pid back so a caller that must reach into the container
+/// (e.g. [`crate::nsfile`], entering its mount namespace) does not have to ask
+/// crun a second time and race the answer.
+#[cfg(target_os = "linux")]
+pub fn crun_container_pid(container_id: &str) -> Option<u32> {
+    crun_container_pid_at(
+        container_id,
+        std::path::Path::new(paths::CRUN_ROOT_DIR),
+        std::path::Path::new("/proc"),
+        true,
+    )
+}
+
+/// PID of a container that has been created but not yet started.
+///
+/// [`crun_container_pid`] deliberately reports nothing until `crun start`
+/// releases the container, because its callers are asking "can I exec into
+/// this?". Mounting happens in exactly that window: after `create` the
+/// namespaces exist and PID 1 is parked on `exec.fifo`, which is precisely when
+/// a volume must be mounted so the workload's first instruction already sees it.
+#[cfg(target_os = "linux")]
+pub fn crun_created_container_pid(container_id: &str) -> Option<u32> {
+    crun_container_pid_at(
+        container_id,
+        std::path::Path::new(paths::CRUN_ROOT_DIR),
+        std::path::Path::new("/proc"),
+        false,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn crun_container_pid_at(
+    container_id: &str,
+    state_root: &std::path::Path,
+    proc_root: &std::path::Path,
+    require_running: bool,
+) -> Option<u32> {
+    if !valid_crun_container_id(container_id) {
+        return None;
+    }
+
+    let state_dir = state_root.join(container_id);
+
+    // crun leaves exec.fifo present until `crun start` releases a created
+    // container. The old `crun state` path reported that state as `created`,
+    // not `running`; preserve that distinction without entering crun.
+    if require_running && state_dir.join("exec.fifo").exists() {
+        return None;
+    }
+
+    let status = std::fs::read(state_dir.join("status")).ok()?;
+    let identity = parse_crun_process_identity(&status)?;
+    let proc_stat =
+        std::fs::read_to_string(proc_root.join(identity.pid.to_string()).join("stat")).ok()?;
+    validate_crun_process_identity(identity, &proc_stat)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CrunProcessIdentity {
+    pid: u32,
+    start_time: u64,
+}
+
+/// crun accepts only this deliberately small ID alphabet. Mirror it before
+/// constructing a state path so an overlay's persisted ID cannot escape the
+/// runtime root.
+#[cfg(target_os = "linux")]
+fn valid_crun_container_id(container_id: &str) -> bool {
+    !container_id.is_empty()
+        && !container_id.starts_with('.')
+        && container_id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'+' | b'.' | b'-'))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_crun_process_identity(status: &[u8]) -> Option<CrunProcessIdentity> {
+    let value: serde_json::Value = serde_json::from_slice(status).ok()?;
+    let pid = value
+        .get("pid")?
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())?;
+    if pid == 0 {
+        return None;
+    }
+    let start_time = value
+        .get("process-start-time")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    Some(CrunProcessIdentity { pid, start_time })
+}
+
+/// Verify the status record against `/proc/<pid>/stat`, including PID-reuse
+/// protection. Field 2 (`comm`) may contain spaces and `)`, so fields are
+/// counted only after its final closing parenthesis. `starttime` is field 22,
+/// or index 19 in that remainder (whose index 0 is field 3, process state).
+#[cfg(target_os = "linux")]
+fn validate_crun_process_identity(identity: CrunProcessIdentity, proc_stat: &str) -> Option<u32> {
+    let (_, remainder) = proc_stat.rsplit_once(')')?;
+    let fields: Vec<&str> = remainder.split_whitespace().collect();
+    let state = fields.first()?.as_bytes().first().copied()?;
+    if matches!(state, b'Z' | b'X') {
+        return None;
+    }
+    let actual_start_time = fields.get(19)?.parse::<u64>().ok()?;
+
+    // Older crun status files omit the start time (encoded here as zero). In
+    // that compatibility case the successfully-read, non-zombie proc record is
+    // still stronger than the old PID-only kill(0) check.
+    if identity.start_time != 0 && identity.start_time != actual_start_time {
+        return None;
+    }
+    Some(identity.pid)
+}
+
+/// Non-Linux stub.
+#[cfg(not(target_os = "linux"))]
+pub fn crun_container_pid(_container_id: &str) -> Option<u32> {
+    None
+}
+
+/// Non-Linux stub.
+#[cfg(not(target_os = "linux"))]
+pub fn is_container_running(_container_id: &str) -> bool {
+    false
+}
+
+/// Spawn a command by joining a running container via `crun exec`.
+///
+/// Used when a main workload container is already running for this overlay —
+/// the new command joins its existing PID/mount/cgroup namespaces rather than
+/// creating an isolated new container.
+///
+/// When `tty` is true the PTY is obtained from crun via `--console-socket`,
+/// exactly like the fresh `crun run` path in [`spawn_interactive_command`].
+/// Letting crun allocate the PTY (rather than handing it a slave from an
+/// agent-owned pair) is what makes `TIOCSWINSZ` resizes reach the process
+/// inside the container; without it TUIs never redraw on host resize. See
+/// GH #156.
+#[cfg(target_os = "linux")]
+fn spawn_exec_in_container(
+    container_id: &str,
+    launch: &ResolvedLaunch,
+    tty: bool,
+    unprivileged: bool,
+) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+    use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
+    use std::sync::atomic::Ordering;
+
+    // An exec joining a running container inherits the same image-resolved env /
+    // workdir as the container's main process.
+    let command: &[String] = &launch.command;
+    let env: &[(String, String)] = &launch.env;
+    let workdir: Option<&str> = launch.workdir.as_deref();
+
+    info!(
+        container_id = %container_id,
+        command = ?command,
+        tty = tty,
+        "joining running container"
+    );
+
+    // A restored crun runtime can accept several execs and then stall even
+    // though the container and its processes remain healthy. Entering the
+    // inherited namespaces directly avoids that restored-runtime state while
+    // preserving the workload's live memory and process tree.
+    if !unprivileged {
+        if let Some(mut command) = restored_container_exec_command(container_id, launch)? {
+            if tty {
+                let (pty_master, slave_fd) = pty::open_pty(80, 24)?;
+                let slave_raw = slave_fd.as_raw_fd();
+                // SAFETY: `slave_fd` is a valid open PTY slave descriptor.
+                unsafe {
+                    command
+                        .stdin(Stdio::from_raw_fd(libc::dup(slave_raw)))
+                        .stdout(Stdio::from_raw_fd(libc::dup(slave_raw)))
+                        .stderr(Stdio::from_raw_fd(libc::dup(slave_raw)));
+                }
+                let child = command.spawn()?;
+                drop(slave_fd);
+                return Ok((child, Some(pty_master)));
+            }
+            let child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            return Ok((child, None));
+        }
+    }
+
+    if tty {
+        // Preferred: console socket (resizable). Mirrors the create path.
+        if CONSOLE_SOCKET_WORKS.load(Ordering::Relaxed) {
+            let console = pty::ConsoleSocket::bind(container_id)?;
+            let mut child = crun::CrunCommand::exec_with_console(
+                container_id,
+                env,
+                command,
+                workdir,
+                console.path(),
+            )
+            .user(launch.user.as_deref())
+            .spawn()?;
+            match console.recv_master(std::time::Duration::from_secs(3)) {
+                Ok(pty_master) => {
+                    let _ = pty_master.set_window_size(80, 24);
+                    if let Some(mut err) = child.stderr.take() {
+                        std::thread::spawn(move || {
+                            let mut sink = Vec::new();
+                            let _ = err.read_to_end(&mut sink);
+                        });
+                    }
+                    return Ok((child, Some(pty_master)));
+                }
+                Err(e) => {
+                    // A transient timeout (crun slow to hand back the console)
+                    // must not permanently disable console sockets for the rest
+                    // of the VM's life — that would silently lose resize on
+                    // every later session. Only latch off when the runtime
+                    // genuinely doesn't support them (a non-timeout failure).
+                    if e.kind() != std::io::ErrorKind::TimedOut {
+                        CONSOLE_SOCKET_WORKS.store(false, Ordering::Relaxed);
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stderr = child
+                        .stderr
+                        .take()
+                        .map(|mut s| {
+                            let mut buf = String::new();
+                            let _ = s.read_to_string(&mut buf);
+                            buf
+                        })
+                        .unwrap_or_default();
+                    warn!(error = %e, crun_stderr = %stderr.trim(), "exec console socket unavailable; falling back to stdio PTY");
+                }
+            }
+        }
+
+        // Fallback: attach the agent's PTY slave as crun exec's stdio.
+        let (pty_master, slave_fd) = pty::open_pty(80, 24)?;
+        let slave_raw = slave_fd.as_raw_fd();
+        // SAFETY: slave_fd is a valid open fd from openpty.
+        let child = unsafe {
+            crun::CrunCommand::exec(container_id, env, command, workdir, true)
+                .user(launch.user.as_deref())
+                .stdin_from_fd(libc::dup(slave_raw))
+                .stdout_from_fd(libc::dup(slave_raw))
+                .stderr_from_fd(libc::dup(slave_raw))
+                .spawn()?
+        };
+        drop(slave_fd);
+        Ok((child, Some(pty_master)))
+    } else {
+        let child = crun::CrunCommand::exec(container_id, env, command, workdir, false)
+            .user(launch.user.as_deref())
+            .stdin_piped()
+            .capture_output()
+            .spawn()?;
+        Ok((child, None))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn restored_container_id() -> Option<String> {
+    restored_container_id_at(std::path::Path::new(
+        smolvm_protocol::forkpoint::RESTORED_CONTAINER_PATH,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn restored_container_id_at(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(target_os = "linux")]
+fn container_workdir_path(
+    root: &std::path::Path,
+    guest_workdir: &str,
+) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+
+    let path = std::path::Path::new(guest_workdir);
+    if !path.is_absolute() {
+        return Err(format!(
+            "container workdir must be absolute: {guest_workdir}"
+        ));
+    }
+    let mut relative = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(value) => relative.push(value),
+            Component::ParentDir => {
+                if !relative.pop() {
+                    return Err(format!(
+                        "container workdir escapes its root: {guest_workdir}"
+                    ));
+                }
+            }
+            Component::Prefix(_) => {
+                return Err(format!("invalid container workdir: {guest_workdir}"));
+            }
+        }
+    }
+    Ok(root.join(relative))
+}
+
+/// Build a process that enters a snapshot-restored workload container without
+/// asking crun to create another process through restored runtime state.
+///
+/// Returning `None` means this is a fresh container and should use the normal
+/// OCI runtime path. Unprivileged workloads deliberately never call this path.
+#[cfg(target_os = "linux")]
+fn restored_container_exec_command(
+    container_id: &str,
+    launch: &ResolvedLaunch,
+) -> Result<Option<Command>, Box<dyn std::error::Error>> {
+    if restored_container_id().as_deref() != Some(container_id) {
+        return Ok(None);
+    }
+    let pid = crun_container_pid(container_id).ok_or_else(|| {
+        format!("restored container '{container_id}' no longer has a live init process")
+    })?;
+    let root = std::path::PathBuf::from(format!("/proc/{pid}/root"));
+    let guest_workdir = launch.workdir.as_deref().unwrap_or("/");
+    let host_workdir = container_workdir_path(&root, guest_workdir)?;
+
+    let target_environment = std::fs::read(format!("/proc/{pid}/environ"))?;
+    let mut environment = target_environment
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect::<Vec<_>>();
+    for (key, value) in &launch.env {
+        environment.retain(|(existing, _)| existing != key);
+        environment.push((key.clone(), value.clone()));
+    }
+    let environment = crun::augmented_exec_env(&environment, container_id);
+
+    let user = launch.user.as_deref().unwrap_or("0:0");
+    let (uid, gid) = user
+        .split_once(':')
+        .ok_or_else(|| format!("resolved container user is not uid:gid: {user}"))?;
+    let uid: u32 = uid.parse()?;
+    let gid: u32 = gid.parse()?;
+
+    let mut command = Command::new("/usr/bin/nsenter");
+    command
+        .arg("--target")
+        .arg(pid.to_string())
+        .args(["--mount", "--uts", "--ipc", "--pid"])
+        .arg(format!("--root={}", root.display()))
+        .arg(format!("--wd={}", host_workdir.display()))
+        .arg(format!("--setgid={gid}"))
+        .arg(format!("--setuid={uid}"))
+        .arg("--")
+        .args(&launch.command)
+        .env_clear()
+        .envs(environment);
+
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: setgroups is async-signal-safe and touches only child credentials.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setgroups(0, std::ptr::null()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    info!(
+        container_id,
+        pid,
+        command = ?launch.command,
+        "joining snapshot-restored container namespaces"
+    );
+    Ok(Some(command))
+}
+
+/// Look up a running main workload container for the given overlay ID.
+///
+/// Returns `Some(container_id)` if a container is registered and alive.
+/// Cleans up stale state (dead container ID file, orphaned crun state)
+/// and returns `None` so the caller falls through to a fresh `crun run`.
+///
+/// Used by both interactive and non-interactive exec paths.
+#[cfg(target_os = "linux")]
+pub fn resolve_main_container(persistent_overlay_id: Option<&str>) -> Option<String> {
+    let overlay_id = persistent_overlay_id?;
+    let workload_id = format!("persistent-{}", overlay_id);
+    let id_path = paths::main_container_id_path(&workload_id);
+
+    let cid = std::fs::read_to_string(&id_path).ok()?;
+    let cid = cid.trim().to_string();
+    if cid.is_empty() {
+        return None;
+    }
+
+    if let Some(pid) = crun_container_pid(&cid) {
+        stabilize_new_container(pid);
+    }
+
+    if is_container_running(&cid) {
+        // A restored fork clone's keep-alive container is alive (its process
+        // came back with the golden's RAM) but runs from the golden's
+        // pre-fork overlay mount, whose virtiofs lowerdirs are stale in the
+        // clone — joining it fails every exec with ESTALE. Only hand the
+        // container out if its overlay still answers lookups; otherwise
+        // recycle it so the caller re-establishes container + overlay fresh
+        // (the remount keeps the CoW-inherited upper layer).
+        if storage::persistent_overlay_mount_is_healthy(&workload_id) {
+            return Some(cid);
+        }
+        info!(container_id = %cid, "main container's overlay mount is stale (restored fork state); recycling");
+        let _ = std::fs::remove_file(&id_path);
+        let _ = crun::CrunCommand::delete(&cid, true).output();
+        return None;
+    }
+
+    // Stale: container died. Clean up the ID file and crun state.
+    info!(container_id = %cid, "main container not running, cleaning up stale state");
+    let _ = std::fs::remove_file(&id_path);
+    let _ = crun::CrunCommand::delete(&cid, true).output();
+    None
+}
+
+/// Close the short `crun start` race where a container reports running, its
+/// main command exits immediately afterwards, and an exec reaches crun before
+/// stale-state cleanup. Mature containers pay no delay; only a process in its
+/// first 100 ms is allowed to settle before the second validated state check.
+#[cfg(target_os = "linux")]
+fn stabilize_new_container(pid: u32) {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return;
+    };
+    let Some((_, remainder)) = stat.rsplit_once(')') else {
+        return;
+    };
+    let Some(start_ticks) = remainder
+        .split_whitespace()
+        .nth(19)
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let Some(uptime) = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|value| value.split_whitespace().next()?.parse::<f64>().ok())
+    else {
+        return;
+    };
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        return;
+    }
+    let age = uptime - start_ticks as f64 / ticks_per_second as f64;
+    const SETTLE_SECONDS: f64 = 0.1;
+    if (0.0..SETTLE_SECONDS).contains(&age) {
+        std::thread::sleep(std::time::Duration::from_secs_f64(SETTLE_SECONDS - age));
+    }
+}
+
+/// Non-Linux stub.
+#[cfg(not(target_os = "linux"))]
+pub fn resolve_main_container(_persistent_overlay_id: Option<&str>) -> Option<String> {
+    None
+}
+
+/// Whether the runtime's `--console-socket` handshake works in this environment.
+/// We attempt it once; if the runtime never hands back the console master (older
+/// crun, or a guest where it doesn't work), we flip this off and use the
+/// stdio-PTY fallback for the rest of the process's life — so only the first
+/// interactive session pays the connect timeout. The console path gives dynamic
+/// terminal resize; the fallback works everywhere but doesn't propagate resize.
+#[cfg(target_os = "linux")]
+static CONSOLE_SOCKET_WORKS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Spawn a command for interactive execution using crun OCI runtime.
+///
+/// When `tty` is true, the OCI spec sets `terminal: true` and the agent
+/// asks crun to allocate the container's PTY via `--console-socket`.
+/// crun sends the PTY master fd back to the agent over an AF_UNIX socket
+/// using `SCM_RIGHTS`; the agent then reads, writes, and resizes that
+/// master directly. This is the only way to make `TIOCSWINSZ` reach the
+/// process inside the container. Without `--console-socket` crun
+/// allocates its own PTY that the agent has no handle on, and every
+/// resize message is silently applied to the wrong terminal. See GH
+/// #156.
+/// Establish the long-lived "main" container for a persistent overlay and return
+/// its id. PID 1 is smolvm's image-independent keepalive and child reaper, so
+/// processes a later `crun exec` backgrounds inside it survive across exec calls
+/// for the machine's lifetime without accumulating orphan zombies. Env / workdir /
+/// user are inherited from the image so exec'd commands see the right environment.
+/// Uses the same two-step `crun create` + `crun start` as [`handle_run_detached`]
+/// (`crun run --detach` hangs in the smolvm VM environment).
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn ensure_main_container(
+    rootfs: &str,
+    overlay_id: Option<&str>,
+    mounts: &[(String, String, bool)],
+    unprivileged: bool,
+    base_launch: &ResolvedLaunch,
+    s3_volumes: &[smolvm_protocol::S3Volume],
+) -> Result<String, Box<dyn std::error::Error>> {
+    use std::path::Path;
+
+    let keepalive = ResolvedLaunch {
+        command: vec!["/run/smolvm/init".to_string(), "container-init".to_string()],
+        env: base_launch.env.clone(),
+        workdir: base_launch.workdir.clone(),
+        user: base_launch.user.clone(),
+    };
+
+    let rootfs_path = Path::new(rootfs);
+    let bundle_path = rootfs_path
+        .parent()
+        .ok_or("invalid rootfs path: no parent")?
+        .join("bundle");
+    if !bundle_path.exists() {
+        return Err(format!("bundle directory not found: {}", bundle_path.display()).into());
+    }
+
+    let container_id = write_oci_bundle(
+        rootfs_path,
+        &bundle_path,
+        &keepalive,
+        mounts,
+        false,
+        unprivileged,
+        true,
+    )?;
+
+    let create = crun::CrunCommand::create(&bundle_path, &container_id).output()?;
+    if !create.status.success() {
+        return Err(format!(
+            "keep-alive crun create failed: {}",
+            crun::create_failure_reason(&container_id, &create)
+        )
+        .into());
+    }
+    // Mount remote volumes in the window between create and start: the
+    // container's namespaces exist but its first instruction has not run, so
+    // anything exec'd into it afterwards is guaranteed to see the bucket. This
+    // is the same ordering `handle_run_detached` relies on, and the reason the
+    // container is established in two steps rather than with `crun run`.
+    if !s3_volumes.is_empty() {
+        if let Err(e) = s3mount::mount_all(&container_id, s3_volumes) {
+            let _ = crun::CrunCommand::kill(&container_id, "SIGKILL").status();
+            let _ = crun::CrunCommand::delete(&container_id, true).output();
+            return Err(format!("mount remote volume: {e}").into());
+        }
+    }
+
+    let start = crun::CrunCommand::start(&container_id).output()?;
+    if !start.status.success() {
+        let _ = crun::CrunCommand::delete(&container_id, true).output();
+        return Err(format!(
+            "keep-alive crun start failed: {}",
+            String::from_utf8_lossy(&start.stderr).trim()
+        )
+        .into());
+    }
+
+    // An ephemeral run has no overlay to key the container by; it lives and
+    // dies with this session, so there is nothing for a later exec to rejoin.
+    if let Some(overlay_id) = overlay_id {
+        let workload_id = format!("persistent-{}", overlay_id);
+        if let Err(e) = std::fs::write(
+            paths::main_container_id_path(&workload_id),
+            container_id.as_bytes(),
+        ) {
+            let _ = crun::CrunCommand::kill(&container_id, "SIGKILL").status();
+            let _ = crun::CrunCommand::delete(&container_id, true).output();
+            return Err(format!("failed to persist main container id: {}", e).into());
+        }
+    }
+    info!(container_id = %container_id, overlay_id = ?overlay_id, "established keep-alive main container");
+    Ok(container_id)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn spawn_interactive_command(
+    rootfs: &str,
+    launch: &ResolvedLaunch,
+    mounts: &[(String, String, bool)],
+    tty: bool,
+    persistent_overlay_id: Option<&str>,
+    unprivileged: bool,
+    s3_volumes: &[smolvm_protocol::S3Volume],
+) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+    use std::path::Path;
+
+    if launch.command.is_empty() {
+        return Err("empty command".into());
+    }
+
+    // The keep-alive join below runs the command via `crun exec --user`, which
+    // requires a NUMERIC uid[:gid] — a username (image `config.User` / request
+    // user) is rejected with "invalid USERSPEC specified". Resolve it against the
+    // container rootfs /etc/passwd, consistent with the `crun run` path (#632).
+    // (Harmless for the fresh-container path, which re-resolves via config.json.)
+    let mut exec_env = launch.env.clone();
+    oci::apply_process_env(Path::new(rootfs), launch.user.as_deref(), &mut exec_env);
+    let launch_owned = ResolvedLaunch {
+        command: launch.command.clone(),
+        env: exec_env,
+        workdir: launch.workdir.clone(),
+        user: oci::resolve_exec_user_spec(Path::new(rootfs), launch.user.as_deref())?,
+    };
+    let launch = &launch_owned;
+
+    // If a main workload container is running for this overlay, join it.
+    if let Some(cid) = resolve_main_container(persistent_overlay_id) {
+        return spawn_exec_in_container(&cid, launch, tty, unprivileged);
+    }
+
+    // On a persistent machine with no main container yet, establish a long-lived
+    // keep-alive container (PID 1 = smolvm's child reaper) and exec the command INTO
+    // it, rather than running the command AS the container. Without this, PID 1 is
+    // the command itself, so the container — and anything the command backgrounds
+    // (a `dockerd`, a dev server, a k3d cluster) — is torn down the moment the
+    // command returns, and the next exec sees a fresh container. Joining a
+    // keep-alive container makes backgrounded processes survive across execs for
+    // the machine's lifetime. On failure, fall through to the fresh-container path
+    // so exec never breaks outright.
+    if let Some(overlay_id) = persistent_overlay_id {
+        match ensure_main_container(
+            rootfs,
+            Some(overlay_id),
+            mounts,
+            unprivileged,
+            launch,
+            s3_volumes,
+        ) {
+            Ok(cid) => return spawn_exec_in_container(&cid, launch, tty, unprivileged),
+            Err(e) => {
+                // Falling back to a fresh container would silently drop the
+                // remote volumes, leaving the workload reading an empty
+                // directory. When volumes were requested the failure is the
+                // answer, not something to work around.
+                if !s3_volumes.is_empty() {
+                    return Err(e);
+                }
+                warn!(error = %e, "keep-alive main container setup failed; running in a fresh container")
+            }
+        }
+    }
+
+    // An ephemeral run with a remote volume cannot use `crun run`: that
+    // collapses create and start, leaving no window in which to mount, and the
+    // workload's first instruction would race the mount. Establish the
+    // container in two steps and exec the command into it instead.
+    if !s3_volumes.is_empty() {
+        let cid = ensure_main_container(rootfs, None, mounts, unprivileged, launch, s3_volumes)?;
+        return spawn_exec_in_container(&cid, launch, tty, unprivileged);
+    }
+
+    let rootfs_path = Path::new(rootfs);
+    let overlay_root = rootfs_path
+        .parent()
+        .ok_or("invalid rootfs path: no parent")?;
+    let bundle_path = overlay_root.join("bundle");
+
+    if !bundle_path.exists() {
+        return Err(format!("bundle directory not found: {}", bundle_path.display()).into());
+    }
+
+    // Build the OCI bundle (config.json) and get a fresh container ID. When
+    // tty=true the spec sets terminal:true and a starting consoleSize, and the
+    // PTY master is obtained from crun via --console-socket below.
+    let container_id = write_oci_bundle(
+        rootfs_path,
+        &bundle_path,
+        launch,
+        mounts,
+        tty,
+        unprivileged,
+        false,
+    )?;
+
+    // Persist the container ID so subsequent execs join this container.
+    // Written before spawn: if spawn fails the ID is stale, but
+    // is_container_running() will return false and the next exec starts fresh.
+    if let Some(overlay_id) = persistent_overlay_id {
+        let workload_id = format!("persistent-{}", overlay_id);
+        let _ = std::fs::write(
+            paths::main_container_id_path(&workload_id),
+            container_id.as_bytes(),
+        );
+    }
+
+    info!(
+        command = ?launch.command,
+        container_id = %container_id,
+        bundle = %bundle_path.display(),
+        mounts = mounts.len(),
+        tty = tty,
+        "spawning interactive container with crun"
+    );
+
+    // The single-container `Run` path keeps cgroups disabled (its VM is the
+    // limit); per-container cgroups are a pod-only concern.
+    spawn_crun_run(&bundle_path, &container_id, tty, false)
+}
+
+/// Launch a container with `crun run` and hand back the child plus the PTY
+/// master when `tty` is set (console-socket handshake, with the stdio-PTY
+/// fallback). This is the spawn tail shared by interactive `Run`
+/// ([`spawn_interactive_command`]) and pod containers
+/// ([`pod::handle_pod_start`] → `start_init_process`); the bundle must
+/// already be written.
+#[cfg(target_os = "linux")]
+fn spawn_crun_run(
+    bundle_path: &std::path::Path,
+    container_id: &str,
+    tty: bool,
+    cgroups: bool,
+) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+    use std::os::unix::io::AsRawFd as _;
+    use std::sync::atomic::Ordering;
+
+    if tty {
+        // Preferred path: take the container's console over a socket so the
+        // master we hold is the process's real tty (resize works).
+        if CONSOLE_SOCKET_WORKS.load(Ordering::Relaxed) {
+            let console = pty::ConsoleSocket::bind(container_id)?;
+            let cmd = if cgroups {
+                crun::CrunCommand::run_with_console_cgroupfs(
+                    bundle_path,
+                    container_id,
+                    console.path(),
+                )
+            } else {
+                crun::CrunCommand::run_with_console(bundle_path, container_id, console.path())
+            };
+            let mut child = cmd.spawn()?;
+            match console.recv_master(std::time::Duration::from_secs(3)) {
+                Ok(pty_master) => {
+                    let _ = pty_master.set_window_size(80, 24);
+                    // Drain crun's stderr so a chatty runtime can't fill the pipe.
+                    if let Some(mut err) = child.stderr.take() {
+                        std::thread::spawn(move || {
+                            let mut sink = Vec::new();
+                            let _ = err.read_to_end(&mut sink);
+                        });
+                    }
+                    return Ok((child, Some(pty_master)));
+                }
+                Err(e) => {
+                    // A transient timeout (crun slow to hand back the console)
+                    // must not permanently disable console sockets for the rest
+                    // of the VM's life — that would silently lose resize on
+                    // every later session. Only latch off when the runtime
+                    // genuinely doesn't support them (a non-timeout failure).
+                    if e.kind() != std::io::ErrorKind::TimedOut {
+                        CONSOLE_SOCKET_WORKS.store(false, Ordering::Relaxed);
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stderr = child
+                        .stderr
+                        .take()
+                        .map(|mut s| {
+                            let mut buf = String::new();
+                            let _ = s.read_to_string(&mut buf);
+                            buf
+                        })
+                        .unwrap_or_default();
+                    warn!(error = %e, crun_stderr = %stderr.trim(), "console socket unavailable; falling back to stdio PTY (resize will not propagate)");
+                    // The failed `crun run --console-socket` may have registered
+                    // container state under this id; clear it so the fallback
+                    // `crun run` with the same id doesn't hit "already exists".
+                    let _ = crun::CrunCommand::delete(container_id, true).output();
+                }
+            }
+        }
+
+        // Fallback: attach the agent's PTY slave as crun's stdio.
+        let (pty_master, slave_fd) = pty::open_pty(80, 24)?;
+        let slave_raw = slave_fd.as_raw_fd();
+        // SAFETY: slave_fd is a valid open fd from openpty.
+        let base = if cgroups {
+            crun::CrunCommand::run_cgroupfs(bundle_path, container_id)
+        } else {
+            crun::CrunCommand::run(bundle_path, container_id)
+        };
+        let child = unsafe {
+            base.stdin_from_fd(libc::dup(slave_raw))
+                .stdout_from_fd(libc::dup(slave_raw))
+                .stderr_from_fd(libc::dup(slave_raw))
+                .spawn()?
+        };
+        drop(slave_fd);
+        Ok((child, Some(pty_master)))
+    } else {
+        let base = if cgroups {
+            crun::CrunCommand::run_cgroupfs(bundle_path, container_id)
+        } else {
+            crun::CrunCommand::run(bundle_path, container_id)
+        };
+        let child = base.stdin_piped().capture_output().spawn()?;
+        Ok((child, None))
+    }
+}
+
+/// Non-Linux stub for spawn_interactive_command.
+#[cfg(not(target_os = "linux"))]
+fn spawn_interactive_command(
+    rootfs: &str,
+    launch: &ResolvedLaunch,
+    mounts: &[(String, String, bool)],
+    _tty: bool,
+    _persistent_overlay_id: Option<&str>,
+    unprivileged: bool,
+    _s3_volumes: &[smolvm_protocol::S3Volume],
+) -> Result<(Child, Option<()>), Box<dyn std::error::Error>> {
+    use std::path::Path;
+
+    let command: &[String] = &launch.command;
+    let env: &[(String, String)] = &launch.env;
+    let workdir: Option<&str> = launch.workdir.as_deref();
+    let user: Option<&str> = launch.user.as_deref();
+
+    if command.is_empty() {
+        return Err("empty command".into());
+    }
+
+    let rootfs_path = Path::new(rootfs);
+    let overlay_root = rootfs_path
+        .parent()
+        .ok_or("invalid rootfs path: no parent")?;
+    let bundle_path = overlay_root.join("bundle");
+
+    if !bundle_path.exists() {
+        return Err(format!("bundle directory not found: {}", bundle_path.display()).into());
+    }
+
+    let workdir_str = workdir.unwrap_or("/");
+    let identity = oci::resolve_process_identity(rootfs_path, user)?;
+    let mut spec = oci::OciSpec::new(command, env, workdir_str, false, &identity, unprivileged);
+    spec.add_gpu_devices_if_available();
+    spec.add_kvm_device_if_available();
+
+    for (tag, container_path, read_only) in mounts {
+        let virtiofs_mount = storage::volume_bind_source(tag);
+        spec.add_bind_mount(
+            &virtiofs_mount.to_string_lossy(),
+            container_path,
+            *read_only,
+        );
+    }
+
+    storage::add_workspace_fallback(&mut spec, mounts);
+    storage::add_storage_fallback(&mut spec, mounts, unprivileged);
+
+    // Forward SSH agent into the container if enabled at boot.
+    ssh_agent::inject_into_container(&mut spec);
+    publish_socket::inject_into_container(&mut spec);
+    rosetta::inject_into_container(&mut spec);
+    forkpoint::inject_into_container(&mut spec);
+    cuda::inject_into_container(&mut spec, rootfs_path);
+    vulkan::inject_into_container(&mut spec, rootfs_path);
+    credentials::inject_into_container(&mut spec, rootfs_path, mounts);
+
+    spec.write_to(&bundle_path)
+        .map_err(|e| format!("failed to write OCI spec: {}", e))?;
+
+    let container_id = oci::generate_container_id();
+
+    let child = crun::CrunCommand::run(&bundle_path, &container_id)
+        .stdin_piped()
+        .capture_output()
+        .spawn()?;
+
+    Ok((child, None))
+}
+
+/// Run the interactive I/O loop using poll() for efficient I/O multiplexing.
+/// Kill a child process and return a timeout exit code. Used when the host
+/// disconnects during an interactive exec — the agent must clean up the
+/// child and continue accepting new connections rather than propagating
+/// the I/O error.
+/// The client went away: kill the command and everything it started. For an
+/// image container the command is a grandchild (under `crun exec`), so killing
+/// only the direct child would leave it running.
+fn kill_child_on_disconnect(child: &mut Child) -> i32 {
+    process::kill_child_tree(child);
+    124
+}
+
+fn run_interactive_loop(
+    stream: &mut impl ReadWrite,
+    child: &mut Child,
+    timeout_ms: Option<u64>,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    let deadline = timeout_ms.map(|ms| start + Duration::from_millis(ms));
+
+    // Get handles to child's stdio
+    let mut child_stdout = child.stdout.take();
+    let mut child_stderr = child.stderr.take();
+    let mut child_stdin = child.stdin.take();
+
+    // Set non-blocking mode on stdout/stderr
+    if let Some(ref stdout) = child_stdout {
+        if !set_nonblocking(stdout.as_raw_fd()) {
+            warn!("failed to set stdout to non-blocking mode");
+        }
+    }
+    if let Some(ref stderr) = child_stderr {
+        if !set_nonblocking(stderr.as_raw_fd()) {
+            warn!("failed to set stderr to non-blocking mode");
+        }
+    }
+
+    let mut stdout_buf = [0u8; IO_BUFFER_SIZE];
+    let mut stderr_buf = [0u8; IO_BUFFER_SIZE];
+
+    loop {
+        // Check if child has exited
+        if let Some(status) = child.try_wait()? {
+            // Drain any remaining output
+            drain_remaining_output(
+                stream,
+                &mut child_stdout,
+                &mut child_stderr,
+                &mut stdout_buf,
+                &mut stderr_buf,
+            )?;
+            return Ok(process::exit_code_from_status(&status));
+        }
+
+        // Check timeout
+        if let Some(deadline) = deadline {
+            if Instant::now() >= deadline {
+                warn!("interactive command timed out, killing process");
+                // The whole tree: in an image container the command is a
+                // grandchild. Also reaps the child, avoiding a zombie.
+                process::kill_child_tree(child);
+                return Ok(124); // Timeout exit code
+            }
+        }
+
+        // Calculate poll timeout: either remaining time until deadline, or 100ms default
+        let poll_timeout_ms = match deadline {
+            Some(dl) => {
+                let remaining = dl.saturating_duration_since(Instant::now());
+                // Cap at 100ms to periodically check child exit status
+                remaining
+                    .as_millis()
+                    .min(INTERACTIVE_POLL_TIMEOUT_MS as u128) as i32
+            }
+            None => INTERACTIVE_POLL_TIMEOUT_MS,
+        };
+
+        // Build poll fds array for stdout, stderr, and vsock stream
+        let stdout_fd = child_stdout.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1);
+        let stderr_fd = child_stderr.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1);
+        let stream_fd = stream.as_raw_fd();
+
+        let mut poll_fds = [
+            libc::pollfd {
+                fd: stdout_fd,
+                events: if stdout_fd >= 0 { libc::POLLIN } else { 0 },
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stderr_fd,
+                events: if stderr_fd >= 0 { libc::POLLIN } else { 0 },
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stream_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+
+        // Wait for I/O or timeout using poll()
+        let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 3, poll_timeout_ms) };
+
+        if poll_result < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                debug!(error = %err, "poll error");
+            }
+            continue;
+        }
+
+        // Read available stdout. If send_response fails (host disconnected),
+        // kill the child and return gracefully.
+        if poll_fds[0].revents & libc::POLLIN != 0 {
+            if let Some(ref mut stdout) = child_stdout {
+                loop {
+                    match stdout.read(&mut stdout_buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if send_response(
+                                stream,
+                                &AgentResponse::Stdout {
+                                    data: stdout_buf[..n].to_vec(),
+                                },
+                            )
+                            .is_err()
+                            {
+                                debug!("host disconnected while sending stdout");
+                                return Ok(kill_child_on_disconnect(child));
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            debug!(error = %e, "stdout read error");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Read available stderr. Same disconnection handling as stdout.
+        if poll_fds[1].revents & libc::POLLIN != 0 {
+            if let Some(ref mut stderr) = child_stderr {
+                loop {
+                    match stderr.read(&mut stderr_buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if send_response(
+                                stream,
+                                &AgentResponse::Stderr {
+                                    data: stderr_buf[..n].to_vec(),
+                                },
+                            )
+                            .is_err()
+                            {
+                                debug!("host disconnected while sending stderr");
+                                return Ok(kill_child_on_disconnect(child));
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            debug!(error = %e, "stderr read error");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Read incoming request from host (stdin data, resize) — only when
+        // poll confirms data is available, then use blocking read_exact which
+        // is safe because the data is already in the kernel buffer.
+        //
+        // If the host disconnects (client killed, timeout), read_exact returns
+        // an error. In that case, kill the child and return gracefully — the
+        // agent must survive client disconnections.
+        if poll_fds[2].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            let mut header = [0u8; 4];
+            if let Err(e) = stream.read_exact(&mut header) {
+                debug!(error = %e, "host disconnected during interactive exec");
+                return Ok(kill_child_on_disconnect(child));
+            }
+            let len = u32::from_be_bytes(header) as usize;
+            if len > MAX_MESSAGE_SIZE {
+                return Err(format!("message too large: {} bytes", len).into());
+            }
+            let mut buf = vec![0u8; len];
+            if let Err(e) = stream.read_exact(&mut buf) {
+                debug!(error = %e, "host disconnected during interactive exec payload");
+                return Ok(kill_child_on_disconnect(child));
+            }
+            let request: AgentRequest = serde_json::from_slice(&buf)?;
+
+            match request {
+                AgentRequest::Stdin { data } => {
+                    if data.is_empty() {
+                        drop(child_stdin.take());
+                    } else if let Some(ref mut stdin) = child_stdin {
+                        let _ = stdin.write_all(&data);
+                        let _ = stdin.flush();
+                    }
+                }
+                AgentRequest::Resize { cols, rows } => {
+                    debug!(cols, rows, "resize requested (no PTY in pipe mode)");
+                }
+                _ => {
+                    warn!("unexpected request during interactive session");
+                }
+            }
+        }
+    }
+}
+
+/// Run the interactive I/O loop for PTY-based sessions.
+///
+/// Unlike `run_interactive_loop`, this polls a single PTY master fd
+/// (PTY merges stdout and stderr) and supports terminal resize.
+#[cfg(target_os = "linux")]
+fn run_interactive_loop_pty(
+    stream: &mut impl ReadWrite,
+    child: &mut Child,
+    pty_master: pty::PtyMaster,
+    timeout_ms: Option<u64>,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    let deadline = timeout_ms.map(|ms| start + Duration::from_millis(ms));
+
+    // Set the master fd to non-blocking so we can poll it.
+    if !set_nonblocking(pty_master.as_raw_fd()) {
+        warn!("failed to set PTY master to non-blocking mode");
+    }
+
+    let mut buf = [0u8; IO_BUFFER_SIZE];
+
+    loop {
+        // Check if child has exited.
+        if let Some(status) = child.try_wait()? {
+            // Drain remaining PTY output.
+            loop {
+                match pty_master.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        send_response(
+                            stream,
+                            &AgentResponse::Stdout {
+                                data: buf[..n].to_vec(),
+                            },
+                        )?;
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.raw_os_error() == Some(libc::EIO) =>
+                    {
+                        // EIO is expected when the slave side is closed.
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            return Ok(process::exit_code_from_status(&status));
+        }
+
+        // Check timeout.
+        if let Some(deadline) = deadline {
+            if Instant::now() >= deadline {
+                warn!("interactive PTY command timed out, killing process");
+                process::kill_child_tree(child);
+                return Ok(124);
+            }
+        }
+
+        // Poll the PTY master fd for readable data.
+        let poll_timeout_ms = match deadline {
+            Some(dl) => {
+                let remaining = dl.saturating_duration_since(Instant::now());
+                remaining
+                    .as_millis()
+                    .min(INTERACTIVE_POLL_TIMEOUT_MS as u128) as i32
+            }
+            None => INTERACTIVE_POLL_TIMEOUT_MS,
+        };
+
+        // Poll PTY master and vsock stream for readable data.
+        let stream_fd = stream.as_raw_fd();
+        let mut poll_fds = [
+            libc::pollfd {
+                fd: pty_master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stream_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+
+        let poll_result = unsafe { libc::poll(poll_fds.as_mut_ptr(), 2, poll_timeout_ms) };
+
+        if poll_result < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                debug!(error = %err, "poll error on PTY master");
+            }
+            continue;
+        }
+
+        // Read available data from PTY master. If send_response fails
+        // (host disconnected), kill the child and return gracefully.
+        let mut slave_closed = false;
+        if poll_fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            loop {
+                match pty_master.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if send_response(
+                            stream,
+                            &AgentResponse::Stdout {
+                                data: buf[..n].to_vec(),
+                            },
+                        )
+                        .is_err()
+                        {
+                            debug!("host disconnected while sending PTY stdout");
+                            return Ok(kill_child_on_disconnect(child));
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+                        // Slave side closed — child is exiting. Reap immediately
+                        // instead of waiting for the next poll cycle.
+                        slave_closed = true;
+                        break;
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "PTY master read error");
+                        slave_closed = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // If the slave closed, the process is exiting — reap it now.
+        if slave_closed {
+            let status = child.wait()?;
+            return Ok(process::exit_code_from_status(&status));
+        }
+
+        // Read incoming request from host — only when poll confirms data
+        // is available, then use blocking read_exact (safe, data is buffered).
+        // If the host disconnects, kill the child and return gracefully.
+        if poll_fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            let mut header = [0u8; 4];
+            if let Err(e) = stream.read_exact(&mut header) {
+                debug!(error = %e, "host disconnected during PTY interactive exec");
+                return Ok(kill_child_on_disconnect(child));
+            }
+            let len = u32::from_be_bytes(header) as usize;
+            if len > MAX_MESSAGE_SIZE {
+                return Err(format!("message too large: {} bytes", len).into());
+            }
+            let mut msg_buf = vec![0u8; len];
+            if let Err(e) = stream.read_exact(&mut msg_buf) {
+                debug!(error = %e, "host disconnected during PTY interactive exec payload");
+                return Ok(kill_child_on_disconnect(child));
+            }
+            let request: AgentRequest = serde_json::from_slice(&msg_buf)?;
+
+            match request {
+                AgentRequest::Stdin { data } => {
+                    if data.is_empty() {
+                        // Host stdin reached EOF. A PTY cannot have one
+                        // direction closed, so signal end-of-input to the
+                        // child by writing the EOF control character (VEOF,
+                        // Ctrl-D / 0x04). In canonical mode VEOF makes the
+                        // pending line available to the child's read()
+                        // immediately; a read() that finds an empty line
+                        // buffer returns 0, which is the EOF the child waits
+                        // for. Without it a stdin-reading child (cat, sh,
+                        // read) never terminates and the exec session hangs.
+                        //
+                        // Send it twice: if the host's final stdin chunk was
+                        // not newline-terminated, the first VEOF only flushes
+                        // that partial line (delivered as data, not EOF), so a
+                        // second VEOF — now at an empty line buffer — is what
+                        // produces the zero-length read. When the buffer is
+                        // already empty the first VEOF yields EOF and the
+                        // second is harmlessly consumed after the child exits.
+                        let _ = pty_master.write_all(&[0x04, 0x04]);
+                    } else {
+                        let _ = pty_master.write_all(&data);
+                    }
+                }
+                AgentRequest::Resize { cols, rows } => {
+                    if let Err(e) = pty_master.set_window_size(cols, rows) {
+                        debug!(error = %e, cols, rows, "failed to set PTY window size");
+                    }
+                }
+                _ => {
+                    warn!("unexpected request during interactive PTY session");
+                }
+            }
+        }
+    }
+}
+
+/// Drain any remaining output from stdout/stderr after child exits.
+fn drain_remaining_output(
+    stream: &mut impl Write,
+    child_stdout: &mut Option<std::process::ChildStdout>,
+    child_stderr: &mut Option<std::process::ChildStderr>,
+    stdout_buf: &mut [u8],
+    stderr_buf: &mut [u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+
+    if let Some(ref mut stdout) = child_stdout {
+        loop {
+            match stdout.read(stdout_buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    send_response(
+                        stream,
+                        &AgentResponse::Stdout {
+                            data: stdout_buf[..n].to_vec(),
+                        },
+                    )?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+    }
+    if let Some(ref mut stderr) = child_stderr {
+        loop {
+            match stderr.read(stderr_buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    send_response(
+                        stream,
+                        &AgentResponse::Stderr {
+                            data: stderr_buf[..n].to_vec(),
+                        },
+                    )?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Set a file descriptor to non-blocking mode.
+///
+/// Returns true if successful, false if fcntl() failed.
+fn set_nonblocking(fd: i32) -> bool {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            debug!(fd, "fcntl(F_GETFL) failed");
+            return false;
+        }
+        let result = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        if result < 0 {
+            debug!(fd, "fcntl(F_SETFL, O_NONBLOCK) failed");
+            return false;
+        }
+        true
+    }
+}
+
+/// Extract host:port from a URL for TCP connection testing.
+///
+/// Supports URLs like:
+/// - `http://example.com` -> `example.com:80`
+/// - `https://example.com` -> `example.com:443`
+/// - `http://example.com:8080` -> `example.com:8080`
+/// - `example.com:80` -> `example.com:80`
+fn extract_host_port(url: &str) -> Option<String> {
+    // Remove protocol prefix if present
+    let without_proto = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+
+    // Extract host (remove path)
+    let host_port = without_proto.split('/').next()?;
+
+    // If no port, add default based on protocol
+    if host_port.contains(':') {
+        Some(host_port.to_string())
+    } else if url.starts_with("https://") {
+        Some(format!("{}:443", host_port))
+    } else {
+        Some(format!("{}:80", host_port))
+    }
+}
+
+/// Test TCP connection using pure syscalls (bypass C library).
+/// Connects to the specified target and sends HTTP GET request.
+///
+/// # Arguments
+/// * `target` - Host:port to connect to (e.g., "1.1.1.1:80", "example.com:443")
+fn test_tcp_syscall(target: &str) -> serde_json::Value {
+    use std::io::{Read as _, Write as _};
+    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    info!(target = %target, "testing TCP with pure Rust std::net");
+
+    // Resolve the target to socket address
+    let addr: SocketAddr = match target.to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(addr) => addr,
+            None => {
+                return serde_json::json!({
+                    "success": false,
+                    "error": "could not resolve target address",
+                    "target": target,
+                });
+            }
+        },
+        Err(e) => {
+            return serde_json::json!({
+                "success": false,
+                "error": format!("failed to resolve {}: {}", target, e),
+                "target": target,
+            });
+        }
+    };
+
+    // Extract host for HTTP Host header
+    let host = target.split(':').next().unwrap_or(target);
+
+    let connect_result =
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(NETWORK_TEST_TIMEOUT_SECS)) {
+            Ok(mut stream) => {
+                // Try to set timeouts
+                let _ =
+                    stream.set_read_timeout(Some(Duration::from_secs(NETWORK_TEST_TIMEOUT_SECS)));
+                let _ =
+                    stream.set_write_timeout(Some(Duration::from_secs(NETWORK_TEST_TIMEOUT_SECS)));
+
+                // Send a simple HTTP request
+                let request = format!("GET / HTTP/1.0\r\nHost: {}\r\n\r\n", host);
+                match stream.write_all(request.as_bytes()) {
+                    Ok(_) => {
+                        // Try to read the response
+                        let mut response = vec![0u8; 1024];
+                        match stream.read(&mut response) {
+                            Ok(n) => {
+                                let response_str =
+                                    String::from_utf8_lossy(&response[..n.min(200)]).to_string();
+                                serde_json::json!({
+                                    "success": true,
+                                    "connected": true,
+                                    "sent_request": true,
+                                    "received_bytes": n,
+                                    "response_preview": response_str,
+                                })
+                            }
+                            Err(e) => {
+                                serde_json::json!({
+                                    "success": false,
+                                    "connected": true,
+                                    "sent_request": true,
+                                    "read_error": format!("{}", e),
+                                    "read_error_kind": format!("{:?}", e.kind()),
+                                })
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        serde_json::json!({
+                            "success": false,
+                            "connected": true,
+                            "write_error": format!("{}", e),
+                        })
+                    }
+                }
+            }
+            Err(e) => {
+                // Get more details about the error
+                let raw_os_error = e.raw_os_error();
+                serde_json::json!({
+                    "success": false,
+                    "connected": false,
+                    "error": format!("{}", e),
+                    "error_kind": format!("{:?}", e.kind()),
+                    "raw_os_error": raw_os_error,
+                })
+            }
+        };
+
+    // Also test socket syscall and lseek behavior using safe nix APIs
+    #[cfg(target_os = "linux")]
+    let socket_test = {
+        use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
+        use nix::unistd::{lseek, Whence};
+        use std::os::fd::AsRawFd;
+
+        match socket(
+            AddressFamily::Inet,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        ) {
+            Ok(fd) => {
+                let raw_fd = fd.as_raw_fd();
+
+                // Test lseek on the socket - this should return ESPIPE (29) for normal sockets
+                let (lseek_result, lseek_errno) = match lseek(raw_fd, 0, Whence::SeekCur) {
+                    Ok(offset) => (offset, None),
+                    Err(e) => (-1, Some((e as i32, e.desc().to_string()))),
+                };
+
+                // fd is automatically closed when OwnedFd drops
+                serde_json::json!({
+                    "socket_created": true,
+                    "fd": raw_fd,
+                    "sock_type": libc::SOCK_STREAM,  // We know we created SOCK_STREAM
+                    "lseek_result": lseek_result,
+                    "lseek_errno": lseek_errno.map(|(e, s)| serde_json::json!({"code": e, "str": s})),
+                    "expected_errno_espipe": 29,  // ESPIPE = 29 on Linux
+                })
+            }
+            Err(e) => {
+                serde_json::json!({
+                    "socket_created": false,
+                    "errno": e as i32,
+                    "errno_str": e.desc().to_string(),
+                })
+            }
+        }
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let socket_test = serde_json::json!({
+        "skipped": true,
+        "reason": "socket test only available on Linux"
+    });
+
+    // Test 3: Try nc (netcat) if available
+    let nc_result = match std::process::Command::new("nc")
+        .args(["-w", "5", "1.1.1.1", "80"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(mut child) => {
+            // Send HTTP request via stdin
+            if let Some(ref mut stdin) = child.stdin {
+                let _ = stdin.write_all(b"GET / HTTP/1.0\r\nHost: 1.1.1.1\r\n\r\n");
+            }
+            drop(child.stdin.take());
+
+            match child.wait_with_output() {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    serde_json::json!({
+                        "tool": "nc",
+                        "success": output.status.success(),
+                        "exit_code": output.status.code(),
+                        "stdout_preview": stdout.chars().take(200).collect::<String>(),
+                        "stderr": stderr.to_string(),
+                    })
+                }
+                Err(e) => serde_json::json!({
+                    "tool": "nc",
+                    "error": format!("wait error: {}", e),
+                }),
+            }
+        }
+        Err(e) => serde_json::json!({
+            "tool": "nc",
+            "error": format!("spawn error: {}", e),
+        }),
+    };
+
+    // Test 4: Try curl if available
+    let curl_result = match std::process::Command::new("curl")
+        .args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--connect-timeout",
+            "10",
+            "http://1.1.1.1",
+        ])
+        .output()
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            serde_json::json!({
+                "tool": "curl",
+                "success": output.status.success(),
+                "exit_code": output.status.code(),
+                "http_code": stdout,
+                "stderr": stderr,
+            })
+        }
+        Err(e) => serde_json::json!({
+            "tool": "curl",
+            "error": format!("{}", e),
+        }),
+    };
+
+    serde_json::json!({
+        "rust_std_net": connect_result,
+        "raw_socket": socket_test,
+        "nc": nc_result,
+        "curl": curl_result,
+    })
+}
+
+/// Handle command execution request (non-interactive).
+/// Handle a background `Run` request — spawn the container and return its PID.
+///
+/// Background mode requires a persistent overlay ID; an ephemeral overlay
+/// would leak because nothing waits for the container to exit to clean it
+/// up. The returned PID is the crun process, which stays alive as long as
+/// the container's init process runs.
+#[allow(clippy::too_many_arguments)]
+fn handle_run_background(
+    image: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    user: Option<&str>,
+    mounts: &[(String, String, bool)],
+    persistent_overlay_id: Option<&str>,
+    unprivileged: bool,
+    s3_volumes: &[smolvm_protocol::S3Volume],
+) -> AgentResponse {
+    info!(image = %image, command = ?command, mounts = ?mounts, "running command in background");
+
+    let Some(overlay_id) = persistent_overlay_id else {
+        return AgentResponse::error(
+            "background run requires persistent_overlay_id",
+            error_codes::INVALID_REQUEST,
+        );
+    };
+
+    // Run the background command DETACHED inside the machine's long-lived
+    // keep-alive container (via `crun exec --detach`), NOT as a separate
+    // `crun run` container. The old separate-container path
+    // (`spawn_in_overlay`) shared the overlay's merged mount and per-overlay
+    // OCI bundle with the keep-alive container; the two conflicted and the
+    // background container died within seconds — so a documented "long-lived
+    // daemon" (dev server, agent) never survived (QA 2026-07-19, F-12).
+    // Running inside the keep-alive container makes the background process a
+    // child of the container's PID 1, sharing the exact namespace/filesystem
+    // every foreground exec sees, and it lives for the machine's lifetime.
+    #[cfg(target_os = "linux")]
+    {
+        match run_background_in_keepalive(
+            overlay_id,
+            image,
+            command,
+            env,
+            workdir,
+            user,
+            mounts,
+            unprivileged,
+            s3_volumes,
+        ) {
+            Ok(resp) => return resp,
+            Err(e) => {
+                // Falling back to a fresh container would silently drop the
+                // remote volumes, leaving the workload reading an empty
+                // directory. When volumes were requested the failure is the
+                // answer, not something to work around.
+                if !s3_volumes.is_empty() {
+                    return AgentResponse::error(
+                        format!("mount remote volume: {e}"),
+                        error_codes::SPAWN_FAILED,
+                    );
+                }
+                warn!(error = %e, "keep-alive background exec failed; falling back to a fresh container");
+            }
+        }
+    }
+
+    match storage::spawn_in_overlay(
+        image,
+        command,
+        env,
+        workdir,
+        user,
+        mounts,
+        overlay_id,
+        unprivileged,
+    ) {
+        Ok(pid) => AgentResponse::Completed {
+            exit_code: 0,
+            stdout: format!("{}", pid).into_bytes(),
+            stderr: Vec::new(),
+        },
+        Err(e) => AgentResponse::from_err(e, error_codes::RUN_FAILED),
+    }
+}
+
+/// Launch a background command detached inside the machine's keep-alive
+/// container, establishing the keep-alive container first if needed. Mirrors
+/// [`run_in_keepalive_container`]'s container resolution, then `crun exec
+/// --detach` instead of a foreground exec.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn run_background_in_keepalive(
+    overlay_id: &str,
+    image: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    user: Option<&str>,
+    mounts: &[(String, String, bool)],
+    unprivileged: bool,
+    s3_volumes: &[smolvm_protocol::S3Volume],
+) -> Result<AgentResponse, Box<dyn std::error::Error>> {
+    let mut launch = ResolvedLaunch::resolve(
+        image,
+        command.to_vec(),
+        env.to_vec(),
+        workdir.map(str::to_string),
+        user.map(str::to_string),
+        // Keep-alive/exec path: it JOINS the workload container that already
+        // holds the remote-volume mount, so no mount is established here.
+        Vec::new(),
+    )?;
+
+    let (cid, rootfs) = match resolve_main_container(Some(overlay_id)) {
+        Some(c) => (c, storage::persistent_overlay_rootfs(overlay_id)),
+        None => {
+            let prepared = storage::prepare_for_run_persistent(image, overlay_id)?;
+            storage::setup_mounts(&prepared.rootfs_path, mounts)?;
+            let cid = ensure_main_container(
+                &prepared.rootfs_path,
+                Some(overlay_id),
+                mounts,
+                unprivileged,
+                &launch,
+                s3_volumes,
+            )?;
+            (cid, std::path::PathBuf::from(&prepared.rootfs_path))
+        }
+    };
+
+    // `crun exec --user` needs a numeric uid[:gid]; resolve any username
+    // against the container's /etc/passwd, same as the foreground path.
+    oci::apply_process_env(&rootfs, launch.user.as_deref(), &mut launch.env);
+    launch.user = oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    // Capture the detached process's PID via a pid-file so the response
+    // honors the run-background contract (the host client parses a PID from
+    // stdout). Unique per launch to avoid collisions between concurrent
+    // background execs on the same machine.
+    let pid_file = std::path::PathBuf::from(format!(
+        "/tmp/smolvm-bg-{}-{}.pid",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let pid = if !unprivileged {
+        if let Some(mut command) = restored_container_exec_command(&cid, &launch)? {
+            let child = command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+            child.id()
+        } else {
+            run_crun_background_exec(&cid, &launch, &pid_file)?
+        }
+    } else {
+        run_crun_background_exec(&cid, &launch, &pid_file)?
+    };
+    let _ = std::fs::remove_file(&pid_file);
+
+    Ok(AgentResponse::Completed {
+        exit_code: 0,
+        stdout: format!("{pid}").into_bytes(),
+        stderr: Vec::new(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn run_crun_background_exec(
+    container_id: &str,
+    launch: &ResolvedLaunch,
+    pid_file: &std::path::Path,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let status = crun::CrunCommand::exec_detached(
+        container_id,
+        &launch.env,
+        &launch.command,
+        launch.workdir.as_deref(),
+        Some(pid_file),
+    )
+    .user(launch.user.as_deref())
+    .stdin_null()
+    .discard_output()
+    .status()?;
+    if !status.success() {
+        return Err(format!(
+            "crun exec --detach failed (exit {})",
+            status.code().unwrap_or(-1)
+        )
+        .into());
+    }
+    Ok(std::fs::read_to_string(pid_file)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0))
+}
+
+/// Non-streaming exec/run returns the whole output in a single wire frame. If it
+/// would exceed the frame budget, return a clear error instead of attempting an
+/// oversized frame — which otherwise fails mid-send and surfaces to the caller as
+/// a confusing connection drop / SIGPIPE-truncated result. Large output should
+/// use streaming exec (`exec_stream`/`execStream`). The budget leaves headroom
+/// under MAX_FRAME_SIZE for base64 of the byte fields (~4/3) plus the JSON envelope.
+fn oversized_output_error(stdout: &[u8], stderr: &[u8]) -> Option<AgentResponse> {
+    const BUDGET: usize = 20 * 1024 * 1024; // ~20 MiB raw → ~27 MiB base64, under the 32 MiB frame
+    let total = stdout.len() + stderr.len();
+    if total > BUDGET {
+        return Some(AgentResponse::error(
+            format!(
+                "command output too large ({total} bytes; limit {BUDGET}). \
+                 Redirect large output to a file and download it via the files \
+                 API — streaming exec is capped at the same output budget."
+            ),
+            error_codes::EXEC_FAILED,
+        ));
+    }
+    None
+}
+
+/// Swap a `Completed` response whose captured output would overflow the wire
+/// frame for the clean oversized-output error. EVERY exec return path must pass
+/// through this — otherwise the frame-size validator rejects the send and the
+/// caller sees an opaque "frame too large" 500 with zero output (e.g. the
+/// keep-alive container path, whose output previously skipped the guard the
+/// fresh-container path applied).
+fn cap_exec_response(resp: AgentResponse) -> AgentResponse {
+    if let AgentResponse::Completed {
+        ref stdout,
+        ref stderr,
+        ..
+    } = resp
+    {
+        if let Some(err) = oversized_output_error(stdout, stderr) {
+            return err;
+        }
+    }
+    resp
+}
+
+/// Run a non-interactive command inside the machine's long-lived keep-alive
+/// container (establishing it on first use), capturing its output. Joining the
+/// keep-alive container — rather than spawning a fresh one per exec — is what
+/// lets a process this command backgrounds (a `dockerd`, a dev server, a k3d
+/// cluster) survive into later execs for the machine's lifetime. Returns the
+/// captured result; the caller falls back to a fresh container on error.
+/// Deletes a container when dropped, or does nothing when there is none.
+///
+/// An ephemeral `run` establishes its own container so a remote volume can be
+/// mounted between create and start. Nothing will ever rejoin that container,
+/// so it has to go when the run returns — including on the error paths, which
+/// is why this is a guard rather than a call at the end.
+#[cfg(target_os = "linux")]
+struct EphemeralContainer(Option<String>);
+
+#[cfg(target_os = "linux")]
+impl Drop for EphemeralContainer {
+    fn drop(&mut self) {
+        if let Some(id) = self.0.take() {
+            let _ = crun::CrunCommand::kill(&id, "SIGKILL").status();
+            let _ = crun::CrunCommand::delete(&id, true).output();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn run_in_keepalive_container(
+    overlay_id: Option<&str>,
+    image: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    user: Option<&str>,
+    mounts: &[(String, String, bool)],
+    unprivileged: bool,
+    timeout_ms: Option<u64>,
+    stdin_data: Option<&str>,
+    client_fd: Option<std::os::unix::io::RawFd>,
+    s3_volumes: &[smolvm_protocol::S3Volume],
+) -> Result<AgentResponse, Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+
+    let mut launch = ResolvedLaunch::resolve(
+        image,
+        command.to_vec(),
+        env.to_vec(),
+        workdir.map(str::to_string),
+        user.map(str::to_string),
+        // Keep-alive/exec path: it JOINS the workload container that already
+        // holds the remote-volume mount, so no mount is established here.
+        Vec::new(),
+    )?;
+
+    // Reuse the running keep-alive container, or establish one now so this and
+    // every later exec join the same container (PID 1 = smolvm's child reaper).
+    // Also carry the container's rootfs so the user can be resolved against its
+    // /etc/passwd below.
+    // An ephemeral run has no overlay to key a container by, so there is never
+    // one to rejoin: it establishes its own and tears it down when it returns.
+    let reusable = overlay_id.and_then(|id| resolve_main_container(Some(id)));
+    let (cid, rootfs, ephemeral) = match (reusable, overlay_id) {
+        (Some(c), Some(id)) => (c, storage::persistent_overlay_rootfs(id), false),
+        _ => {
+            let prepared = match overlay_id {
+                Some(id) => storage::prepare_for_run_persistent(image, id)?,
+                None => storage::prepare_for_run(image)?,
+            };
+            storage::setup_mounts(&prepared.rootfs_path, mounts)?;
+            let cid = ensure_main_container(
+                &prepared.rootfs_path,
+                overlay_id,
+                mounts,
+                unprivileged,
+                &launch,
+                s3_volumes,
+            )?;
+            (
+                cid,
+                std::path::PathBuf::from(&prepared.rootfs_path),
+                overlay_id.is_none(),
+            )
+        }
+    };
+    // A container established for an ephemeral run must not outlive it, or a
+    // long-lived VM accumulates one per `run`. Dropped on every exit path.
+    let _reaper = EphemeralContainer(ephemeral.then(|| cid.clone()));
+
+    // The workload runs via `crun exec --user`, which requires a NUMERIC uid[:gid]
+    // — a username (the image's `config.User`, e.g. `nobody`/`node`, or the
+    // request user) is rejected with "invalid USERSPEC specified". Resolve it
+    // against the container's /etc/passwd, matching the `crun run` path (#632).
+    oci::apply_process_env(&rootfs, launch.user.as_deref(), &mut launch.env);
+    launch.user = oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    // Spawn the exec, wire stdin, then wait with the SAME timeout + client
+    // liveness contract every other exec path uses. The keep-alive path
+    // previously used blocking `.output()` / `wait_with_output()`, which
+    // silently ignored `timeout_ms` — an `exec --timeout N` against an image
+    // machine ran to completion regardless (found by QA 2026-07-19).
+    let exec_pid_file = crun::ExecPidFile::new()?;
+    let (mut child, namespace_exec) = if !unprivileged {
+        if let Some(mut command) = restored_container_exec_command(&cid, &launch)? {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            if stdin_data.is_some() {
+                command.stdin(Stdio::piped());
+            } else {
+                command.stdin(Stdio::null());
+            }
+            (command.spawn()?, true)
+        } else {
+            (
+                spawn_crun_foreground_exec(&cid, &launch, &exec_pid_file, stdin_data)?,
+                false,
+            )
+        }
+    } else {
+        (
+            spawn_crun_foreground_exec(&cid, &launch, &exec_pid_file, stdin_data)?,
+            false,
+        )
+    };
+    if namespace_exec {
+        std::fs::write(exec_pid_file.path(), child.id().to_string())?;
+    }
+    if let (Some(data), Some(mut stdin)) = (stdin_data, child.stdin.take()) {
+        let _ = stdin.write_all(data.as_bytes());
+        // Drop closes the pipe → the command sees EOF.
+    }
+
+    // Kill only the exec'd process on timeout/disconnect — NOT the keep-alive
+    // container, which hosts the shared namespace for every exec (a timed-out
+    // `exec -- sleep 10` must not destroy the machine's workload).
+    let result = crate::process::wait_with_timeout_cleanup_and_liveness(
+        &mut child,
+        timeout_ms,
+        client_fd,
+        || {
+            exec_pid_file.kill_workload();
+        },
+    )?;
+
+    Ok(match result {
+        crate::process::WaitResult::Completed { exit_code, output } => AgentResponse::Completed {
+            exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        },
+        crate::process::WaitResult::TimedOut { output, timeout_ms } => {
+            let mut stderr = output.stderr;
+            stderr.extend_from_slice(
+                format!("\ncommand timed out after {}ms", timeout_ms).as_bytes(),
+            );
+            AgentResponse::Completed {
+                exit_code: crate::process::TIMEOUT_EXIT_CODE,
+                stdout: output.stdout,
+                stderr,
+            }
+        }
+        crate::process::WaitResult::ClientDisconnected { output } => {
+            let mut stderr = output.stderr;
+            stderr.extend_from_slice(b"\nclient disconnected");
+            AgentResponse::Completed {
+                exit_code: 137,
+                stdout: output.stdout,
+                stderr,
+            }
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_crun_foreground_exec(
+    container_id: &str,
+    launch: &ResolvedLaunch,
+    exec_pid_file: &crun::ExecPidFile,
+    stdin_data: Option<&str>,
+) -> Result<Child, Box<dyn std::error::Error>> {
+    let mut builder = crun::CrunCommand::exec(
+        container_id,
+        &launch.env,
+        &launch.command,
+        launch.workdir.as_deref(),
+        false,
+    )
+    .user(launch.user.as_deref())
+    .pid_file(exec_pid_file.path())
+    .capture_output();
+    builder = if stdin_data.is_some() {
+        builder.stdin_piped()
+    } else {
+        builder.stdin_null()
+    };
+    Ok(builder.spawn()?)
+}
+
+// Mirrors `storage::run_command`'s workload parameter list one-for-one; both
+// want folding into a shared spec struct rather than trimming here.
+#[allow(clippy::too_many_arguments)]
+fn handle_run(
+    image: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    user: Option<&str>,
+    mounts: &[(String, String, bool)],
+    timeout_ms: Option<u64>,
+    persistent_overlay_id: Option<&str>,
+    stdin_data: Option<&str>,
+    client_fd: Option<std::os::unix::io::RawFd>,
+    unprivileged: bool,
+    s3_volumes: &[smolvm_protocol::S3Volume],
+) -> AgentResponse {
+    info!(image = %image, command = ?command, mounts = ?mounts, timeout_ms = ?timeout_ms, persistent = persistent_overlay_id.is_some(), stdin = stdin_data.is_some(), "running command");
+
+    // Host-injected boot mounts (including the implicit CUDA ring) must be
+    // present in ordinary non-interactive containers too. Interactive and
+    // detached paths already merge them; omitting them here creates a fresh
+    // post-fork overlay with a plain /opt/smolvm-ring directory, so mapped
+    // host allocations fall back or can hit the clone's stale golden mount.
+    let mounts = storage::merged_with_boot_mounts(mounts);
+    let mounts = &mounts[..];
+
+    // SSH agent forwarding: make SSH_AUTH_SOCK part of the command env so it
+    // survives the keep-alive `crun exec` path (#542), which runs commands with
+    // this env rather than the keep-alive container's own. No-op when forwarding
+    // is off; harmless on the fresh-container path.
+    let mut env = env.to_vec();
+    ssh_agent::inject_into_env(&mut env);
+    let env = &env[..];
+
+    // Honor the image's default USER when the request doesn't pin one, so every
+    // container-run path (the keep-alive `crun exec` below and the fresh-container
+    // fallback) runs as the uid the image expects — matching the workload
+    // container itself. An explicit request user still wins; an image with no
+    // USER stays root. Bare-VM exec (`handle_vm_exec`) never reaches here, so it
+    // is unaffected.
+    let image_user = if user.is_none() {
+        storage::query_image(image)
+            .ok()
+            .flatten()
+            .and_then(|i| i.user)
+    } else {
+        None
+    };
+    let user = user.or(image_user.as_deref());
+
+    // On a persistent machine, run inside the long-lived keep-alive container so
+    // backgrounded processes survive across execs. Fall back to a fresh container
+    // if the keep-alive can't be established, so exec never breaks outright.
+    #[cfg(target_os = "linux")]
+    {
+        // A remote volume can only be mounted into a container established in
+        // two steps, which is what the keep-alive runner does — so route there
+        // even without an overlay rather than falling through to the
+        // single-step path, which would run with the volume silently missing.
+        if persistent_overlay_id.is_some() || !s3_volumes.is_empty() {
+            match run_in_keepalive_container(
+                persistent_overlay_id,
+                image,
+                command,
+                env,
+                workdir,
+                user,
+                mounts,
+                unprivileged,
+                timeout_ms,
+                stdin_data,
+                client_fd,
+                s3_volumes,
+            ) {
+                Ok(resp) => return cap_exec_response(resp),
+                Err(e) => {
+                    // Falling back to a fresh container would silently drop the
+                    // remote volumes, leaving the workload reading an empty
+                    // directory. When volumes were requested the failure is the
+                    // answer, not something to work around.
+                    if !s3_volumes.is_empty() {
+                        return AgentResponse::error(
+                            format!("mount remote volume: {e}"),
+                            error_codes::SPAWN_FAILED,
+                        );
+                    }
+                    warn!(error = %e, "keep-alive exec failed; running in a fresh container")
+                }
+            }
+        }
+    }
+
+    match storage::run_command(
+        image,
+        command,
+        env,
+        workdir,
+        user,
+        mounts,
+        timeout_ms,
+        persistent_overlay_id,
+        stdin_data,
+        client_fd,
+        unprivileged,
+    ) {
+        Ok(result) => cap_exec_response(AgentResponse::Completed {
+            exit_code: result.exit_code,
+            stdout: result.stdout,
+            stderr: result.stderr,
+        }),
+        Err(e) => AgentResponse::from_err(e, error_codes::RUN_FAILED),
+    }
+}
+
+/// Handle image pull request with progress streaming.
+fn handle_streaming_pull<S: Read + Write>(
+    stream: &mut S,
+    image: &str,
+    oci_platform: Option<&str>,
+    auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_storage_mounted();
+    info!(
+        image = %image,
+        ?oci_platform,
+        has_auth = auth.is_some(),
+        has_proxy = proxy.is_some(),
+        "pulling image with progress"
+    );
+
+    // Create a progress callback that sends updates over the stream
+    let progress_callback = |current: usize, total: usize, layer: &str| {
+        let percent = if total > 0 {
+            ((current as f64 / total as f64) * 100.0) as u8
+        } else {
+            0
+        };
+        let response = AgentResponse::Progress {
+            message: format!("Pulling layer {}/{}", current, total),
+            percent: Some(percent),
+            layer: Some(layer.to_string()),
+        };
+        // Ignore errors from progress updates - non-critical
+        let _ = send_response(stream, &response);
+    };
+
+    let response = AgentResponse::from_result(
+        storage::pull_image_with_progress_and_auth(
+            image,
+            oci_platform,
+            auth,
+            proxy,
+            no_proxy,
+            progress_callback,
+        ),
+        error_codes::PULL_FAILED,
+    );
+
+    send_response(stream, &response)
+}
+
+/// Handle image query request.
+fn handle_query(image: &str) -> AgentResponse {
+    match storage::query_image(image) {
+        Ok(Some(info)) => AgentResponse::ok_with_data(info),
+        Ok(None) => AgentResponse::error(
+            format!("image not found: {}", image),
+            error_codes::NOT_FOUND,
+        ),
+        Err(e) => AgentResponse::from_err(e, error_codes::QUERY_FAILED),
+    }
+}
+
+/// Handle list images request.
+fn handle_list_images() -> AgentResponse {
+    AgentResponse::from_result(storage::list_images(), error_codes::LIST_FAILED)
+}
+
+/// Handle garbage collection request.
+fn handle_gc(dry_run: bool, purge_all: bool) -> AgentResponse {
+    if purge_all && !dry_run {
+        if let Err(e) = storage::purge_all_images() {
+            return AgentResponse::from_err(e, error_codes::GC_FAILED);
+        }
+    }
+    match storage::garbage_collect(dry_run) {
+        Ok(freed) => AgentResponse::ok_with_data(serde_json::json!({
+            "freed_bytes": freed,
+            "dry_run": dry_run,
+        })),
+        Err(e) => AgentResponse::from_err(e, error_codes::GC_FAILED),
+    }
+}
+
+/// Handle overlay preparation request.
+fn handle_prepare_overlay(image: &str, workload_id: &str) -> AgentResponse {
+    info!(image = %image, workload_id = %workload_id, "preparing overlay");
+    AgentResponse::from_result(
+        storage::prepare_overlay(image, workload_id),
+        error_codes::OVERLAY_FAILED,
+    )
+}
+
+/// Handle overlay cleanup request.
+fn handle_cleanup_overlay(workload_id: &str) -> AgentResponse {
+    info!(workload_id = %workload_id, "cleaning up overlay");
+    match storage::cleanup_overlay(workload_id) {
+        Ok(_) => AgentResponse::ok(None),
+        Err(e) => AgentResponse::from_err(e, error_codes::CLEANUP_FAILED),
+    }
+}
+
+/// Handle a request to merge layer directories into one tar archive.
+fn handle_flatten_layers(lowerdirs: &[String], output: &str) -> AgentResponse {
+    info!(layer_count = lowerdirs.len(), output = %output, "flattening layers");
+    match storage::flatten_layers_to_tar(lowerdirs, std::path::Path::new(output)) {
+        Ok(_) => AgentResponse::ok(None),
+        Err(e) => AgentResponse::from_err(e, error_codes::MOUNT_FAILED),
+    }
+}
+
+/// Merge `lowerdirs` and stream the result back as a tar archive.
+///
+/// The same overlay merge [`handle_flatten_layers`] does, piped straight to the
+/// caller instead of landing on the guest's disk first. `pack create --from-vm`
+/// flattens a whole rootfs, so the staged form needs the export helper's disk to
+/// hold that rootfs *and* a second full copy of it as an archive; a large enough
+/// image runs the helper out of space partway through. Streaming keeps the
+/// archive off the disk entirely, so only the source rootfs has to fit.
+fn handle_streaming_flatten_layers(
+    stream: &mut impl Write,
+    lowerdirs: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!(
+        layer_count = lowerdirs.len(),
+        "flattening layers (streamed)"
+    );
+
+    // Held for the whole stream: dropping the guard unmounts the merged view, so
+    // it has to outlive the tar that reads through it.
+    let tree = match storage::flatten_layers(lowerdirs) {
+        Ok(tree) => tree,
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::from_err(e, error_codes::MOUNT_FAILED),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let mut child = match std::process::Command::new("tar")
+        .args(["-cf", "-", "-C"])
+        .arg(tree.path())
+        .arg(".")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("failed to start flatten archive: {error}"),
+                    error_codes::EXPORT_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let mut stdout = child.stdout.take().expect("piped tar stdout");
+    // Body-only, so tar's exit status is checked before the stream is declared
+    // clean: a tar that dies midway must not look like a complete archive.
+    let result = send_data_chunks_body(
+        stream,
+        &mut stdout,
+        smolvm_protocol::LAYER_CHUNK_SIZE,
+        "failed to read flatten archive",
+        error_codes::EXPORT_FAILED,
+    );
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    result?;
+    match child.wait() {
+        Ok(status) if status.success() => send_response(
+            stream,
+            &AgentResponse::DataChunk {
+                data: Vec::new(),
+                done: true,
+            },
+        ),
+        Ok(status) => send_response(
+            stream,
+            &AgentResponse::error(
+                format!("flatten archive exited with {status}"),
+                error_codes::EXPORT_FAILED,
+            ),
+        ),
+        Err(error) => send_response(
+            stream,
+            &AgentResponse::error(
+                format!("failed to wait for flatten archive: {error}"),
+                error_codes::EXPORT_FAILED,
+            ),
+        ),
+    }
+}
+
+/// Handle storage format request.
+fn handle_format_storage() -> AgentResponse {
+    info!("formatting storage");
+    match storage::format() {
+        Ok(_) => AgentResponse::ok(None),
+        Err(e) => AgentResponse::from_err(e, error_codes::FORMAT_FAILED),
+    }
+}
+
+/// Handle export layer request with chunked streaming.
+///
+/// Pipes `tar -cf -` stdout directly to the vsock stream in LAYER_CHUNK_SIZE
+/// chunks. No temp tar file is created — this allows exporting layers of any
+/// size without filling the storage disk.
+fn handle_streaming_export_layer(
+    stream: &mut impl Write,
+    image_digest: &str,
+    layer_index: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_storage_mounted();
+    info!(image_digest = %image_digest, layer_index = layer_index, "exporting layer (streamed)");
+
+    // Find the layer directory without creating a temp tar file.
+    let layer_dir = match storage::find_layer_path(image_digest, layer_index) {
+        Ok(path) => path,
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::from_err(e, error_codes::EXPORT_FAILED),
+            )?;
+            return Ok(());
+        }
+    };
+
+    // Pipe tar stdout directly — no temp file on disk.
+    let mut child = match std::process::Command::new("tar")
+        .args(["-cf", "-", "-C"])
+        .arg(&layer_dir)
+        .arg(".")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("failed to spawn tar: {}", e),
+                    error_codes::EXPORT_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let mut stdout = child.stdout.take().unwrap();
+
+    // Shared streaming path — same helper used by FileRead.
+    let result = send_data_chunks(
+        stream,
+        &mut stdout,
+        LAYER_CHUNK_SIZE,
+        "failed to read tar output",
+        error_codes::EXPORT_FAILED,
+    );
+    // If the helper returned an Err, it already sent an Error
+    // response; we still need to clean up the tar subprocess.
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    result
+}
+
+/// Handle storage status request.
+/// Build the entry list for a directory.
+///
+/// Shared with the namespace helper so a listing taken inside the workload
+/// container is identical to one taken in the VM base.
+///
+/// Entries are sorted by name so a caller diffing two listings sees real
+/// changes rather than filesystem ordering. Symlinks are reported as
+/// `"symlink"` without being followed: resolving here would let a link inside
+/// the guest decide what the host is told about, and a caller that wants the
+/// target can ask for it by path.
+pub(crate) fn list_directory_entries(
+    path: &str,
+) -> std::result::Result<Vec<smolvm_protocol::DirectoryEntry>, String> {
+    use smolvm_protocol::DirectoryEntry;
+
+    let read = std::fs::read_dir(path).map_err(|e| format!("list directory {path}: {e}"))?;
+    let mut entries: Vec<DirectoryEntry> = Vec::new();
+    for entry in read.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            // A name that is not UTF-8 cannot survive the JSON round trip;
+            // skipping it beats failing the whole listing.
+            continue;
+        };
+        // `symlink_metadata` describes the link itself, so a dangling link is
+        // still listed rather than erroring the entry away.
+        let Ok(meta) = entry.path().symlink_metadata() else {
+            continue;
+        };
+        let ft = meta.file_type();
+        let kind = if ft.is_symlink() {
+            "symlink"
+        } else if ft.is_dir() {
+            "dir"
+        } else if ft.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+        entries.push(DirectoryEntry {
+            name,
+            kind: kind.to_string(),
+            size: if ft.is_file() { meta.len() } else { 0 },
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(entries)
+}
+
+/// List a guest directory, inside the workload container when there is one.
+///
+/// An image machine's files live in the container's mount namespace, which is
+/// where `FileRead` already looks; listing the VM base instead would report an
+/// empty or entirely different tree.
+fn handle_list_directory(path: &str) -> AgentResponse {
+    // Mirror the read path exactly. An image machine's files live in the
+    // workload container's mount namespace; without one, the path still has to
+    // be resolved through the active persistent overlay, which is also what
+    // rejects a symlink escaping the overlay or the workspace. Listing the raw
+    // path instead reports the VM base, which for `/root` is simply empty.
+    let entries = match nsfile::GuestNs::for_workload() {
+        nsfile::GuestNs::Container(ns) => ns.list(path),
+        nsfile::GuestNs::Root(_) => match resolve_guest_io_path(path, FilePathAccess::Read) {
+            Ok(resolved) => list_directory_entries(&resolved.to_string_lossy()),
+            Err(resp) => return resp,
+        },
+    };
+    match entries {
+        Ok(entries) => match serde_json::to_value(&entries) {
+            Ok(entries) => AgentResponse::Ok {
+                data: Some(serde_json::json!({ "entries": entries })),
+            },
+            Err(e) => AgentResponse::error(
+                format!("serialize directory listing: {e}"),
+                error_codes::FILE_IO_FAILED,
+            ),
+        },
+        Err(message) => {
+            let code = if message.contains("os error 2") || message.contains("No such file") {
+                error_codes::NOT_FOUND
+            } else {
+                error_codes::FILE_IO_FAILED
+            };
+            AgentResponse::error(message, code)
+        }
+    }
+}
+
+fn handle_storage_status() -> AgentResponse {
+    AgentResponse::from_result(storage::status(), error_codes::STATUS_FAILED)
+}
+
+/// Report machine memory as the guest's own allocator sees it.
+///
+/// `/proc/meminfo` reports kB (always kibibytes, whatever the unit column
+/// says), so every value is scaled to bytes here and the protocol carries only
+/// bytes. A field the running kernel does not publish stays zero rather than
+/// failing the request: `SwapTotal` is absent on a guest with no swap, and
+/// `MemAvailable` predates some very old kernels.
+fn handle_memory_status() -> AgentResponse {
+    AgentResponse::from_result(read_meminfo("/proc/meminfo"), error_codes::STATUS_FAILED)
+}
+
+/// Parse the `Key:  value kB` lines of a meminfo file into bytes.
+fn read_meminfo(path: &str) -> std::io::Result<smolvm_protocol::MemoryStatus> {
+    let text = std::fs::read_to_string(path)?;
+    let mut status = smolvm_protocol::MemoryStatus::default();
+    let mut swap_free = 0u64;
+
+    for line in text.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        // The value is the first token of the remainder; the unit, when present,
+        // is always kB.
+        let Some(value) = rest
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let bytes = value.saturating_mul(1024);
+        match key {
+            "MemTotal" => status.total_bytes = bytes,
+            "MemAvailable" => status.available_bytes = bytes,
+            "MemFree" => status.free_bytes = bytes,
+            "Cached" => status.cached_bytes = bytes,
+            "SwapTotal" => status.swap_total_bytes = bytes,
+            "SwapFree" => swap_free = bytes,
+            _ => {}
+        }
+    }
+
+    status.swap_used_bytes = status.swap_total_bytes.saturating_sub(swap_free);
+    // A kernel too old for MemAvailable would otherwise report everything as
+    // used; free plus reclaimable cache is the estimate it replaced.
+    if status.available_bytes == 0 {
+        status.available_bytes = status.free_bytes.saturating_add(status.cached_bytes);
+    }
+    Ok(status)
+}
+
+// ============================================================================
+// VM-Level Exec Handlers (Direct Execution in VM)
+// ============================================================================
+
+/// PIDs of background children the agent owns and must reap.
+///
+/// Populated by [`register_background_child`] when a background-mode
+/// handler (`handle_vm_exec_background`, `handle_run_background`)
+/// spawns + forgets a process. Cleared by [`reap_background_children`].
+///
+/// Scoping to known PIDs is required once the accept loop is
+/// multi-threaded: an unscoped `waitpid(-1, WNOHANG)` would steal the
+/// exit status from *any* exited child — including the foreground
+/// crun processes that per-request handlers are actively waiting on —
+/// and produce ECHILD races under concurrent load.
+static BG_CHILDREN: OnceLock<std::sync::Mutex<Vec<u32>>> = OnceLock::new();
+
+fn bg_children() -> &'static std::sync::Mutex<Vec<u32>> {
+    BG_CHILDREN.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Track a PID so a later [`reap_background_children`] waits on it.
+///
+/// Callers should pair this with `std::mem::forget(child)` so the
+/// Rust `Child` doesn't also race to reap the process on drop.
+fn register_background_child(pid: u32) {
+    bg_children().lock().unwrap().push(pid);
+}
+
+/// Reap any exited background children to prevent zombie accumulation.
+///
+/// Called periodically in the accept loop. Walks the registered PID
+/// list and issues a per-PID `waitpid(..., WNOHANG)` — non-blocking
+/// and scoped, so it never steals exit statuses from foreground
+/// handlers running in sibling threads.
+#[cfg(target_os = "linux")]
+fn reap_background_children() {
+    let mut guard = bg_children().lock().unwrap();
+    guard.retain(|&pid| {
+        let ret = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) };
+        match ret {
+            // >0 = child was reaped; drop from tracking.
+            r if r > 0 => {
+                debug!(pid, "reaped background child");
+                false
+            }
+            // 0 = still running; keep tracking for the next sweep.
+            0 => true,
+            // <0 = error (typically ECHILD — already reaped elsewhere or the
+            // PID was detached in a way we don't own). Drop either way.
+            _ => false,
+        }
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reap_background_children() {}
+
+/// Handle background VM exec — spawn and return PID immediately.
+///
+/// The process runs detached from the agent's control. stdout/stderr
+/// go to /dev/null. Zombie children are reaped by reap_background_children()
+/// in the accept loop.
+fn handle_vm_exec_background(
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+) -> AgentResponse {
+    info!(command = ?command, "background VM exec");
+
+    if command.is_empty() {
+        return AgentResponse::error("command cannot be empty", error_codes::INVALID_REQUEST);
+    }
+
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..]);
+
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    if let Some(wd) = workdir {
+        cmd.current_dir(wd);
+    }
+
+    // Detach: stdout/stderr to /dev/null so the process doesn't block on pipe writes
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    cmd.stdin(Stdio::null());
+
+    match cmd.spawn() {
+        Ok(child) => {
+            let pid = child.id();
+            // Don't wait — let the child run independently. The Rust
+            // `Child` is forgotten so drop doesn't race our reaper, and
+            // the PID is registered so reap_background_children()
+            // collects the eventual exit status.
+            std::mem::forget(child);
+            register_background_child(pid);
+            info!(pid = pid, "background process started");
+            AgentResponse::Completed {
+                exit_code: 0,
+                stdout: format!("{}", pid).into_bytes(),
+                stderr: Vec::new(),
+            }
+        }
+        Err(e) => AgentResponse::error(
+            format!("failed to spawn background command: {}", e),
+            error_codes::SPAWN_FAILED,
+        ),
+    }
+}
+
+fn handle_vm_exec(
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    timeout_ms: Option<u64>,
+    client_fd: Option<std::os::unix::io::RawFd>,
+    stdin_data: Option<&str>,
+) -> AgentResponse {
+    info!(command = ?command, "executing directly in VM");
+
+    if command.is_empty() {
+        return AgentResponse::error("command cannot be empty", error_codes::INVALID_REQUEST);
+    }
+
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..]);
+
+    // Set environment variables
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+
+    // Set working directory
+    if let Some(wd) = workdir {
+        cmd.current_dir(wd);
+    }
+
+    // If stdin data is provided, pipe it to the command.
+    // Otherwise, give the command immediate EOF via /dev/null.
+    if stdin_data.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    // Put the child in its own process group so we can signal the whole
+    // tree (e.g., `sh -c 'sleep 30'` — killing sh alone leaves sleep
+    // orphaned and holding the stdout pipe, blocking reader threads).
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                // setsid creates a new session and process group rooted at
+                // this child. killpg(pgid, SIGKILL) later hits all descendants.
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    // Spawn the command
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return AgentResponse::error(
+                format!("failed to spawn command: {}", e),
+                error_codes::SPAWN_FAILED,
+            );
+        }
+    };
+
+    // Drain stdout and stderr concurrently in background threads to prevent
+    // pipe deadlock. Without this, a child writing >64KB to stderr blocks on
+    // write() while the agent blocks waiting for the child to exit — neither
+    // side makes progress. See docs/exec-streaming-unification.md for the
+    // long-term fix (streaming exec).
+    const MAX_OUTPUT: usize = crate::process::MAX_EXEC_OUTPUT;
+
+    // Use read_to_end (not read_to_string) so binary output (image bytes,
+    // tarballs, any non-UTF-8 data) is preserved through the protocol.
+    // The protocol serializes Vec<u8> as base64 JSON string.
+    let stdout_handle = child.stdout.take().map(|out| {
+        std::thread::Builder::new()
+            .name("exec-stdout".into())
+            .spawn(move || {
+                // Read ONE byte past the cap so the handler can tell "exactly at
+                // cap" from "overflowed" and return a clear error instead of a
+                // silently truncated result (+ a SIGPIPE exit on the child).
+                let mut buf = Vec::new();
+                let _ = out.take(MAX_OUTPUT as u64 + 1).read_to_end(&mut buf);
+                buf
+            })
+    });
+
+    let stderr_handle = child.stderr.take().map(|err| {
+        std::thread::Builder::new()
+            .name("exec-stderr".into())
+            .spawn(move || {
+                let mut buf = Vec::new();
+                let _ = err.take(MAX_OUTPUT as u64 + 1).read_to_end(&mut buf);
+                buf
+            })
+    });
+
+    // Write stdin on a separate thread after stdout/stderr drains are live.
+    // This keeps the timeout/disconnect loop below active even when the child
+    // never reads stdin and the pipe buffer fills.
+    let stdin_handle = stdin_data.and_then(|data| {
+        child.stdin.take().map(|mut child_stdin| {
+            let data = data.to_owned();
+            std::thread::Builder::new()
+                .name("exec-stdin".into())
+                .spawn(move || {
+                    use std::io::Write;
+                    child_stdin.write_all(data.as_bytes())
+                    // child_stdin is dropped here, closing the pipe → child sees EOF.
+                })
+        })
+    });
+
+    // Wait for exit with timeout
+    let deadline =
+        timeout_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+
+    let exit_code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break process::exit_code_from_status(&status),
+            Ok(None) => {
+                // Client disconnected — kill the orphan child so the accept
+                // loop isn't blocked waiting for it. Fixes BUG-12/20: SIGTERM
+                // on the host-side exec client used to leave the agent stuck.
+                if let Some(fd) = client_fd {
+                    if process::is_peer_closed(fd) {
+                        warn!(
+                            pid = child.id(),
+                            "client disconnected during VM exec, killing child group"
+                        );
+                        // Kill the entire process group — `sh -c 'sleep 30'`
+                        // creates child processes that inherit the stdout pipe.
+                        // Killing just `sh` leaves `sleep` holding the pipe,
+                        // blocking the reader threads' EOF. killpg hits them all.
+                        #[cfg(target_os = "linux")]
+                        unsafe {
+                            libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+                        }
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break 129; // SIGHUP convention: killed by disconnect
+                    }
+                }
+                if let Some(deadline) = deadline {
+                    if std::time::Instant::now() >= deadline {
+                        warn!("VM exec command timed out, killing process group");
+                        #[cfg(target_os = "linux")]
+                        unsafe {
+                            libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+                        }
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break 124; // Standard timeout exit code
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(PROCESS_POLL_INTERVAL_MS));
+            }
+            Err(e) => {
+                return AgentResponse::error(
+                    format!("failed to check process status: {}", e),
+                    error_codes::WAIT_FAILED,
+                );
+            }
+        }
+    };
+
+    // Join reader threads — they return EOF because the child and all its
+    // descendants in the process group have been killed (pipes closed).
+    let stdout = stdout_handle
+        .and_then(|h| h.ok())
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_handle
+        .and_then(|h| h.ok())
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    if let Some(Ok(handle)) = stdin_handle {
+        if handle.is_finished() {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Ok(Err(e)) => debug!(error = %e, "stdin writer finished with error"),
+                Err(_) => debug!("stdin writer thread panicked"),
+            }
+        } else {
+            debug!("stdin writer still blocked after command exit; detaching");
+        }
+    }
+
+    // If either stream exceeded the cap (we read one byte past it), the output
+    // was truncated and the child likely took a SIGPIPE — return a clear error
+    // instead of a silently-truncated success. Large output should stream.
+    if stdout.len() > MAX_OUTPUT || stderr.len() > MAX_OUTPUT {
+        return AgentResponse::error(
+            format!(
+                "command output exceeded {MAX_OUTPUT} bytes and was truncated. \
+                 Use streaming exec (exec_stream / execStream) for large output."
+            ),
+            error_codes::EXEC_FAILED,
+        );
+    }
+    AgentResponse::Completed {
+        exit_code,
+        stdout,
+        stderr,
+    }
+}
+
+/// Handle interactive VM-level exec with streaming I/O.
+fn handle_interactive_vm_exec(
+    stream: &mut impl ReadWrite,
+    request: AgentRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (command, env, workdir, timeout_ms, tty) = match request {
+        AgentRequest::VmExec {
+            command,
+            env,
+            workdir,
+            timeout_ms,
+            tty,
+            ..
+        } => (command, env, workdir, timeout_ms, tty),
+        _ => {
+            send_response(
+                stream,
+                &AgentResponse::error("expected VmExec request", error_codes::INVALID_REQUEST),
+            )?;
+            return Ok(());
+        }
+    };
+
+    info!(command = ?command, tty = tty, "starting interactive VM exec");
+
+    if command.is_empty() {
+        send_response(
+            stream,
+            &AgentResponse::error("command cannot be empty", error_codes::INVALID_REQUEST),
+        )?;
+        return Ok(());
+    }
+
+    // Spawn the command directly
+    let (mut child, pty_master) =
+        match spawn_direct_interactive_command(&command, &env, workdir.as_deref(), tty) {
+            Ok(result) => result,
+            Err(e) => {
+                send_response(
+                    stream,
+                    &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
+                )?;
+                return Ok(());
+            }
+        };
+
+    // Send Started response
+    send_response(stream, &AgentResponse::Started)?;
+
+    // Run the appropriate interactive I/O loop. Every Ok path inside the loops
+    // already reaps the child (try_wait auto-reaps on exit; timeout and host
+    // disconnect both kill+wait). The Err paths — a malformed/oversized inbound
+    // frame, a Stdin parse failure, a try_wait/drain error — do NOT, so reap
+    // here before propagating. The agent is PID 1 with no global waitpid(-1)
+    // reaper, so an unreaped interactive child would linger as a zombie holding
+    // its stdio/PTY fds. Mirrors the loop's own kill_child_on_disconnect.
+    let loop_result = match pty_master {
+        #[cfg(target_os = "linux")]
+        Some(pty) => run_interactive_loop_pty(stream, &mut child, pty, timeout_ms),
+        _ => run_interactive_loop(stream, &mut child, timeout_ms),
+    };
+    let exit_code = match loop_result {
+        Ok(code) => code,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
+
+    // Send Exited response
+    send_response(
+        stream,
+        &AgentResponse::Exited {
+            exit_code,
+            oom: false,
+        },
+    )?;
+
+    Ok(())
+}
+
+/// Spawn a command directly in the VM for interactive execution.
+///
+/// When `tty` is true, allocates a PTY pair and attaches the slave side
+/// to the child process. Returns the child and an optional `PtyMaster`.
+#[cfg(target_os = "linux")]
+fn spawn_direct_interactive_command(
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    tty: bool,
+) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+    use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::process::CommandExt;
+
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..]);
+
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    if let Some(wd) = workdir {
+        cmd.current_dir(wd);
+    }
+
+    if tty {
+        // Allocate a PTY pair with default 80x24 size (host will send Resize).
+        let (pty_master, slave_fd) = pty::open_pty(80, 24)?;
+        let slave_raw = slave_fd.as_raw_fd();
+
+        // Set up stdio from the slave fd. We dup because Stdio::from_raw_fd
+        // takes ownership and we need the fd for all three handles + pre_exec.
+        // SAFETY: slave_fd is a valid open fd from openpty.
+        unsafe {
+            cmd.stdin(Stdio::from_raw_fd(libc::dup(slave_raw)));
+            cmd.stdout(Stdio::from_raw_fd(libc::dup(slave_raw)));
+            cmd.stderr(Stdio::from_raw_fd(libc::dup(slave_raw)));
+        }
+
+        // SAFETY: pre_exec closure calls only async-signal-safe functions.
+        unsafe {
+            cmd.pre_exec(pty::slave_pre_exec(slave_raw));
+        }
+
+        let child = cmd.spawn()?;
+
+        // Close the slave fd in the parent — the child has its own copies.
+        drop(slave_fd);
+
+        Ok((child, Some(pty_master)))
+    } else {
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let child = cmd.spawn()?;
+        Ok((child, None))
+    }
+}
+
+/// Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+fn spawn_direct_interactive_command(
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    _tty: bool,
+) -> Result<(Child, Option<()>), Box<dyn std::error::Error>> {
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..]);
+
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    if let Some(wd) = workdir {
+        cmd.current_dir(wd);
+    }
+
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let child = cmd.spawn()?;
+    Ok((child, None))
+}
+
+/// Send a response to the client.
+fn send_response(
+    stream: &mut impl Write,
+    response: &AgentResponse,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let json = serde_json::to_vec(response)?;
+    let len = json.len() as u32;
+
+    stream.write_all(&len.to_be_bytes())?;
+    stream.write_all(&json)?;
+    stream.flush()?;
+
+    debug!(?response, "sent response");
+    Ok(())
+}
+
+/// Trait for read+write streams with raw fd access.
+trait ReadWrite: Read + Write + AsRawFd {}
+impl<T: Read + Write + AsRawFd> ReadWrite for T {}
+
+/// Regression tests for the scoped background-child reaper.
+///
+/// These are the companion to the accept-loop threading change. The bug
+/// they guard against: once the accept loop spawns a thread per
+/// connection, an unscoped `waitpid(-1, WNOHANG)` in the reaper steals
+/// exit statuses from any foreground crun process that a sibling thread
+/// is waiting on, producing ECHILD races and "command died mid-run"
+/// failures. Scoped reaping must only touch PIDs registered as
+/// background.
+///
+/// Linux-only because `waitpid` behavior + the agent crate as a whole
+/// is Linux-specific. `cargo test -p smolvm-agent --target
+/// aarch64-unknown-linux-musl` on a Linux runner.
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod work_slot_tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    #[test]
+    fn only_pings_and_shutdown_skip_the_work_slots() {
+        assert!(!needs_work_slot(&AgentRequest::Ping));
+        assert!(!needs_work_slot(&AgentRequest::Shutdown {
+            progress: false
+        }));
+        assert!(needs_work_slot(&AgentRequest::ListImages));
+    }
+
+    #[test]
+    fn a_ping_is_answered_while_every_work_slot_is_taken() {
+        let held: Vec<_> = (0..MAX_CONCURRENT_WORK)
+            .map(|_| WORK_SLOTS.acquire())
+            .collect();
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let mut guest = guest;
+            let _ = handle_connection(&mut guest);
+        });
+        let frame = serde_json::to_vec(&AgentRequest::Ping).unwrap();
+        host.write_all(&(frame.len() as u32).to_be_bytes()).unwrap();
+        host.write_all(&frame).unwrap();
+        host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut header = [0u8; 4];
+        host.read_exact(&mut header)
+            .expect("a ping must be answered even with every work slot taken");
+        drop(held);
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod bg_reap_tests {
+    use super::*;
+    use std::process::Command;
+    use std::time::Duration;
+
+    #[test]
+    fn reaper_leaves_unregistered_children_waitable() {
+        // Foreground child: the test owns it and will wait on it. The
+        // reaper must NOT steal it.
+        let mut foreground = Command::new("/bin/true")
+            .spawn()
+            .expect("spawn foreground /bin/true");
+        let fg_pid = foreground.id();
+
+        // Background child: registered, and the Rust Child handle is
+        // forgotten so drop doesn't race the reaper.
+        let background = Command::new("/bin/true")
+            .spawn()
+            .expect("spawn background /bin/true");
+        let bg_pid = background.id();
+        register_background_child(bg_pid);
+        std::mem::forget(background);
+
+        // Let both exit before we reap.
+        std::thread::sleep(Duration::from_millis(150));
+
+        reap_background_children();
+
+        // Foreground must still be reapable via the Rust Child. If the
+        // unscoped reaper stole it, wait() returns ECHILD and this
+        // expect() fires — that's exactly the concurrent-exec bug.
+        let status = foreground.wait().expect(
+            "foreground child must still be waitable — reaper must not touch unregistered PIDs",
+        );
+        assert!(status.success(), "foreground /bin/true should succeed");
+
+        // Background PID should be gone from tracking (reaped). Check
+        // only this test's PID so parallel tests don't interfere.
+        let tracked = bg_children().lock().unwrap().clone();
+        assert!(
+            !tracked.contains(&bg_pid),
+            "reaped bg PID {} must be removed from tracking",
+            bg_pid
+        );
+        assert!(
+            !tracked.contains(&fg_pid),
+            "unregistered fg PID {} must never enter tracking",
+            fg_pid
+        );
+    }
+
+    #[test]
+    fn reaper_retains_still_running_background_children() {
+        // A registered but still-alive child must stay in tracking so a
+        // subsequent sweep collects it after it exits.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep 30");
+        let pid = child.id();
+        register_background_child(pid);
+
+        reap_background_children();
+
+        let tracked = bg_children().lock().unwrap().clone();
+        assert!(
+            tracked.contains(&pid),
+            "still-running bg PID {} must remain in tracking",
+            pid
+        );
+
+        // Clean up so the test doesn't leak a 30-second sleep.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A listing is what a caller uses to decide where to recurse and what to
+    /// download, so the shape matters: names only, sorted, with sizes only
+    /// where they mean something.
+    #[test]
+    fn listing_reports_sorted_names_with_kinds_and_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("zebra.txt"), b"1234567890").unwrap();
+        std::fs::write(dir.path().join("alpha.txt"), b"abc").unwrap();
+        std::fs::create_dir(dir.path().join("middle")).unwrap();
+
+        let resp = handle_list_directory(dir.path().to_str().unwrap());
+        let AgentResponse::Ok { data: Some(data) } = resp else {
+            panic!("expected a listing, got {resp:?}");
+        };
+        let entries = data["entries"].as_array().unwrap().clone();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["alpha.txt", "middle", "zebra.txt"],
+            "sorted by name"
+        );
+
+        assert_eq!(entries[0]["kind"], "file");
+        assert_eq!(entries[0]["size"], 3);
+        assert_eq!(entries[1]["kind"], "dir");
+        assert_eq!(entries[1]["size"], 0, "size is meaningless for a directory");
+        assert_eq!(entries[2]["size"], 10);
+    }
+
+    /// A missing directory must be distinguishable from an empty one, or a
+    /// caller cannot tell "nothing here" from "wrong path".
+    #[test]
+    fn a_missing_directory_is_an_error_not_an_empty_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let resp = handle_list_directory(dir.path().join("nope").to_str().unwrap());
+        let AgentResponse::Error { code, .. } = resp else {
+            panic!("expected an error, got {resp:?}");
+        };
+        assert_eq!(code.as_deref(), Some("NOT_FOUND"));
+
+        let empty = handle_list_directory(dir.path().to_str().unwrap());
+        let AgentResponse::Ok { data: Some(data) } = empty else {
+            panic!("an empty directory still lists");
+        };
+        assert!(data["entries"].as_array().unwrap().is_empty());
+    }
+
+    /// Symlinks are reported without being followed: resolving in the guest
+    /// would let a link decide what the host is told about.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_reported_as_a_symlink_and_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.txt"), b"hello").unwrap();
+        std::os::unix::fs::symlink("real.txt", dir.path().join("link.txt")).unwrap();
+        std::os::unix::fs::symlink("gone.txt", dir.path().join("dangling.txt")).unwrap();
+
+        let AgentResponse::Ok { data: Some(data) } =
+            handle_list_directory(dir.path().to_str().unwrap())
+        else {
+            panic!("expected a listing");
+        };
+        let entries = data["entries"].as_array().unwrap();
+        let kind_of = |n: &str| {
+            entries
+                .iter()
+                .find(|e| e["name"] == n)
+                .unwrap_or_else(|| panic!("{n} missing from listing"))["kind"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(kind_of("link.txt"), "symlink");
+        assert_eq!(
+            kind_of("dangling.txt"),
+            "symlink",
+            "a dangling link is still listed"
+        );
+        assert_eq!(kind_of("real.txt"), "file");
+    }
+
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_container_marker_is_trimmed_and_empty_is_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("restored-container");
+        assert_eq!(restored_container_id_at(&marker), None);
+        std::fs::write(&marker, "  smolvm-restored-1\n").unwrap();
+        assert_eq!(
+            restored_container_id_at(&marker).as_deref(),
+            Some("smolvm-restored-1")
+        );
+        std::fs::write(&marker, " \n").unwrap();
+        assert_eq!(restored_container_id_at(&marker), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_container_workdir_cannot_escape_proc_root() {
+        let root = std::path::Path::new("/proc/123/root");
+        assert_eq!(
+            container_workdir_path(root, "/testbed/./src/../tests").unwrap(),
+            root.join("testbed/tests")
+        );
+        assert!(container_workdir_path(root, "relative").is_err());
+        assert!(container_workdir_path(root, "/../../agent-root").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn proc_stat_fixture(pid: u32, state: char, start_time: u64) -> String {
+        let before_start = (1..=18)
+            .map(|field| field.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Deliberately put both spaces and ')' in comm to guard the parsing
+        // rule used by Linux and crun: the final ')' terminates field 2.
+        format!("{pid} (worker ) name) {state} {before_start} {start_time} 0")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn crun_container_ids_match_runtime_validation() {
+        for valid in ["smolvm-abc123", "UPPER_lower+1.2-3"] {
+            assert!(valid_crun_container_id(valid), "rejected valid ID {valid}");
+        }
+        for invalid in ["", ".hidden", "../escape", "with/slash", "with space"] {
+            assert!(
+                !valid_crun_container_id(invalid),
+                "accepted invalid ID {invalid}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn crun_container_pid_reads_status_without_runtime_subprocess() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        let proc_root = temp.path().join("proc");
+        let state_dir = state_root.join("smolvm-test");
+        let proc_dir = proc_root.join("123");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&proc_dir).unwrap();
+        std::fs::write(
+            state_dir.join("status"),
+            br#"{"pid":123,"process-start-time":4242}"#,
+        )
+        .unwrap();
+        std::fs::write(proc_dir.join("stat"), proc_stat_fixture(123, 'S', 4242)).unwrap();
+
+        assert_eq!(
+            crun_container_pid_at("smolvm-test", &state_root, &proc_root, true),
+            Some(123)
+        );
+
+        // A still-created container has an init process, but is not yet a
+        // running workload and must not be selected for namespace entry.
+        std::fs::write(state_dir.join("exec.fifo"), []).unwrap();
+        assert_eq!(
+            crun_container_pid_at("smolvm-test", &state_root, &proc_root, true),
+            None
+        );
+
+        // Path traversal is rejected before any status lookup.
+        assert_eq!(
+            crun_container_pid_at("../smolvm-test", &state_root, &proc_root, true),
+            None
+        );
+
+        // Remote volumes are mounted between `crun create` and `crun start`,
+        // when the fifo still exists: that lookup must find the same pid the
+        // running one would, or the mount has no namespace to enter.
+        assert_eq!(
+            crun_container_pid_at("smolvm-test", &state_root, &proc_root, false),
+            Some(123)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn crun_status_identity_rejects_invalid_pids() {
+        assert_eq!(
+            parse_crun_process_identity(br#"{"pid":123,"process-start-time":456}"#),
+            Some(CrunProcessIdentity {
+                pid: 123,
+                start_time: 456
+            })
+        );
+        assert!(parse_crun_process_identity(br#"{"pid":0}"#).is_none());
+        assert!(parse_crun_process_identity(br#"{"pid":-1}"#).is_none());
+        assert!(parse_crun_process_identity(br#"{"pid":"123"}"#).is_none());
+        assert!(parse_crun_process_identity(br#"{"process-start-time":456}"#).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn crun_status_identity_is_start_time_and_state_verified() {
+        let identity = CrunProcessIdentity {
+            pid: 123,
+            start_time: 4242,
+        };
+        assert_eq!(
+            validate_crun_process_identity(identity, &proc_stat_fixture(123, 'S', 4242)),
+            Some(123)
+        );
+        assert!(
+            validate_crun_process_identity(identity, &proc_stat_fixture(123, 'S', 4243)).is_none()
+        );
+        assert!(
+            validate_crun_process_identity(identity, &proc_stat_fixture(123, 'Z', 4242)).is_none()
+        );
+        assert!(validate_crun_process_identity(identity, "malformed proc stat").is_none());
+
+        // crun treats a missing/zero recorded start time as a legacy status
+        // file. We still require a readable, non-zombie /proc identity.
+        let legacy = CrunProcessIdentity {
+            pid: 321,
+            start_time: 0,
+        };
+        assert_eq!(
+            validate_crun_process_identity(legacy, &proc_stat_fixture(321, 'I', 9999)),
+            Some(321)
+        );
+    }
+
+    // Regression for `--dns` being silently dropped on the TSI backend: an
+    // explicit override must win over whatever is currently in resolv.conf,
+    // otherwise a guest on a network where 1.1.1.1/8.8.8.8 are unreachable can
+    // never pull an image.
+    #[test]
+    fn tsi_resolv_conf_override_wins_over_current() {
+        assert_eq!(
+            tsi_resolv_conf(Some("9.9.9.9"), "nameserver 8.8.8.8\n").as_deref(),
+            Some("nameserver 9.9.9.9\n")
+        );
+        // Surrounding whitespace is trimmed rather than written into resolv.conf.
+        assert_eq!(
+            tsi_resolv_conf(Some(" 10.0.0.2 "), "").as_deref(),
+            Some("nameserver 10.0.0.2\n")
+        );
+    }
+
+    // Without an override, a valid host-written resolv.conf (e.g. the libkrun
+    // backend's setup_dns) must be PRESERVED, not clobbered — this is the other
+    // half of the same bug.
+    #[test]
+    fn tsi_resolv_conf_preserves_valid_host_written_file() {
+        assert_eq!(tsi_resolv_conf(None, "nameserver 9.9.9.9\n"), None);
+        // A blank override is treated as "no override", so preservation applies.
+        assert_eq!(tsi_resolv_conf(Some("  "), "nameserver 10.0.0.2\n"), None);
+    }
+
+    // A stale loopback (left by a prior --allow-host run) or an empty file is
+    // repaired to the public resolvers.
+    #[test]
+    fn tsi_resolv_conf_repairs_stale_loopback_or_empty() {
+        let public = "nameserver 1.1.1.1\nnameserver 8.8.8.8\n";
+        assert_eq!(
+            tsi_resolv_conf(None, "nameserver 127.0.0.1\n").as_deref(),
+            Some(public)
+        );
+        assert_eq!(tsi_resolv_conf(None, "").as_deref(), Some(public));
+        assert_eq!(tsi_resolv_conf(None, "   \n").as_deref(), Some(public));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn vm_exec_timeout_is_not_blocked_by_unread_stdin() {
+        let stdin_data = "x".repeat(8 * 1024 * 1024);
+        let start = std::time::Instant::now();
+
+        let response = handle_vm_exec(
+            &["sleep".to_string(), "5".to_string()],
+            &[],
+            None,
+            Some(100),
+            None,
+            Some(&stdin_data),
+        );
+
+        let AgentResponse::Completed { exit_code, .. } = response else {
+            panic!("expected completed response");
+        };
+        assert_eq!(exit_code, 124);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "blocked stdin must not prevent timeout handling"
+        );
+    }
+
+    // ========================================================================
+    // Streaming file-upload session tests
+    //
+    // These exercise the agent-side state machine in isolation — no
+    // vsock, no connection, just the handlers and the WriteSession
+    // struct. End-to-end protocol testing would require booting a
+    // real VM, which is covered by the integration harness.
+    // ========================================================================
+
+    fn tmp_target(tmp: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        tmp.path().join(name)
+    }
+
+    /// Collect every file in a directory whose name starts with the
+    /// staging prefix. Used to assert there are no orphan staging
+    /// files after a test runs.
+    fn staging_files_in(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().contains(".smolvm-upload."))
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Decode a length-prefixed (4-byte BE) JSON response from a
+    /// byte slice. Returns the response and how many bytes it
+    /// consumed. Used by the `send_data_chunks` tests to walk the
+    /// stream of frames the helper wrote into a buffer.
+    fn pop_one_response(buf: &[u8]) -> (AgentResponse, usize) {
+        assert!(buf.len() >= 4, "buffer too short for length header");
+        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        assert!(buf.len() >= 4 + len, "incomplete frame in buffer");
+        let resp: AgentResponse =
+            serde_json::from_slice(&buf[4..4 + len]).expect("decode response");
+        (resp, 4 + len)
+    }
+
+    #[test]
+    fn send_data_chunks_emits_terminator_for_empty_source() {
+        // Source is empty → exactly one DataChunk { data: [], done: true }.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut empty: &[u8] = &[];
+        send_data_chunks(
+            &mut sink,
+            &mut empty,
+            4096,
+            "test",
+            error_codes::FILE_IO_FAILED,
+        )
+        .unwrap();
+
+        let (resp, consumed) = pop_one_response(&sink);
+        match resp {
+            AgentResponse::DataChunk { data, done } => {
+                assert!(data.is_empty());
+                assert!(done);
+            }
+            other => panic!("wrong variant: {:?}", other),
+        }
+        assert_eq!(consumed, sink.len(), "exactly one frame expected");
+    }
+
+    #[test]
+    fn send_data_chunks_concatenates_in_order_with_done_terminator() {
+        // 1024 bytes through a 256-byte chunk → 4 full chunks + 1
+        // empty terminator. The agent's implementation always emits a
+        // separate done-frame on EOF, even when EOF lands on a chunk
+        // boundary; the host's read_file relies on that.
+        let payload: Vec<u8> = (0..1024).map(|i| (i & 0xFF) as u8).collect();
+        let mut sink: Vec<u8> = Vec::new();
+        let mut src = std::io::Cursor::new(payload.clone());
+        send_data_chunks(
+            &mut sink,
+            &mut src,
+            256,
+            "test",
+            error_codes::FILE_IO_FAILED,
+        )
+        .unwrap();
+
+        let mut offset = 0usize;
+        let mut reconstructed: Vec<u8> = Vec::new();
+        let mut saw_done = false;
+        while offset < sink.len() {
+            let (resp, consumed) = pop_one_response(&sink[offset..]);
+            match resp {
+                AgentResponse::DataChunk { data, done } => {
+                    reconstructed.extend_from_slice(&data);
+                    if done {
+                        saw_done = true;
+                    }
+                }
+                other => panic!("wrong variant: {:?}", other),
+            }
+            offset += consumed;
+        }
+        assert!(saw_done, "stream missing done terminator");
+        assert_eq!(reconstructed, payload);
+    }
+
+    #[test]
+    fn send_data_chunks_partial_final_chunk_is_handled() {
+        // 1000 bytes through a 256-byte chunk → 3 full chunks (768
+        // bytes) + 1 partial chunk (232 bytes, done: false) + 1
+        // empty terminator (done: true). This separates the
+        // "partial chunk" case from the "EOF" case so the helper
+        // doesn't have to detect short reads.
+        let payload: Vec<u8> = (0..1000).map(|i| (i & 0xFF) as u8).collect();
+        let mut sink: Vec<u8> = Vec::new();
+        let mut src = std::io::Cursor::new(payload.clone());
+        send_data_chunks(
+            &mut sink,
+            &mut src,
+            256,
+            "test",
+            error_codes::FILE_IO_FAILED,
+        )
+        .unwrap();
+
+        let mut offset = 0usize;
+        let mut chunks: Vec<(Vec<u8>, bool)> = Vec::new();
+        while offset < sink.len() {
+            let (resp, consumed) = pop_one_response(&sink[offset..]);
+            if let AgentResponse::DataChunk { data, done } = resp {
+                chunks.push((data, done));
+            }
+            offset += consumed;
+        }
+        // Last frame must be the empty terminator.
+        let last = chunks.last().expect("at least one frame");
+        assert!(
+            last.0.is_empty() && last.1,
+            "last frame must be empty + done"
+        );
+        // All earlier frames carry data and are not done.
+        for c in &chunks[..chunks.len() - 1] {
+            assert!(!c.1, "non-final chunk had done=true");
+            assert!(!c.0.is_empty(), "non-final chunk was empty");
+        }
+        // Concatenated data matches the source.
+        let concatenated: Vec<u8> = chunks.iter().flat_map(|(d, _)| d.iter().copied()).collect();
+        assert_eq!(concatenated, payload);
+    }
+
+    #[test]
+    fn streaming_write_rejects_when_total_size_exceeds_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp_target(&tmp, "big");
+        let (session, resp) = handle_file_write_begin(
+            target.to_string_lossy().into(),
+            None,
+            None,
+            None,
+            smolvm_protocol::FILE_TRANSFER_MAX_TOTAL + 1,
+        );
+        assert!(session.is_none(), "session must not be created");
+        assert!(
+            matches!(resp, AgentResponse::Error { .. }),
+            "expected error, got {:?}",
+            resp
+        );
+    }
+
+    #[test]
+    fn cap_exec_response_guards_oversized_keepalive_output() {
+        // A Completed response whose output would overflow the wire frame must be
+        // swapped for a clean error — the exact keep-alive-container path that
+        // used to return oversized output straight into a "frame too large" 500.
+        let huge = AgentResponse::Completed {
+            exit_code: 0,
+            stdout: vec![b'A'; 25 * 1024 * 1024],
+            stderr: Vec::new(),
+        };
+        assert!(
+            matches!(cap_exec_response(huge), AgentResponse::Error { .. }),
+            "oversized output must become a clean error, not a frame-too-large 500"
+        );
+        // Normal-sized output passes through untouched.
+        let ok = AgentResponse::Completed {
+            exit_code: 7,
+            stdout: b"hello".to_vec(),
+            stderr: b"world".to_vec(),
+        };
+        assert!(matches!(
+            cap_exec_response(ok),
+            AgentResponse::Completed { exit_code: 7, .. }
+        ));
+    }
+
+    #[test]
+    fn streaming_write_happy_path_writes_file_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp_target(&tmp, "hello.bin");
+
+        // Build a recognizable payload that also crosses a chunk boundary
+        // via the test-only helper. Use a known-odd size so no power-of-
+        // two alignment could accidentally hide a bug.
+        let payload = {
+            let mut v = Vec::with_capacity(37);
+            for i in 0..37u8 {
+                v.push(i);
+            }
+            v
+        };
+
+        let (session, resp) = handle_file_write_begin(
+            target.to_string_lossy().into(),
+            Some(0o600),
+            None,
+            None,
+            payload.len() as u64,
+        );
+        assert!(matches!(resp, AgentResponse::Ok { .. }));
+
+        let (session, resp) = handle_file_write_chunk(session, &payload, true);
+        assert!(
+            matches!(resp, AgentResponse::Ok { .. }),
+            "finalize failed: {:?}",
+            resp
+        );
+        assert!(session.is_none());
+
+        // File exists with correct contents.
+        let got = std::fs::read(&target).unwrap();
+        assert_eq!(got, payload);
+
+        // No staging file left behind.
+        assert!(
+            staging_files_in(tmp.path()).is_empty(),
+            "staging file leaked"
+        );
+
+        // Mode applied (unix only).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn streaming_write_multi_chunk_concatenates_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp_target(&tmp, "multi.bin");
+        let total = 1024usize;
+
+        let (mut session, resp) = handle_file_write_begin(
+            target.to_string_lossy().into(),
+            None,
+            None,
+            None,
+            total as u64,
+        );
+        assert!(matches!(resp, AgentResponse::Ok { .. }));
+
+        // Three chunks: 400 + 400 + 224 bytes, each a distinct fill byte.
+        let chunks: [(&[u8], bool); 3] = [
+            (&[b'A'; 400], false),
+            (&[b'B'; 400], false),
+            (&[b'C'; 224], true),
+        ];
+        for (data, done) in chunks {
+            let (new_session, resp) = handle_file_write_chunk(session, data, done);
+            assert!(
+                matches!(resp, AgentResponse::Ok { .. }),
+                "chunk failed: {:?}",
+                resp
+            );
+            session = new_session;
+        }
+        assert!(session.is_none(), "session must be consumed on done");
+
+        let got = std::fs::read(&target).unwrap();
+        let mut expected = Vec::with_capacity(total);
+        expected.extend(std::iter::repeat_n(b'A', 400));
+        expected.extend(std::iter::repeat_n(b'B', 400));
+        expected.extend(std::iter::repeat_n(b'C', 224));
+        assert_eq!(got, expected);
+        assert!(staging_files_in(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn streaming_write_overflow_aborts_with_no_partial_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp_target(&tmp, "overflow.bin");
+
+        let (session, _resp) =
+            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 10);
+        assert!(session.is_some());
+
+        // First chunk fits.
+        let (session, resp) = handle_file_write_chunk(session, &[0u8; 5], false);
+        assert!(matches!(resp, AgentResponse::Ok { .. }));
+        assert!(session.is_some());
+
+        // Second chunk would push bytes_written to 15, over total_size=10.
+        let (session, resp) = handle_file_write_chunk(session, &[0u8; 10], false);
+        assert!(matches!(resp, AgentResponse::Error { .. }));
+        // Session must be dropped (cleans staging).
+        assert!(session.is_none());
+
+        // Target never appeared (promise: no partial file).
+        assert!(!target.exists());
+        // Staging file cleaned up via Drop.
+        assert!(staging_files_in(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn streaming_write_drop_cleans_staging_file() {
+        // Simulates connection dropping mid-stream. We open a session,
+        // write one chunk, then drop the session without calling done.
+        // The Drop impl must unlink the staging file so no partial
+        // content lingers.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp_target(&tmp, "dropped.bin");
+
+        let (session, _) =
+            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 100);
+        let (session, _) = handle_file_write_chunk(session, &[0u8; 50], false);
+        assert!(session.is_some());
+        // Staging file exists mid-stream.
+        assert_eq!(staging_files_in(tmp.path()).len(), 1);
+
+        drop(session);
+        // After drop, the staging file is gone and target never
+        // appeared.
+        assert!(staging_files_in(tmp.path()).is_empty());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn streaming_write_chunk_without_begin_errors() {
+        let (session, resp) = handle_file_write_chunk(None, &[0u8; 10], true);
+        assert!(session.is_none());
+        assert!(matches!(resp, AgentResponse::Error { .. }));
+    }
+
+    #[test]
+    fn streaming_write_zero_length_file() {
+        // Host sends empty `FileWriteChunk { data: [], done: true }`
+        // to finalize an empty file. Agent must create an empty file
+        // at the target, not leave it missing.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp_target(&tmp, "empty.bin");
+
+        let (session, _) =
+            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 0);
+        let (session, resp) = handle_file_write_chunk(session, &[], true);
+        assert!(matches!(resp, AgentResponse::Ok { .. }));
+        assert!(session.is_none());
+
+        assert!(target.exists());
+        assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
+        assert!(staging_files_in(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn single_shot_write_uses_atomic_rename_too() {
+        // Regression guard on the shared finalizer: handle_file_write
+        // and handle_file_write_chunk(done=true) both go through
+        // install_file_atomic / WriteSession::finalize, so a failure
+        // mid-rename must leave no partial file at the target.
+        // Here we just verify the success path — install_file_atomic
+        // produces a correct file — and that no staging artifact
+        // leaks.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp_target(&tmp, "single.bin");
+        let payload = b"small file contents".to_vec();
+
+        let resp = handle_file_write(&target.to_string_lossy(), &payload, Some(0o644), None, None);
+        assert!(
+            matches!(resp, AgentResponse::Ok { .. }),
+            "write failed: {:?}",
+            resp
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), payload);
+        assert!(staging_files_in(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn resolve_guest_path_rejects_parent_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let merged = tmp.path().join("merged");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&merged).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let res = resolve_guest_io_path_with_roots(
+            "/../../storage/secret.txt",
+            FilePathAccess::Write,
+            Some(&merged),
+            &workspace,
+        );
+        assert!(matches!(res, Err(AgentResponse::Error { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_guest_read_rejects_symlink_escape_from_overlay() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let merged = tmp.path().join("merged");
+        let workspace = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&merged).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let outside_file = outside.join("secret.txt");
+        std::fs::write(&outside_file, b"secret").unwrap();
+        symlink(&outside_file, merged.join("link-outside")).unwrap();
+
+        let res = resolve_guest_io_path_with_roots(
+            "/link-outside",
+            FilePathAccess::Read,
+            Some(&merged),
+            &workspace,
+        );
+        assert!(matches!(res, Err(AgentResponse::Error { .. })));
+    }
+
+    /// A workload can leave a symlink in its own workspace pointing at a
+    /// directory outside it, and `tar -C` follows such a link — so archiving a
+    /// workspace path must be refused when it resolves outside the workspace.
+    ///
+    /// This covers the resolver for a DIRECTORY escape, the shape the archive
+    /// path passes it; the file cases above cover a file escape. It does not by
+    /// itself prove which resolver the archive handler calls — that is the
+    /// wiring this change makes, and it is visible at the call site.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_guest_read_rejects_a_symlinked_directory_escaping_the_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let merged = tmp.path().join("merged");
+        let workspace = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&merged).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+
+        // The workload plants a link in its workspace to a directory outside it.
+        symlink(&outside, workspace.join("results")).unwrap();
+
+        let res = resolve_guest_io_path_with_roots(
+            "/workspace/results",
+            FilePathAccess::Read,
+            Some(&merged),
+            &workspace,
+        );
+        assert!(
+            matches!(res, Err(AgentResponse::Error { .. })),
+            "archiving a workspace path that links outside the workspace must be refused"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_guest_write_rejects_symlink_escape_from_overlay() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let merged = tmp.path().join("merged");
+        let workspace = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&merged).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        symlink(&outside, merged.join("escape-dir")).unwrap();
+
+        let res = resolve_guest_io_path_with_roots(
+            "/escape-dir/pwned.txt",
+            FilePathAccess::Write,
+            Some(&merged),
+            &workspace,
+        );
+        assert!(matches!(res, Err(AgentResponse::Error { .. })));
+    }
+
+    #[test]
+    fn resolve_guest_workspace_path_maps_to_workspace_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let merged = tmp.path().join("merged");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&merged).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let resolved = resolve_guest_io_path_with_roots(
+            "/workspace/subdir/file.txt",
+            FilePathAccess::Write,
+            Some(&merged),
+            &workspace,
+        )
+        .unwrap();
+
+        assert!(resolved.starts_with(&workspace));
+        assert_eq!(resolved, workspace.join("subdir").join("file.txt"));
+    }
+
+    #[test]
+    fn resolve_guest_relative_path_is_normalized_under_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let merged = tmp.path().join("merged");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&merged).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let resolved = resolve_guest_io_path_with_roots(
+            "etc/hosts",
+            FilePathAccess::Write,
+            Some(&merged),
+            &workspace,
+        )
+        .unwrap();
+
+        assert_eq!(resolved, merged.join("etc").join("hosts"));
+    }
+
+    #[test]
+    fn test_boot_log_valid_json() {
+        let line = format_boot_log("ERROR", "something failed");
+        let parsed: serde_json::Value = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("Invalid JSON: {}\nLine: {}", e, line));
+        assert_eq!(parsed["level"], "ERROR");
+        assert_eq!(parsed["message"], "something failed");
+        assert_eq!(parsed["target"], "smolvm_agent::boot");
+    }
+
+    #[test]
+    fn test_boot_log_escapes_quotes() {
+        let line = format_boot_log("ERROR", r#"failed: "device" not found"#);
+        let parsed: serde_json::Value = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("Invalid JSON: {}\nLine: {}", e, line));
+        assert!(parsed["message"].as_str().unwrap().contains("\"device\""));
+    }
+}
+
+/// Map a typed branchpoint step's result onto the wire.
+fn branchpoint_outcome(result: Result<(), branchpoint::TypedError>) -> AgentResponse {
+    match result {
+        Ok(()) => AgentResponse::Ok { data: None },
+        Err(e) => branchpoint_error(e),
+    }
+}
+
+fn branchpoint_error(e: branchpoint::TypedError) -> AgentResponse {
+    AgentResponse::Error {
+        message: e.message,
+        code: Some(e.code.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod meminfo_tests {
+    use super::read_meminfo;
+
+    fn write(contents: &str) -> tempfile::NamedTempFile {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(contents.as_bytes()).expect("write");
+        f.flush().expect("flush");
+        f
+    }
+
+    /// meminfo reports kibibytes, so every field has to be scaled. Reading the
+    /// numbers as bytes would understate a machine's memory 1024-fold.
+    #[test]
+    fn values_are_scaled_from_kibibytes_to_bytes() {
+        let f = write(
+            "MemTotal:        4035968 kB\n\
+             MemFree:         4001728 kB\n\
+             MemAvailable:    3982212 kB\n\
+             Cached:             9512 kB\n",
+        );
+        let m = read_meminfo(f.path().to_str().unwrap()).expect("parses");
+
+        assert_eq!(m.total_bytes, 4_035_968 * 1024);
+        assert_eq!(m.free_bytes, 4_001_728 * 1024);
+        assert_eq!(m.available_bytes, 3_982_212 * 1024);
+        assert_eq!(m.cached_bytes, 9_512 * 1024);
+        // Total minus available is what the guest cannot hand back.
+        assert_eq!(m.used_bytes(), (4_035_968 - 3_982_212) * 1024);
+    }
+
+    /// Swap is reported as total and free; used is the difference. A guest with
+    /// no swap publishes neither line and must report zero, not garbage.
+    #[test]
+    fn swap_used_is_total_minus_free_and_absent_swap_is_zero() {
+        let with_swap = write(
+            "MemTotal:        1024 kB\n\
+             MemAvailable:     512 kB\n\
+             SwapTotal:       2048 kB\n\
+             SwapFree:         512 kB\n",
+        );
+        let m = read_meminfo(with_swap.path().to_str().unwrap()).expect("parses");
+        assert_eq!(m.swap_total_bytes, 2048 * 1024);
+        assert_eq!(m.swap_used_bytes, (2048 - 512) * 1024);
+
+        let no_swap = write("MemTotal:        1024 kB\nMemAvailable:     512 kB\n");
+        let m = read_meminfo(no_swap.path().to_str().unwrap()).expect("parses");
+        assert_eq!(m.swap_total_bytes, 0);
+        assert_eq!(m.swap_used_bytes, 0);
+    }
+
+    /// Kernels predating MemAvailable would otherwise report the whole machine
+    /// as used, since used is derived from it.
+    #[test]
+    fn a_kernel_without_mem_available_falls_back_to_free_plus_cache() {
+        let f = write(
+            "MemTotal:        1000 kB\n\
+             MemFree:          200 kB\n\
+             Cached:           300 kB\n",
+        );
+        let m = read_meminfo(f.path().to_str().unwrap()).expect("parses");
+        assert_eq!(m.available_bytes, 500 * 1024);
+        assert_eq!(m.used_bytes(), 500 * 1024);
+    }
+
+    /// Lines this build does not care about, and malformed ones, must not
+    /// derail the fields it does read.
+    #[test]
+    fn unknown_and_malformed_lines_are_skipped() {
+        let f = write(
+            "Committed_AS:   123456 kB\n\
+             not a meminfo line\n\
+             HugePages_Total:     0\n\
+             MemTotal:         2048 kB\n\
+             Bogus:          notanumber kB\n\
+             MemAvailable:     1024 kB\n",
+        );
+        let m = read_meminfo(f.path().to_str().unwrap()).expect("parses");
+        assert_eq!(m.total_bytes, 2048 * 1024);
+        assert_eq!(m.available_bytes, 1024 * 1024);
+    }
+}

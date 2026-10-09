@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="theme-color" content="#fafafa">
+  <meta name="description" content="Your DevVM projects and DSH conversations, together.">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/app/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app/app.css">
+  <title>DevVM</title>
+</head>
+<body>
+  <div class="app" id="app">
+    <aside class="projects-panel" id="projects-panel" aria-label="Projects" inert>
+      <div class="panel-heading">
+        <a class="brand" href="/" aria-label="DevVM home"><svg viewBox="0 0 28 28" aria-hidden="true"><path d="M6 7h16v14H6zM10 11l3 3-3 3m6 0h3"/></svg><span>DevVM</span></a>
+        <button class="icon-button" id="close-projects" aria-label="Close Projects"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+      </div>
+      <div class="project-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><input id="project-search" type="search" placeholder="Find a project" aria-label="Find a project" autocomplete="off"></div>
+      <div class="list-label">Projects <button class="icon-button" id="refresh-projects" aria-label="Refresh Projects" title="Refresh Project status"><svg viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M5.2 8a7 7 0 0 1 11.6-3L20 8M4 16l3.2 3A7 7 0 0 0 18.8 16"/></svg></button></div>
+      <nav class="project-list" id="project-list" aria-label="Select a Project"><p class="list-empty">Loading Projects…</p></nav>
+      <div class="panel-footer">
+        <button class="manage-button" id="manage-projects"><svg viewBox="0 0 28 28" aria-hidden="true"><path d="M6 7h16v14H6zM10 11l3 3-3 3m6 0h3"/></svg>Manage Projects</button>
+        <div class="daemon-status" id="daemon-status" role="status"><span class="status-dot"></span><span>Connecting to daemon</span></div>
+      </div>
+    </aside>
+    <button class="panel-backdrop" id="projects-backdrop" aria-label="Close Projects" tabindex="-1" hidden></button>
+    <main class="workspace" id="workspace">
+      <header class="workspace-heading">
+        <button class="icon-button" id="open-projects" aria-label="Open Projects" title="Toggle DevVM sidebar" aria-controls="projects-panel" aria-expanded="false"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h12M4 18h8"/></svg></button>
+        <button class="project-title" id="project-title" aria-label="Choose Project"><span id="project-name">Your workspace</span><span id="session-title" class="session-title"></span></button>
+        <div class="heading-actions">
+          <button class="connection-pill text-button" id="connection-status" aria-live="polite" hidden></button>
+          <button class="icon-button saved-text-button" id="open-saved-text" aria-label="Saved text" aria-haspopup="dialog" hidden><svg viewBox="0 0 24 24"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h4"/></svg><span id="saved-text-count" class="count-badge"></span></button>
+          <button class="icon-button" id="project-actions" aria-label="Project actions" aria-haspopup="dialog" hidden><svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg></button>
+        </div>
+      </header>
+      <div class="notice" id="notice" role="status" hidden><span id="notice-text"></span><button class="text-button" id="dismiss-notice" aria-label="Dismiss notification">Dismiss</button></div>
+      <section class="conversation-area" id="conversation-area" aria-label="DSH workspace">
+        <div class="frames" id="frames"></div>
+        <div class="workspace-placeholder" id="workspace-placeholder">
+          <div class="welcome-icon" aria-hidden="true"><svg viewBox="0 0 28 28"><path d="M6 7h16v14H6zM10 11l3 3-3 3m6 0h3"/></svg></div>
+          <h1 id="placeholder-title">A place for every Project</h1>
+          <p id="placeholder-description">Choose a Project to pick up your conversation, or manage Projects to add one.</p>
+          <button class="primary-button" id="placeholder-action">Choose Project</button>
+          <span id="placeholder-progress" class="placeholder-progress" hidden></span>
+        </div>
+      </section>
+    </main>
+  </div>
+  <dialog class="surface-dialog" id="actions-dialog" aria-labelledby="actions-title">
+    <div class="dialog-heading"><div><h2 id="actions-title">Project</h2><p id="actions-path"></p></div><button class="icon-button" data-close-dialog aria-label="Close Project actions"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+    <div class="project-details" id="project-details"></div>
+    <div class="operation-status" id="operation-status" role="status" hidden></div>
+    <div class="action-list" id="action-list"></div>
+    <div class="dialog-footer"><button class="text-button" id="open-logs">View Project Logs</button><button class="text-button" id="open-management">More controls</button></div>
+  </dialog>
+  <dialog class="management-dialog" id="management-dialog" aria-labelledby="management-title">
+    <div class="dialog-heading"><h2 id="management-title">Manage Projects</h2><button class="icon-button" data-close-dialog aria-label="Close management"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+    <iframe id="management-frame" title="Project management" referrerpolicy="no-referrer"></iframe>
+  </dialog>
+  <dialog class="logs-dialog" id="logs-dialog" aria-labelledby="logs-title">
+    <div class="dialog-heading"><div><h2 id="logs-title">Project Logs</h2><p id="logs-description"></p></div><button class="icon-button" data-close-dialog aria-label="Close Project Logs"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+    <pre class="logs-content" id="logs-content" tabindex="0"></pre>
+    <div class="dialog-footer"><button class="text-button" id="refresh-logs">Refresh Logs</button><span id="logs-status" role="status"></span></div>
+  </dialog>
+  <dialog class="surface-dialog saved-text-dialog" id="saved-text-dialog" aria-labelledby="saved-text-title">
+    <div class="dialog-heading"><div><h2 id="saved-text-title">Saved text</h2><p>Text waiting for its original Project to accept it.</p></div><button class="icon-button" data-close-dialog aria-label="Close saved text"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+    <div id="saved-text-list" class="saved-text-list"></div>
+  </dialog>
+  <dialog class="confirmation-dialog" id="confirmation-dialog" aria-labelledby="confirmation-title">
+    <h2 id="confirmation-title"></h2><p id="confirmation-description"></p>
+    <div class="confirmation-actions"><button class="secondary-button" id="cancel-confirmation">Cancel</button><button class="danger-button" id="confirm-action">Confirm</button></div>
+  </dialog>
+  <script type="module" src="/app/app.js"></script>
+</body>
+</html>

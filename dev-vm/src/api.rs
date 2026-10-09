@@ -10,7 +10,7 @@ use crate::models::{
 use crate::registry::{
     get_project, load_projects, register_project, unregister_project, RegistryError,
 };
-use crate::runner::check_vm_status;
+use crate::runner::{check_vm_memory, check_vm_status};
 use crate::runtime::{DshRuntimeManager, LifecycleAction};
 use crate::sync::{load_sync_config, provision_sync_setup, SyncConfig, SyncManager};
 use crate::ui::INDEX_HTML;
@@ -58,6 +58,57 @@ fn api_error(
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index_handler))
+        .route(
+            "/manage",
+            get(|| async { Html(crate::ui::MANAGEMENT_HTML) }),
+        )
+        .route(
+            "/app/app.css",
+            get(|| async { app_asset("text/css; charset=utf-8", crate::ui::APP_CSS) }),
+        )
+        .route(
+            "/app/app.js",
+            get(|| async { app_asset("text/javascript; charset=utf-8", crate::ui::APP_JS) }),
+        )
+        .route(
+            "/app/text-store.js",
+            get(|| async { app_asset("text/javascript; charset=utf-8", crate::ui::TEXT_STORE_JS) }),
+        )
+        .route(
+            "/app/icon.svg",
+            get(|| async { app_asset("image/svg+xml", crate::ui::ICON) }),
+        )
+        .route(
+            "/app/icon-192.png",
+            get(|| async {
+                (
+                    [("content-type", "image/png")],
+                    include_bytes!("web/icon-192.png").as_slice(),
+                )
+            }),
+        )
+        .route(
+            "/app/icon-512.png",
+            get(|| async {
+                (
+                    [("content-type", "image/png")],
+                    include_bytes!("web/icon-512.png").as_slice(),
+                )
+            }),
+        )
+        .route(
+            "/manifest.webmanifest",
+            get(|| async { app_asset("application/manifest+json", crate::ui::MANIFEST) }),
+        )
+        .route(
+            "/service-worker.js",
+            get(|| async {
+                app_asset(
+                    "text/javascript; charset=utf-8",
+                    crate::ui::service_worker(),
+                )
+            }),
+        )
         .route("/api/projects", get(list_projects))
         .route("/api/projects/{id}", get(get_project_handler))
         .route("/api/projects/register", post(register_project_handler))
@@ -66,6 +117,10 @@ pub fn create_router(state: AppState) -> Router {
             post(unregister_project_handler),
         )
         .route("/api/projects/{id}/logs", get(get_logs_handler))
+        .route(
+            "/api/projects/{id}/operations",
+            get(project_operations).post(submit_operation),
+        )
         .route("/api/projects/{id}/vm/start", post(start_vm_handler))
         .route("/api/projects/{id}/vm/stop", post(stop_vm_handler))
         .route("/api/projects/{id}/vm/delete", post(delete_vm_handler))
@@ -119,6 +174,12 @@ async fn build_project_view(state: &AppState, record: &ProjectRecord) -> Project
         None
     };
 
+    let memory = if vm_status == crate::models::VmStatus::Running {
+        check_vm_memory(&state.config, &record.path).await
+    } else {
+        None
+    };
+
     let (local_dsh_url, tailnet_dsh_url) = if dsh_status == DshStatus::Running {
         if let Some(token) = state
             .dsh_runtime_manager
@@ -149,6 +210,7 @@ async fn build_project_view(state: &AppState, record: &ProjectRecord) -> Project
         .as_deref()
         .and_then(|d| build_remote_port_template(&project_host, d).ok());
 
+    let operations = state.dsh_runtime_manager.operations(record.id);
     ProjectView {
         id: record.id,
         path: record.path.display().to_string(),
@@ -157,6 +219,10 @@ async fn build_project_view(state: &AppState, record: &ProjectRecord) -> Project
         vm_status,
         dsh_status,
         sync_status,
+        memory,
+        daemon_instance_id: operations.daemon_instance_id,
+        operation: operations.active,
+        last_operation: operations.recent.into_iter().next(),
         links: ProjectLinks {
             local_dsh_url: local_dsh_url.clone(),
             tailnet_dsh_url,
@@ -521,4 +587,58 @@ async fn browser_handler(
             format!("I/O error: {}", e),
         ),
     }
+}
+
+async fn project_operations(State(state): State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
+    // Retained records are observable after another client unregisters a Project.
+    let snapshot = state.dsh_runtime_manager.operations(id);
+    if snapshot.active.is_none() && snapshot.recent.is_empty() {
+        if let Err(response) = get_project_or_response(&state, id) {
+            return *response;
+        }
+    }
+    ([("cache-control", "no-store")], Json(snapshot)).into_response()
+}
+
+async fn submit_operation(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<crate::models::SubmitOperationRequest>,
+) -> Response {
+    let project = match get_project_or_response(&state, id) {
+        Ok(project) => project,
+        Err(response) => return *response,
+    };
+    match state.dsh_runtime_manager.submit(
+        &state.config,
+        id,
+        &project.path,
+        request.action,
+        request.request_id,
+    ) {
+        Ok(operation) => (
+            StatusCode::ACCEPTED,
+            [("cache-control", "no-store")],
+            Json(operation),
+        )
+            .into_response(),
+        Err(error) => {
+            let status = match error {
+                LifecycleError::Busy | LifecycleError::Cancelled => StatusCode::CONFLICT,
+                LifecycleError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            api_error(status, &state.config.log_dir, Some(id), "lifecycle", error)
+        }
+    }
+}
+
+fn app_asset(content_type: &'static str, body: impl IntoResponse) -> impl IntoResponse {
+    (
+        [
+            ("content-type", content_type),
+            ("cache-control", "no-cache"),
+            ("x-content-type-options", "nosniff"),
+        ],
+        body,
+    )
 }

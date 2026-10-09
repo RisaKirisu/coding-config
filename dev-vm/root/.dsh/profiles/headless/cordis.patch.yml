@@ -261,41 +261,18 @@
         requestImagePixelBudget: 4194304
         requestImageMaxBytes: 1048576
       krill-claude:
-        displayName: Krill
+        displayName: Krill Claude
         apiKeyEnv: KRILL_CLAUDE_API_KEY
         api: anthropic-messages
-        baseURL: https://api.krill-ai.net
+        baseURL: https://api.krill-code.net
         models:
-          - id: claude-fable-5
-            contextWindow: 300000
-            maxTokens: 64000
+          - id: claude-opus-5-5
+            name: claude-opus-5-5 · Krill AI
+            contextWindow: 1000000
+            maxTokens: 128000
             input:
               - text
               - image
-            reasoningEfforts:
-              off: null
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-            compat:
-              chatTemplateKwargs: {}
-              chatTemplateArgs: {}
-        modelOverrides: {}
-        compat:
-          chatTemplateKwargs: {}
-          chatTemplateArgs: {}
-        defaultContextWindow: 262144
-        defaultMaxTokens: 32768
-        defaultInput:
-          - text
-        headers: {}
-        thinkingBudgets: {}
-        streamIdleTimeoutMs: 300000
-        maxRequestImageBytes: 20971520
-        requestImagePixelBudget: 4194304
-        requestImageMaxBytes: 1048576
 - id: llm-deepseek
   config:
     models:

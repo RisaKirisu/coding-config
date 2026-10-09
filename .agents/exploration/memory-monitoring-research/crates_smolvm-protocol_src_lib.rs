@@ -1,0 +1,1797 @@
+//! Protocol types for smolvm host-guest communication.
+//!
+//! This crate defines the wire protocol for vsock communication between
+//! the smolvm host and the guest agent (smolvm-agent).
+//!
+//! # Protocol Overview
+//!
+//! Communication uses JSON-encoded messages over vsock. Each message is
+//! prefixed with a 4-byte big-endian length header.
+//!
+//! ```text
+//! +----------------+-------------------+
+//! | Length (4 BE)  | JSON payload      |
+//! +----------------+-------------------+
+//! ```
+
+#![deny(missing_docs)]
+
+use serde::{Deserialize, Serialize};
+
+/// One S3-compatible bucket to mount inside the workload container.
+///
+/// Structured rather than a shell command: the agent mounts it natively, so
+/// nothing has to be installed in the image and no command is interpolated.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct S3Volume {
+    /// Service endpoint, e.g. `https://s3.us-east-1.amazonaws.com` or a
+    /// self-hosted `http://minio:9000`.
+    pub endpoint: String,
+    /// Region used for request signing.
+    pub region: String,
+    /// Bucket to mount.
+    pub bucket: String,
+    /// Optional key prefix, so a mount can expose one sub-tree of a bucket.
+    #[serde(default)]
+    pub prefix: String,
+    /// Absolute path inside the container where the bucket appears.
+    pub mountpoint: String,
+    /// Mount read-only; the kernel then rejects writes before they reach us.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Access key. Absent (with the secret) means anonymous access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
+    /// Secret key paired with `access_key_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_access_key: Option<String>,
+    /// Session token, when temporary credentials are in use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
+}
+
+pub mod credentials;
+pub mod forkpoint;
+pub mod guest_env;
+pub mod image_ref;
+pub mod intercept;
+pub mod publish_socket;
+pub mod retry;
+pub mod secrets;
+
+pub use credentials::{CredentialBinding, CredentialPolicy};
+pub use image_ref::{image_repo, normalize_image_ref};
+pub use intercept::InterceptEndpoint;
+pub use secrets::{SecretRef, SecretSourceKind};
+
+/// Serde helper for encoding `Vec<u8>` as a base64 string in JSON.
+///
+/// Without this, serde_json serializes `Vec<u8>` as a JSON array of numbers
+/// (e.g., `[104,101,108,108,111]`), which inflates binary data by ~4x.
+/// Base64 encoding reduces this to ~1.33x.
+pub mod base64_bytes {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Serialize `Vec<u8>` as a base64 string.
+    pub fn serialize<S: Serializer>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(data))
+    }
+
+    /// Deserialize a base64 string into `Vec<u8>`.
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        STANDARD.decode(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Protocol version.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The agent can freeze internal filesystems before acknowledging shutdown.
+pub const QUIESCED_SHUTDOWN_CAPABILITY: &str = "quiesced-shutdown-v1";
+
+/// virtiofs tag under which the host exposes the Rosetta 2 Linux runtime to the
+/// guest. Shared host↔guest so the launcher's `krun_add_virtiofs` tag and the
+/// guest agent's `mount -t virtiofs` source can't drift apart.
+pub const ROSETTA_TAG: &str = "rosetta";
+
+/// Guest mount point for the Rosetta 2 Linux runtime. The ptrace wrapper execs
+/// `<ROSETTA_GUEST_PATH>/rosetta` (the translator), so this path is baked into
+/// both the wrapper and the `binfmt_misc` registration.
+pub const ROSETTA_GUEST_PATH: &str = "/mnt/rosetta";
+
+/// Maximum frame size (32 MB - layer exports use chunked streaming).
+pub const MAX_FRAME_SIZE: u32 = 32 * 1024 * 1024;
+
+/// Chunk size for streaming layer data (~16 MB raw, ~21 MB as base64 JSON).
+pub const LAYER_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+
+/// Files at or below this size are written with a single `FileWrite`
+/// message. Larger files must stream via
+/// `FileWriteBegin` + `FileWriteChunk` so no single frame approaches
+/// [`MAX_FRAME_SIZE`] (base64 + JSON inflation is ~1.4x).
+///
+/// Chosen to keep the single-shot frame comfortably under the frame
+/// limit while preserving the fast-path latency for small config
+/// files / scripts / keys.
+pub const FILE_WRITE_SINGLE_SHOT_MAX: usize = 1024 * 1024;
+
+/// Payload bytes per streaming upload chunk. Deliberately small —
+/// equal to [`FILE_WRITE_SINGLE_SHOT_MAX`] — so each chunk's encoded
+/// frame (~1.4 MB) fits inside typical kernel Unix-socket send
+/// buffers (`SO_SNDBUF` defaults on the order of 200–256 KiB but
+/// can grow). Larger chunks would force `write_all` to spin waiting
+/// for the agent to drain, and any latency spike trips the 10 s
+/// write timeout with `EAGAIN` — exactly the failure David
+/// reproduced before this fix landed.
+///
+/// Note: [`LAYER_CHUNK_SIZE`] is 16 MiB for agent→host (download)
+/// streaming, which works because the host side of the socket has
+/// more headroom than the guest side. Upload streaming is the
+/// asymmetric case and needs a smaller chunk.
+pub const FILE_WRITE_CHUNK_SIZE: usize = FILE_WRITE_SINGLE_SHOT_MAX;
+
+// The single-shot threshold must be <= the chunk size. They can be equal (a
+// 1 MiB file is a single shot; a 1 MiB + 1 byte file streams as two chunks),
+// but SINGLE_SHOT > CHUNK would be incoherent — a file slightly over the shot
+// threshold would have to stream as a single oversized chunk. Enforced at
+// compile time so a bad edit fails the build rather than a test.
+const _: () = assert!(FILE_WRITE_SINGLE_SHOT_MAX <= FILE_WRITE_CHUNK_SIZE);
+
+/// Hard ceiling on a single file transfer in either direction.
+///
+/// On the write path: enforced at `FileWriteBegin` by the agent —
+/// `total_size > FILE_TRANSFER_MAX_TOTAL` is rejected before any
+/// staging file is created.
+///
+/// On the read path: enforced by the host's `read_file` loop —
+/// after the first chunk that pushes the accumulated total past the
+/// cap, the call bails with an error and the partial buffer is
+/// dropped. This protects the host process from OOM if the guest
+/// (compromised or merely buggy) streams unbounded data.
+///
+/// 4 GiB matches the order-of-magnitude of the default overlay disk and the
+/// `gpu_vram_mib` cap. It is the compiled-in default. The host-side transfer
+/// paths (read/export, including `pack create --from-vm`) raise it at runtime
+/// via `SMOLVM_FILE_TRANSFER_MAX_BYTES` (see
+/// `agent::client::file_transfer_max_total`) so a VM snapshot whose overlay
+/// carries a large dependency tree (e.g. a torch + CUDA-wheels environment is
+/// ~5 GiB) can be packed without lowering the DoS bound for everyone else. The
+/// guest agent's write-path check runs inside the VM and cannot see that host
+/// env var, so it always enforces this const. Callers that need to move larger
+/// blobs routinely should stage via a virtiofs mount instead of `cp`.
+pub const FILE_TRANSFER_MAX_TOTAL: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Filename of the virtiofs-visible marker the agent creates when it is
+/// ready to accept vsock connections.
+///
+/// The host polls for this file through its virtiofs mount of the guest
+/// rootfs. The agent writes it (and optionally a symlink from `/oldroot/`)
+/// during deferred init, just before opening the vsock listener.
+///
+/// Both sides must agree on this name; keeping it here prevents silent drift.
+pub const AGENT_READY_MARKER: &str = ".smolvm-ready";
+
+/// Well-known vsock ports.
+pub mod ports {
+    /// Control channel for workload VMs.
+    pub const WORKLOAD_CONTROL: u32 = 5000;
+    /// Log streaming from workload VMs.
+    pub const WORKLOAD_LOGS: u32 = 5001;
+    /// Agent control port (for OCI operations and management).
+    pub const AGENT_CONTROL: u32 = 6000;
+    /// SSH agent forwarding (host SSH_AUTH_SOCK bridged to guest).
+    pub const SSH_AGENT: u32 = 6001;
+    /// DNS filtering proxy (guest forwards DNS queries to host for filtering).
+    pub const DNS_FILTER: u32 = 6002;
+    /// Docker socket bridge: the guest listens on this vsock port and proxies
+    /// each connection to the in-guest `/var/run/docker.sock`, so the host can
+    /// reach the guest's Docker daemon over a host-side Unix socket
+    /// (`DOCKER_HOST=unix://…`). Inbound (host connects in), like the agent
+    /// control channel — unlike the outbound SSH/DNS/CUDA bridges.
+    pub const DOCKER: u32 = 6003;
+    /// Readiness doorbell: the guest connects OUT to this host port the instant it
+    /// finishes init, and the host's `accept()` fires — an event-driven readiness
+    /// signal that needs no writable filesystem, DAX window, or extra virtio
+    /// device. Outbound (guest connects in), like the SSH/DNS/CUDA bridges. The
+    /// primary readiness signal; the ready-marker file and the control-channel
+    /// ping remain as fallbacks. A fork clone resumes past the ring, so it never
+    /// dials this — clones detect readiness by pinging the restored agent.
+    pub const AGENT_READY: u32 = 6004;
+    /// CUDA-over-vsock (experimental): guest CUDA client forwards Driver-API
+    /// calls to a host CUDA server that runs them on the host NVIDIA GPU.
+    pub const CUDA: u32 = 7000;
+
+    /// Base vsock port for user-published Unix-socket bridges
+    /// (`--expose-socket` / `--mount-socket`). Each published socket is assigned
+    /// `PUBLISH_SOCKET_BASE + index`. Kept clear of the fixed ports above (and of
+    /// CUDA at 7000) so a reasonable number of sockets never collides.
+    pub const PUBLISH_SOCKET_BASE: u32 = 6100;
+
+    /// Maximum number of user-published sockets per VM. Bounds the vsock-port
+    /// window (`6100..6100+MAX`) below CUDA's 7000.
+    pub const PUBLISH_SOCKET_MAX: usize = 64;
+}
+
+/// vsock CID constants.
+pub mod cid {
+    /// Host CID (always 2).
+    pub const HOST: u32 = 2;
+    /// Guest CID (always 3 for the first/only guest).
+    pub const GUEST: u32 = 3;
+    /// Any CID (for listening).
+    pub const ANY: u32 = u32::MAX;
+}
+
+/// fsnotify event masks, mirroring the kernel's `FS_*` bits in
+/// `include/linux/fsnotify_backend.h`. Shared by the host watcher (which maps a
+/// host filesystem event to one of these) and the guest agent (which forwards
+/// the raw bits to `/proc/smolvm-fsnotify`). Only the subset relevant to
+/// file-watching tools is defined.
+pub mod fsnotify_mask {
+    /// File was modified.
+    pub const FS_MODIFY: u32 = 0x0000_0002;
+    /// Metadata changed (chmod/chown/utimes).
+    pub const FS_ATTRIB: u32 = 0x0000_0004;
+    /// Writable file was closed.
+    pub const FS_CLOSE_WRITE: u32 = 0x0000_0008;
+    /// File was moved away from the watched dir.
+    pub const FS_MOVED_FROM: u32 = 0x0000_0040;
+    /// File was moved into the watched dir.
+    pub const FS_MOVED_TO: u32 = 0x0000_0080;
+    /// Subfile was created.
+    pub const FS_CREATE: u32 = 0x0000_0100;
+    /// Subfile was deleted.
+    pub const FS_DELETE: u32 = 0x0000_0200;
+    /// Event occurred against a directory.
+    pub const FS_ISDIR: u32 = 0x4000_0000;
+}
+
+/// A single host-originated filesystem change to replay into the guest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsNotifyEvent {
+    /// Guest-side absolute path the event occurred on (virtiofs staging path).
+    pub path: String,
+    /// `fsnotify_mask::FS_*` bitmask for the event.
+    pub mask: u32,
+}
+
+// ============================================================================
+// Agent Protocol (OCI Operations)
+// ============================================================================
+
+fn shutdown_progress_disabled(progress: &bool) -> bool {
+    !progress
+}
+
+#[cfg(test)]
+mod shutdown_compat_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_shutdown_wire_shape_is_unchanged() {
+        let wire = r#"{"method":"shutdown"}"#;
+        assert!(matches!(
+            serde_json::from_str::<AgentRequest>(wire).unwrap(),
+            AgentRequest::Shutdown { progress: false }
+        ));
+        assert_eq!(
+            serde_json::to_string(&AgentRequest::Shutdown { progress: false }).unwrap(),
+            wire
+        );
+    }
+
+    #[test]
+    fn older_agent_can_accept_opt_in_request() {
+        #[derive(Deserialize)]
+        #[serde(tag = "method", rename_all = "snake_case")]
+        enum LegacyRequest {
+            Shutdown,
+        }
+        let wire = serde_json::to_string(&AgentRequest::Shutdown { progress: true }).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<LegacyRequest>(&wire).unwrap(),
+            LegacyRequest::Shutdown
+        ));
+    }
+
+    #[test]
+    fn traced_shutdown_preserves_progress_opt_in() {
+        let envelope = Envelope::with_trace_id(
+            AgentRequest::Shutdown { progress: true },
+            Some("shutdown-test".into()),
+        );
+        let decoded: Envelope<AgentRequest> =
+            decode_message(&encode_message(&envelope).unwrap()).unwrap();
+        assert!(matches!(
+            decoded.body,
+            AgentRequest::Shutdown { progress: true }
+        ));
+        assert_eq!(decoded.trace_id.as_deref(), Some("shutdown-test"));
+    }
+}
+
+/// Agent request types (for image management and OCI operations).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum AgentRequest {
+    /// Ping to check if agent is alive.
+    Ping,
+
+    /// Inject host-originated fsnotify events into the guest.
+    ///
+    /// virtiofs does not deliver host-side file changes to the guest as
+    /// fsnotify/inotify events, so inotify-based hot-reload (Vite, webpack,
+    /// nodemon) never fires when a mounted file is edited on the host. The host
+    /// watches the mount source and sends the resulting events here; the agent
+    /// writes them to `/proc/smolvm-fsnotify`, which fires the matching event on
+    /// the guest inode so watchers on the (bind-mounted) container path wake up.
+    /// Each `path` is a guest-side absolute path (the virtiofs staging path),
+    /// `mask` an `fsnotify_mask::FS_*` bitmask.
+    FsNotify {
+        /// Host-originated filesystem changes to replay as guest fsnotify events.
+        #[serde(default)]
+        events: Vec<FsNotifyEvent>,
+    },
+
+    /// Pull an OCI image and extract layers.
+    Pull {
+        /// Image reference (e.g., "alpine:latest", "docker.io/library/ubuntu:22.04").
+        image: String,
+        /// OCI platform to pull (e.g., "linux/arm64", "linux/amd64").
+        oci_platform: Option<String>,
+        /// Optional registry authentication credentials.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<RegistryAuth>,
+        /// Proxy URL applied to the registry client (sets HTTP_PROXY and HTTPS_PROXY).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proxy: Option<String>,
+        /// Comma-separated NO_PROXY list of hosts/CIDRs that bypass the proxy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        no_proxy: Option<String>,
+    },
+
+    /// Query if an image exists locally.
+    Query {
+        /// Image reference.
+        image: String,
+    },
+
+    /// List all cached images.
+    ListImages,
+
+    /// Run garbage collection on unused layers.
+    GarbageCollect {
+        /// If true, only report what would be deleted.
+        dry_run: bool,
+        /// If true, delete all image manifests and configs first,
+        /// making all layers unreferenced so they get collected.
+        #[serde(default)]
+        purge_all: bool,
+    },
+
+    /// Prepare overlay rootfs for a workload.
+    PrepareOverlay {
+        /// Image reference.
+        image: String,
+        /// Unique workload ID for the overlay.
+        workload_id: String,
+    },
+
+    /// Clean up overlay rootfs for a workload.
+    CleanupOverlay {
+        /// Workload ID to clean up.
+        workload_id: String,
+    },
+
+    /// Format the storage disk (first-time setup).
+    FormatStorage,
+
+    /// Get storage disk status.
+    StorageStatus,
+
+    /// Report the guest's own view of machine memory, read from
+    /// `/proc/meminfo`.
+    ///
+    /// The host cannot answer this. macOS charges the VMM's `phys_footprint`
+    /// as `internal + compressed`, and the compressed part is counted at the
+    /// pages' *uncompressed* size, so an idle guest whose memory has been
+    /// compressed reports a footprint several times the bytes it actually
+    /// occupies. Only the guest's allocator knows what the machine is using.
+    MemoryStatus,
+
+    /// Test network connectivity directly from the agent (not via chroot).
+    /// Used to debug TSI networking.
+    NetworkTest {
+        /// URL to test (e.g., "http://1.1.1.1")
+        url: String,
+    },
+
+    /// Shutdown the agent.
+    Shutdown {
+        /// Opt into progress frames while storage is being synchronized.
+        #[serde(default, skip_serializing_if = "shutdown_progress_disabled")]
+        progress: bool,
+    },
+
+    /// Export a layer as a tar archive.
+    ///
+    /// Used by `smolvm pack` to extract OCI layers for packaging.
+    /// The agent streams the layer tar data back via LayerData responses.
+    ExportLayer {
+        /// Image digest (sha256:...).
+        image_digest: String,
+        /// Layer index (0-based).
+        layer_index: usize,
+    },
+
+    /// Merge a stack of directories into a single tar archive.
+    ///
+    /// `pack create --from-vm` ships the machine's image layers plus whatever the
+    /// container has written since as ONE flattened layer. The merge has to apply
+    /// whiteouts and opaque markers exactly as the runtime would, so it is done
+    /// with a read-only overlay mount rather than a file copy.
+    ///
+    /// The agent owns this rather than the host driving `mount(8)` over `VmExec`,
+    /// because `mount(8)` rejects a `lowerdir=` value beyond ~255 bytes — about
+    /// three OCI layer paths — while the agent can append each layer separately
+    /// through the same `fsconfig` path the runtime container mount uses.
+    FlattenLayers {
+        /// Directories to merge, bottom -> top. Entries that are missing or empty
+        /// are dropped, so a caller may include a container overlay's upper dir
+        /// without first checking whether the machine ever wrote to it.
+        lowerdirs: Vec<String>,
+        /// Guest path to write the tar archive to, or `None` to stream the
+        /// archive straight back as `DataChunk` responses.
+        ///
+        /// Streaming is what a large export wants. The flattened tar is as large
+        /// as the image it came from, so staging it in the guest means the disk
+        /// has to hold both the expanded rootfs and a second full copy of it as
+        /// an archive — the export sizes that disk by guessing, and a big enough
+        /// image runs it out of space.
+        #[serde(default)]
+        output: Option<String>,
+    },
+
+    /// Wait until the workload has declared a branchpoint, returning the ready
+    /// marker's contents (its profile lines) in `data.contents`.
+    BranchpointWait {
+        /// Give up after this many milliseconds.
+        timeout_ms: u64,
+    },
+    /// Put a negotiated helper into its restore-safe loop before capture.
+    BranchpointArm,
+    /// Return a parked source to its ordinary wait after capture.
+    BranchpointPark,
+    /// Release a restored clone: write the release marker for the generation
+    /// recorded in its ready marker, carrying the clone's identity, and wait
+    /// for the helper to acknowledge.
+    BranchpointRelease {
+        /// The clone's parameters in dotenv form, appended to the marker.
+        #[serde(default)]
+        env_dotenv: Option<String>,
+    },
+    /// Assign and release a held clone in one idempotent step: claim it with
+    /// `activation_token` (a retry with the same token completes a partial
+    /// commit; a different token is refused), install the per-clone
+    /// parameters, then write the release marker.
+    BranchpointActivate {
+        /// Per-clone parameters, dotenv form, written to `env_path`.
+        env_dotenv: String,
+        /// The same parameters in shell-sourceable form, written to `branch_env_path`.
+        env_sourceable: String,
+        /// Guest path of the dotenv file (under the clone's overlay for image machines).
+        env_path: String,
+        /// Guest path of the sourceable file.
+        branch_env_path: String,
+        /// Directory that must already exist, typically the clone's merged
+        /// overlay root; activation refuses rather than fabricating it.
+        require_dir: Option<String>,
+        /// Directory to create before writing the env files.
+        env_dir: String,
+        /// Token identifying this activation attempt.
+        activation_token: String,
+    },
+    /// Wait until a released clone's workload publishes its worker-ready token.
+    BranchpointWaitWorkerReady {
+        /// The token the workload must publish; any other is a mismatch.
+        token: String,
+        /// Give up after this many milliseconds.
+        timeout_ms: u64,
+    },
+
+    /// Execute a command directly in the VM (not in a container).
+    ///
+    /// This runs the command in the agent's Alpine rootfs without any
+    /// container isolation. Useful for VM-level operations and debugging.
+    VmExec {
+        /// Command and arguments.
+        command: Vec<String>,
+        /// Environment variables.
+        #[serde(default)]
+        env: Vec<(String, String)>,
+        /// Working directory in the VM.
+        workdir: Option<String>,
+        /// Timeout in milliseconds.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        /// Interactive mode - stream I/O instead of buffering.
+        #[serde(default)]
+        interactive: bool,
+        /// Allocate a pseudo-TTY for the command.
+        #[serde(default)]
+        tty: bool,
+        /// Background mode - spawn and return PID immediately without waiting.
+        #[serde(default)]
+        background: bool,
+        /// Data to pipe to the command's stdin.
+        #[serde(default)]
+        stdin_data: Option<String>,
+    },
+
+    /// Run a command in an image's rootfs.
+    ///
+    /// This prepares an overlay, chroots into it, and executes the command.
+    /// Returns stdout, stderr, and exit code when the command completes.
+    Run {
+        /// Image reference (must be pulled first).
+        image: String,
+        /// Command and arguments.
+        command: Vec<String>,
+        /// Environment variables.
+        #[serde(default)]
+        env: Vec<(String, String)>,
+        /// Working directory inside the rootfs.
+        workdir: Option<String>,
+        /// User inside the rootfs. If omitted, the OCI image default applies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user: Option<String>,
+        /// Volume mounts to bind into the container.
+        /// Each tuple is (virtiofs_tag, container_path, read_only).
+        #[serde(default)]
+        mounts: Vec<(String, String, bool)>,
+        /// Timeout in milliseconds. If the command exceeds this duration,
+        /// it will be killed and return exit code 124.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        /// Interactive mode - stream I/O instead of buffering.
+        /// When true, output is streamed via Stdout/Stderr responses,
+        /// and stdin can be sent via the Stdin request.
+        #[serde(default)]
+        interactive: bool,
+        /// Allocate a pseudo-TTY for the command.
+        /// Enables terminal features like colors, line editing, and signal handling.
+        #[serde(default)]
+        tty: bool,
+        /// Detached mode — start the container and return immediately with the
+        /// container ID. Only meaningful when `persistent_overlay_id` is set.
+        /// Returns a `Completed` response with `stdout` containing the container ID.
+        #[serde(default)]
+        detached: bool,
+        /// Run the workload as an unprivileged container: restricted capabilities,
+        /// read-only cgroup, and no extra tmpfs. The default (false) is "VM-grade"
+        /// — since the microVM is the isolation boundary, the workload gets a full
+        /// capability set and the mounts an init system needs (so any image, incl.
+        /// systemd, boots). Opt in for defense-in-depth when running untrusted code.
+        #[serde(default)]
+        unprivileged: bool,
+        /// If set, use a persistent overlay that survives across exec sessions.
+        /// The overlay is identified by this ID (typically the machine name)
+        /// and reused on subsequent runs. If not set, an ephemeral overlay is
+        /// created and destroyed after the run.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persistent_overlay_id: Option<String>,
+        /// Data to pipe to the command's stdin (non-interactive runs only).
+        /// The pipe is closed after writing, so the command sees EOF.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stdin_data: Option<String>,
+        /// Spawn the container and return immediately with the crun PID.
+        /// The container runs detached; stdout/stderr go to /dev/null.
+        /// Incompatible with `interactive` and `tty`.
+        #[serde(default)]
+        background: bool,
+        /// S3 volumes to mount into the workload container. The agent mounts
+        /// them between `crun create` and `crun start`, so the workload's first
+        /// instruction already sees them and its command is never rewritten.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        s3_volumes: Vec<S3Volume>,
+    },
+
+    /// Send stdin data to a running interactive command.
+    Stdin {
+        /// Input data to send to the command's stdin.
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+    },
+
+    /// Resize the PTY window (for TTY mode).
+    Resize {
+        /// New width in columns.
+        cols: u16,
+        /// New height in rows.
+        rows: u16,
+    },
+
+    // ========================================================================
+    // File I/O
+    // ========================================================================
+    /// Write a file inside the VM in a single message.
+    ///
+    /// Use only for files up to [`FILE_WRITE_SINGLE_SHOT_MAX`]. Larger
+    /// files must stream via [`Self::FileWriteBegin`] +
+    /// [`Self::FileWriteChunk`] to avoid exceeding [`MAX_FRAME_SIZE`]
+    /// after base64 + JSON inflation.
+    FileWrite {
+        /// Absolute path in the VM filesystem.
+        path: String,
+        /// File contents.
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+        /// File mode (e.g., 0o644). None = default (0644).
+        #[serde(default)]
+        mode: Option<u32>,
+        /// Owner uid to apply after the write. None = leave as written (root).
+        #[serde(default)]
+        uid: Option<u32>,
+        /// Owner gid to apply after the write. None = leave as written (root).
+        #[serde(default)]
+        gid: Option<u32>,
+    },
+
+    /// Open a streaming file upload session on this connection.
+    ///
+    /// Must be followed by one or more [`Self::FileWriteChunk`]
+    /// requests. The final chunk sets `done: true` to finalize.
+    /// Dropping the connection (or sending any non-chunk request)
+    /// before `done` aborts the session and leaves no partial file
+    /// at `path`.
+    ///
+    /// Sessions are per-connection — one session at a time.
+    FileWriteBegin {
+        /// Absolute path in the VM filesystem.
+        path: String,
+        /// File mode (e.g., 0o644). None = default (0644).
+        #[serde(default)]
+        mode: Option<u32>,
+        /// Owner uid to apply on finalize. None = leave as written (root).
+        #[serde(default)]
+        uid: Option<u32>,
+        /// Owner gid to apply on finalize. None = leave as written (root).
+        #[serde(default)]
+        gid: Option<u32>,
+        /// Expected total size in bytes. Rejected if it exceeds
+        /// [`FILE_TRANSFER_MAX_TOTAL`]. The agent uses this for an
+        /// early-fail check only; the actual size written is the sum
+        /// of chunk byte lengths.
+        total_size: u64,
+    },
+
+    /// Append a chunk to the currently open streaming upload.
+    /// If `done` is true, the agent fsyncs and atomically renames the
+    /// staging file onto the target path.
+    FileWriteChunk {
+        /// Chunk bytes. Typically [`FILE_WRITE_CHUNK_SIZE`] except
+        /// for the last chunk.
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+        /// True on the final chunk; closes and renames the staging
+        /// file. False on intermediate chunks.
+        done: bool,
+    },
+
+    /// Read a file from the VM.
+    FileRead {
+        /// Absolute path in the VM filesystem.
+        path: String,
+    },
+
+    /// List the entries of a guest directory.
+    ///
+    /// Kept separate from [`AgentRequest::FileRead`], which streams bytes: a
+    /// listing is small and structured, and a caller that has to discover what
+    /// exists would otherwise guess names and read a 404 for each miss.
+    ListDirectory {
+        /// Absolute directory path in the VM filesystem.
+        path: String,
+    },
+
+    /// Stream a tar archive of a guest directory without creating a guest-side
+    /// temporary file. Used by staged mounts to batch many small files across
+    /// vsock instead of paying one virtiofs round trip per file.
+    ArchiveDirectory {
+        /// Absolute directory path in the VM filesystem.
+        path: String,
+    },
+
+    /// Create (without starting) a Kubernetes pod container whose rootfs is a
+    /// virtiofs-shared host directory (containerd snapshotter output) and whose
+    /// process definition comes from the host's OCI config. The agent builds
+    /// its crun bundle around the shared rootfs; nothing runs until
+    /// `PodStart`. Part of the containerd shim v2 datapath
+    /// (docs/kubernetes-runtime.md).
+    PodCreate {
+        /// Container ID (containerd task id).
+        id: String,
+        /// Rootfs path relative to the sandbox's shared virtiofs mount. The
+        /// shim boots the sandbox VM with ONE shared dir and bind-mounts each
+        /// container's rootfs under it (virtiofs shares are fixed at boot, but
+        /// pod containers are created afterwards), so the guest resolves this
+        /// as `<sandbox-share-mount>/<rootfs_rel>`.
+        rootfs_rel: String,
+        /// The host OCI runtime spec (config.json bytes). The agent extracts
+        /// process/env/cwd/user/mounts/resources and grafts them onto its own
+        /// guest bundle template; host-specific namespaces/paths are ignored.
+        spec_json: String,
+        /// Allocate a PTY for the init process.
+        #[serde(default)]
+        tty: bool,
+    },
+
+    /// Start a pod container created by `PodCreate` (or an exec process
+    /// registered by `PodExec`), streaming its I/O on THIS connection:
+    /// `Started` → `Stdout`/`Stderr`... → `Exited`. Stdin arrives via `Stdin`
+    /// requests; PTY resize via `Resize`.
+    PodStart {
+        /// Container ID.
+        id: String,
+        /// Exec process to start instead of the init process.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exec_id: Option<String>,
+    },
+
+    /// Register an exec process for a running pod container. Started later by
+    /// `PodStart { exec_id }`.
+    PodExec {
+        /// Container ID.
+        id: String,
+        /// Exec process ID (unique within the container).
+        exec_id: String,
+        /// OCI Process JSON (containerd's ExecProcessRequest spec).
+        process_json: String,
+        /// Allocate a PTY for the exec process.
+        #[serde(default)]
+        tty: bool,
+    },
+
+    /// Signal a pod container's init process (or one exec process).
+    PodSignal {
+        /// Container ID.
+        id: String,
+        /// Exec process to signal instead of init.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exec_id: Option<String>,
+        /// Signal number (SIGKILL = 9, SIGTERM = 15, ...).
+        signal: u32,
+        /// Signal the whole container process group.
+        #[serde(default)]
+        all: bool,
+    },
+
+    /// List PIDs inside a pod container (guest view).
+    PodPids {
+        /// Container ID.
+        id: String,
+    },
+
+    /// Sample a pod container's resource usage (guest view). The agent reads the
+    /// container's process tree from /proc (there is no per-container cgroup); the
+    /// shim maps the reply into containerd's cgroups metrics for CRI stats.
+    PodStats {
+        /// Container ID.
+        id: String,
+    },
+
+    /// Remove a pod container's (or exec process's) guest resources after
+    /// exit: bundle, cgroup, PTY. Exit status was already streamed by
+    /// `PodStart`'s `Exited`.
+    PodDelete {
+        /// Container ID.
+        id: String,
+        /// Exec process to remove instead of the whole container.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exec_id: Option<String>,
+    },
+}
+
+impl AgentRequest {
+    /// A log-safe one-line summary of the request.
+    ///
+    /// This string is written to the machine's console log, which is exposed
+    /// over the logs API — so it must NEVER include credential- or data-bearing
+    /// fields: registry `auth`, `env` (which can carry host-resolved secrets),
+    /// `proxy` (may embed credentials), or `data` (file/stdin bytes). Only the
+    /// variant name plus a non-secret identifier (image) is emitted.
+    ///
+    /// The match is exhaustive with no catch-all on purpose: adding a new
+    /// variant forces a compile error here, so redaction is a deliberate
+    /// decision rather than an accidental leak in some future request type.
+    pub fn log_summary(&self) -> String {
+        match self {
+            AgentRequest::Ping => "Ping".into(),
+            AgentRequest::FsNotify { events } => format!("FsNotify {{ count: {} }}", events.len()),
+            AgentRequest::Pull { image, .. } => format!("Pull {{ image: {image} }}"),
+            AgentRequest::Query { image, .. } => format!("Query {{ image: {image} }}"),
+            AgentRequest::ListImages => "ListImages".into(),
+            AgentRequest::GarbageCollect { .. } => "GarbageCollect".into(),
+            AgentRequest::PrepareOverlay { .. } => "PrepareOverlay".into(),
+            AgentRequest::CleanupOverlay { .. } => "CleanupOverlay".into(),
+            AgentRequest::FormatStorage => "FormatStorage".into(),
+            AgentRequest::StorageStatus => "StorageStatus".into(),
+            AgentRequest::MemoryStatus => "MemoryStatus".into(),
+            AgentRequest::NetworkTest { .. } => "NetworkTest".into(),
+            AgentRequest::Shutdown { .. } => "Shutdown".into(),
+            AgentRequest::ExportLayer { .. } => "ExportLayer".into(),
+            AgentRequest::FlattenLayers { lowerdirs, .. } => {
+                format!("FlattenLayers {{ count: {} }}", lowerdirs.len())
+            }
+            AgentRequest::VmExec { .. } => "VmExec".into(),
+            AgentRequest::BranchpointWait { .. } => "BranchpointWait".into(),
+            AgentRequest::BranchpointArm => "BranchpointArm".into(),
+            AgentRequest::BranchpointPark => "BranchpointPark".into(),
+            AgentRequest::BranchpointRelease { .. } => "BranchpointRelease".into(),
+            AgentRequest::BranchpointActivate { .. } => "BranchpointActivate".into(),
+            AgentRequest::BranchpointWaitWorkerReady { .. } => "BranchpointWaitWorkerReady".into(),
+            AgentRequest::Run { image, .. } => format!("Run {{ image: {image} }}"),
+            AgentRequest::Stdin { .. } => "Stdin".into(),
+            AgentRequest::Resize { .. } => "Resize".into(),
+            AgentRequest::FileWrite { .. } => "FileWrite".into(),
+            AgentRequest::FileWriteBegin { .. } => "FileWriteBegin".into(),
+            AgentRequest::FileWriteChunk { .. } => "FileWriteChunk".into(),
+            AgentRequest::FileRead { .. } => "FileRead".into(),
+            AgentRequest::ListDirectory { .. } => "ListDirectory".into(),
+            AgentRequest::ArchiveDirectory { .. } => "ArchiveDirectory".into(),
+            // Pod requests: spec/process JSON may carry env secrets — emit ids only.
+            AgentRequest::PodCreate { id, .. } => format!("PodCreate {{ id: {id} }}"),
+            AgentRequest::PodStart { id, exec_id } => match exec_id {
+                Some(e) => format!("PodStart {{ id: {id}, exec: {e} }}"),
+                None => format!("PodStart {{ id: {id} }}"),
+            },
+            AgentRequest::PodExec { id, exec_id, .. } => {
+                format!("PodExec {{ id: {id}, exec: {exec_id} }}")
+            }
+            AgentRequest::PodSignal {
+                id, signal, all, ..
+            } => format!("PodSignal {{ id: {id}, signal: {signal}, all: {all} }}"),
+            AgentRequest::PodPids { id } => format!("PodPids {{ id: {id} }}"),
+            AgentRequest::PodStats { id } => format!("PodStats {{ id: {id} }}"),
+            AgentRequest::PodDelete { id, exec_id } => match exec_id {
+                Some(e) => format!("PodDelete {{ id: {id}, exec: {e} }}"),
+                None => format!("PodDelete {{ id: {id} }}"),
+            },
+        }
+    }
+}
+
+/// One entry of a [`AgentRequest::ListDirectory`] result.
+///
+/// Deliberately small: a name, what it is, and a size. A caller discovering a
+/// tree wants to know where to recurse and what is worth downloading, and
+/// anything richer invites the listing being used as a stat cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryEntry {
+    /// Entry name, not a path: no separators, relative to the directory listed.
+    pub name: String,
+    /// `"file"`, `"dir"`, `"symlink"`, or `"other"` for sockets, devices and
+    /// fifos, which a caller can see but should not try to download.
+    pub kind: String,
+    /// Size in bytes. Zero for anything that is not a regular file.
+    #[serde(default)]
+    pub size: u64,
+}
+
+/// Agent response types.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AgentResponse {
+    /// Operation completed successfully.
+    Ok {
+        /// Response data (varies by request type).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<serde_json::Value>,
+    },
+
+    /// Pong response to ping.
+    Pong {
+        /// Protocol version.
+        version: u32,
+        /// Optional agent features that can evolve independently of the base protocol.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
+    },
+
+    /// Progress update (for long operations like pull).
+    Progress {
+        /// Human-readable message.
+        message: String,
+        /// Completion percentage (0-100).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        percent: Option<u8>,
+        /// Current layer being processed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        layer: Option<String>,
+    },
+
+    /// Operation failed.
+    Error {
+        /// Error message.
+        message: String,
+        /// Error code (for programmatic handling).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+    },
+
+    /// Command execution completed (non-interactive mode).
+    Completed {
+        /// Exit code from the command.
+        exit_code: i32,
+        /// Standard output (may be truncated). `Vec<u8>` preserves binary
+        /// output (image bytes, tarballs, etc.) that would be truncated by
+        /// `String` at the first non-UTF-8 byte. Serialized as base64 JSON
+        /// string — the same format as the streaming `Stdout` variant.
+        #[serde(with = "base64_bytes")]
+        stdout: Vec<u8>,
+        /// Standard error (may be truncated).
+        #[serde(with = "base64_bytes")]
+        stderr: Vec<u8>,
+    },
+
+    /// Command started (interactive mode).
+    /// Indicates the command is running and ready to receive stdin.
+    Started,
+
+    /// Stdout data from a running command (interactive mode).
+    Stdout {
+        /// Output data.
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+    },
+
+    /// Stderr data from a running command (interactive mode).
+    Stderr {
+        /// Error output data.
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+    },
+
+    /// Command exited (interactive mode).
+    Exited {
+        /// Exit code from the command.
+        exit_code: i32,
+        /// The container was terminated by the cgroup OOM killer. The shim
+        /// turns this into a TaskOOM event so the CRI reports
+        /// `reason=OOMKilled`. Only ever set on a pod container's init exit.
+        #[serde(default)]
+        oom: bool,
+    },
+
+    /// PIDs inside a pod container (`PodPids` reply).
+    Pids {
+        /// Guest PIDs, container-init first when known.
+        pids: Vec<u32>,
+    },
+
+    /// Resource usage sample for a pod container (`PodStats` reply). Summed over
+    /// the container's process tree read from /proc (no per-container cgroup).
+    Stats {
+        /// Cumulative CPU time of the process tree, in nanoseconds.
+        cpu_usage_ns: u64,
+        /// Resident memory of the process tree, in bytes.
+        memory_bytes: u64,
+    },
+
+    /// Streaming binary-data chunk.
+    ///
+    /// Used by every streaming download direction: the agent sends
+    /// one or more `DataChunk` responses in sequence, with `done: true`
+    /// on the final chunk. Current producers: `ExportLayer` and
+    /// `FileRead`.
+    ///
+    /// Payload size per chunk should stay under
+    /// [`LAYER_CHUNK_SIZE`] so the encoded frame (~1.33× after
+    /// base64) fits inside [`MAX_FRAME_SIZE`] with JSON overhead to
+    /// spare.
+    DataChunk {
+        /// Chunk bytes. Empty allowed on the final frame (common for
+        /// EOF-on-clean-boundary cases).
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+        /// True on the final chunk of the stream.
+        done: bool,
+    },
+}
+
+// ============================================================================
+// Error Code Constants
+// ============================================================================
+//
+// Standard error codes for AgentResponse::Error. Using constants ensures
+// consistency across the codebase and makes error handling more reliable.
+
+/// Error codes for agent responses.
+pub mod error_codes {
+    /// Request payload was invalid or malformed.
+    pub const INVALID_REQUEST: &str = "INVALID_REQUEST";
+    /// Requested resource was not found.
+    pub const NOT_FOUND: &str = "NOT_FOUND";
+    /// Internal error during operation.
+    pub const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
+    /// Image pull operation failed.
+    pub const PULL_FAILED: &str = "PULL_FAILED";
+    /// Image query operation failed.
+    pub const QUERY_FAILED: &str = "QUERY_FAILED";
+    /// Command execution failed.
+    pub const RUN_FAILED: &str = "RUN_FAILED";
+    /// Command execution failed in container.
+    pub const EXEC_FAILED: &str = "EXEC_FAILED";
+    /// Process spawn failed.
+    pub const SPAWN_FAILED: &str = "SPAWN_FAILED";
+    /// Mount operation failed.
+    pub const MOUNT_FAILED: &str = "MOUNT_FAILED";
+    /// File I/O operation failed.
+    pub const FILE_IO_FAILED: &str = "FILE_IO_FAILED";
+    /// Overlay filesystem operation failed.
+    pub const OVERLAY_FAILED: &str = "OVERLAY_FAILED";
+    /// Cleanup operation failed.
+    pub const CLEANUP_FAILED: &str = "CLEANUP_FAILED";
+    /// Storage format operation failed.
+    pub const FORMAT_FAILED: &str = "FORMAT_FAILED";
+    /// Storage status query failed.
+    pub const STATUS_FAILED: &str = "STATUS_FAILED";
+    /// List operation failed.
+    pub const LIST_FAILED: &str = "LIST_FAILED";
+    /// Garbage collection failed.
+    pub const GC_FAILED: &str = "GC_FAILED";
+    /// Container creation failed.
+    pub const CREATE_FAILED: &str = "CREATE_FAILED";
+    /// Container start failed.
+    pub const START_FAILED: &str = "START_FAILED";
+    /// Container stop failed.
+    pub const STOP_FAILED: &str = "STOP_FAILED";
+    /// Container delete failed.
+    pub const DELETE_FAILED: &str = "DELETE_FAILED";
+    /// Export operation failed.
+    pub const EXPORT_FAILED: &str = "EXPORT_FAILED";
+    /// Serialization error.
+    pub const SERIALIZATION_ERROR: &str = "SERIALIZATION_ERROR";
+    /// Message size exceeds maximum.
+    pub const MESSAGE_TOO_LARGE: &str = "MESSAGE_TOO_LARGE";
+    /// Process wait operation failed.
+    pub const WAIT_FAILED: &str = "WAIT_FAILED";
+}
+
+impl AgentResponse {
+    /// Create an error response with the given message and code.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use smolvm_protocol::{AgentResponse, error_codes};
+    ///
+    /// let response = AgentResponse::error("image not found", error_codes::NOT_FOUND);
+    /// ```
+    pub fn error(message: impl Into<String>, code: &str) -> Self {
+        AgentResponse::Error {
+            message: message.into(),
+            code: Some(code.to_string()),
+        }
+    }
+
+    /// Create an error response from a Result's error, with the given code.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let response = some_operation()
+    ///     .map(|data| AgentResponse::ok_with_data(data))
+    ///     .unwrap_or_else(|e| AgentResponse::from_err(e, error_codes::PULL_FAILED));
+    /// ```
+    pub fn from_err<E: std::fmt::Display>(err: E, code: &str) -> Self {
+        AgentResponse::Error {
+            message: err.to_string(),
+            code: Some(code.to_string()),
+        }
+    }
+
+    /// Create an Ok response with optional JSON data.
+    pub fn ok(data: Option<serde_json::Value>) -> Self {
+        AgentResponse::Ok { data }
+    }
+
+    /// Create an Ok response with JSON-serializable data.
+    ///
+    /// Returns an error response if serialization fails.
+    pub fn ok_with_data<T: serde::Serialize>(data: T) -> Self {
+        match serde_json::to_value(data) {
+            Ok(value) => AgentResponse::Ok { data: Some(value) },
+            Err(e) => AgentResponse::error(
+                format!("failed to serialize response: {}", e),
+                error_codes::SERIALIZATION_ERROR,
+            ),
+        }
+    }
+
+    /// Convert a Result into an AgentResponse.
+    ///
+    /// On success, serializes the value to JSON. On error, creates an error response.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let response = AgentResponse::from_result(
+    ///     storage::pull_image(image),
+    ///     error_codes::PULL_FAILED,
+    /// );
+    /// ```
+    pub fn from_result<T, E>(result: Result<T, E>, error_code: &str) -> Self
+    where
+        T: serde::Serialize,
+        E: std::fmt::Display,
+    {
+        match result {
+            Ok(data) => Self::ok_with_data(data),
+            Err(e) => Self::from_err(e, error_code),
+        }
+    }
+}
+
+/// Image information returned by Query/ListImages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageInfo {
+    /// Image reference.
+    pub reference: String,
+    /// Image digest (sha256:...).
+    pub digest: String,
+    /// Image size in bytes.
+    pub size: u64,
+    /// Creation timestamp (ISO 8601).
+    pub created: Option<String>,
+    /// Platform architecture.
+    pub architecture: String,
+    /// Platform OS.
+    pub os: String,
+    /// Number of layers.
+    pub layer_count: usize,
+    /// Layer digests in order.
+    pub layers: Vec<String>,
+    /// Image entrypoint (from OCI config).
+    #[serde(default)]
+    pub entrypoint: Vec<String>,
+    /// Image default command (from OCI config).
+    #[serde(default)]
+    pub cmd: Vec<String>,
+    /// Image environment variables (from OCI config).
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// Image working directory (from OCI config).
+    #[serde(default)]
+    pub workdir: Option<String>,
+    /// Image default user (from OCI config).
+    #[serde(default)]
+    pub user: Option<String>,
+}
+
+/// Overlay preparation result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverlayInfo {
+    /// Path to the merged overlay rootfs.
+    pub rootfs_path: String,
+    /// Path to the upper (writable) directory.
+    pub upper_path: String,
+    /// Path to the work directory.
+    pub work_path: String,
+}
+
+/// The guest's own account of machine memory, from `/proc/meminfo`.
+///
+/// This is what a machine is actually using. The host-side `phys_footprint`
+/// answers a different question — it counts compressed pages at their
+/// uncompressed size and keeps counting memory the guest has stopped needing —
+/// so it runs well above these figures and should not be read as consumption.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryStatus {
+    /// Total usable RAM the guest sees, in bytes. Slightly below the machine's
+    /// configured size: the kernel reserves some before the allocator sees it.
+    pub total_bytes: u64,
+    /// Memory available for new allocations without swapping, in bytes. The
+    /// figure to report, since `free_bytes` excludes reclaimable page cache.
+    pub available_bytes: u64,
+    /// Free memory in bytes: never allocated, or released and not reused.
+    pub free_bytes: u64,
+    /// Page cache in bytes. Counted inside `available_bytes`.
+    pub cached_bytes: u64,
+    /// Swap configured in the guest, in bytes. Zero when the guest has none.
+    pub swap_total_bytes: u64,
+    /// Swap in use, in bytes.
+    pub swap_used_bytes: u64,
+}
+
+impl MemoryStatus {
+    /// Memory the guest cannot hand back on demand.
+    pub fn used_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.available_bytes)
+    }
+}
+
+/// Storage status information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageStatus {
+    /// Whether the storage is formatted and ready.
+    pub ready: bool,
+    /// Total size in bytes.
+    pub total_bytes: u64,
+    /// Used size in bytes.
+    pub used_bytes: u64,
+    /// Number of cached layers.
+    pub layer_count: usize,
+    /// Number of cached images.
+    pub image_count: usize,
+}
+
+/// Registry authentication credentials for pulling images.
+///
+/// `Debug` is hand-written to redact the password: this value is carried inside
+/// `AgentRequest::Pull`, and any `{:?}` of that request (e.g. a tracing span)
+/// would otherwise serialize the token verbatim into the machine's console log,
+/// which is exposed over the logs API.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RegistryAuth {
+    /// Username for authentication.
+    pub username: String,
+    /// Password or token for authentication.
+    pub password: String,
+}
+
+impl std::fmt::Debug for RegistryAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryAuth")
+            .field("username", &self.username)
+            .field("password", &"***")
+            .finish()
+    }
+}
+
+// ============================================================================
+// Workload VM Protocol (Command Execution)
+// ============================================================================
+
+/// Messages from host to workload VM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HostMessage {
+    /// Authentication request.
+    Auth {
+        /// Authentication token (base64).
+        token: String,
+        /// Protocol version.
+        protocol_version: u32,
+    },
+
+    /// Run a command.
+    Run {
+        /// Request ID for correlating responses.
+        request_id: u64,
+        /// Command and arguments.
+        command: Vec<String>,
+        /// Environment variables.
+        env: Vec<(String, String)>,
+        /// Working directory.
+        workdir: Option<String>,
+    },
+
+    /// Execute a command in running VM.
+    Exec {
+        /// Request ID.
+        request_id: u64,
+        /// Command and arguments.
+        command: Vec<String>,
+        /// Allocate a TTY.
+        tty: bool,
+    },
+
+    /// Send a signal to a running command.
+    Signal {
+        /// Request ID of the command.
+        request_id: u64,
+        /// Signal number.
+        signal: i32,
+    },
+
+    /// Request graceful shutdown.
+    Stop {
+        /// Timeout in milliseconds.
+        timeout_ms: u64,
+    },
+}
+
+/// Messages from workload VM to host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GuestMessage {
+    /// Authentication successful.
+    AuthOk,
+
+    /// Authentication failed.
+    AuthFailed,
+
+    /// VM is ready to receive commands.
+    Ready,
+
+    /// Command started.
+    Started {
+        /// Request ID.
+        request_id: u64,
+    },
+
+    /// Stdout data from command.
+    Stdout {
+        /// Request ID.
+        request_id: u64,
+        /// Output data.
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+        /// Whether output was truncated.
+        truncated: bool,
+    },
+
+    /// Stderr data from command.
+    Stderr {
+        /// Request ID.
+        request_id: u64,
+        /// Output data.
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+        /// Whether output was truncated.
+        truncated: bool,
+    },
+
+    /// Command exited.
+    Exit {
+        /// Request ID.
+        request_id: u64,
+        /// Exit code.
+        code: i32,
+        /// Exit reason.
+        reason: String,
+    },
+
+    /// Error occurred.
+    Error {
+        /// Request ID (if applicable).
+        request_id: Option<u64>,
+        /// Error message.
+        message: String,
+    },
+}
+
+// ============================================================================
+// Wire Format Helpers
+// ============================================================================
+
+/// Envelope that wraps any message with an optional trace ID for correlation.
+///
+/// On the wire, the trace_id is flattened into the JSON alongside the message
+/// fields: `{"trace_id":"abc123","method":"ping"}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Envelope<T> {
+    /// Trace ID for correlating host API requests to agent operations.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub trace_id: Option<String>,
+    /// The wrapped message.
+    #[serde(flatten)]
+    pub body: T,
+}
+
+impl<T> Envelope<T> {
+    /// Create an envelope with no trace ID.
+    pub fn new(body: T) -> Self {
+        Self {
+            trace_id: None,
+            body,
+        }
+    }
+
+    /// Create an envelope with an optional trace ID.
+    pub fn with_trace_id(body: T, trace_id: Option<String>) -> Self {
+        Self { trace_id, body }
+    }
+}
+
+/// Encode a message to wire format (length-prefixed JSON).
+pub fn encode_message<T: Serialize>(msg: &T) -> Result<Vec<u8>, serde_json::Error> {
+    let json = serde_json::to_vec(msg)?;
+    let len = json.len() as u32;
+
+    let mut buf = Vec::with_capacity(4 + json.len());
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(&json);
+
+    Ok(buf)
+}
+
+/// Decode a message from wire format.
+pub fn decode_message<T: for<'de> Deserialize<'de>>(data: &[u8]) -> Result<T, DecodeError> {
+    if data.len() < 4 {
+        return Err(DecodeError::TooShort);
+    }
+
+    let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+
+    if len > MAX_FRAME_SIZE as usize {
+        return Err(DecodeError::TooLarge(len));
+    }
+
+    if data.len() < 4 + len {
+        return Err(DecodeError::Incomplete {
+            expected: len,
+            got: data.len() - 4,
+        });
+    }
+
+    serde_json::from_slice(&data[4..4 + len]).map_err(DecodeError::Json)
+}
+
+/// Error decoding a wire message.
+#[derive(Debug)]
+pub enum DecodeError {
+    /// Data too short to contain length header.
+    TooShort,
+    /// Frame size exceeds maximum.
+    TooLarge(usize),
+    /// Incomplete frame.
+    Incomplete {
+        /// Expected length.
+        expected: usize,
+        /// Actual length.
+        got: usize,
+    },
+    /// JSON parse error.
+    Json(serde_json::Error),
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeError::TooShort => write!(f, "data too short for length header"),
+            DecodeError::TooLarge(size) => write!(f, "frame too large: {} bytes", size),
+            DecodeError::Incomplete { expected, got } => {
+                write!(
+                    f,
+                    "incomplete frame: expected {} bytes, got {}",
+                    expected, got
+                )
+            }
+            DecodeError::Json(e) => write!(f, "JSON decode error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_write_without_owner_fields_still_parses() {
+        // Requests from clients predating uid/gid must keep deserializing.
+        let old = r#"{"method":"file_write","path":"/x","data":"aGk=","mode":420}"#;
+        let req: AgentRequest = serde_json::from_str(old).unwrap();
+        match req {
+            AgentRequest::FileWrite { mode, uid, gid, .. } => {
+                assert_eq!(mode, Some(420));
+                assert_eq!(uid, None);
+                assert_eq!(gid, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flatten_layers_output_is_optional() {
+        // A client predating streaming always names a guest path to stage the
+        // archive at, and must keep deserializing.
+        let staged =
+            r#"{"method":"flatten_layers","lowerdirs":["/a","/b"],"output":"/storage/x.tar"}"#;
+        let req: AgentRequest = serde_json::from_str(staged).unwrap();
+        match req {
+            AgentRequest::FlattenLayers { lowerdirs, output } => {
+                assert_eq!(lowerdirs, vec!["/a".to_string(), "/b".to_string()]);
+                assert_eq!(output, Some("/storage/x.tar".to_string()));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Omitting it asks the agent to stream the archive back instead, which is
+        // what keeps a large export from needing room for a second full copy.
+        let streamed = r#"{"method":"flatten_layers","lowerdirs":["/a","/b"]}"#;
+        let req: AgentRequest = serde_json::from_str(streamed).unwrap();
+        match req {
+            AgentRequest::FlattenLayers { output, .. } => assert_eq!(output, None),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip() {
+        let req = AgentRequest::Pull {
+            image: "alpine:latest".to_string(),
+            oci_platform: Some("linux/arm64".to_string()),
+            auth: None,
+            proxy: None,
+            no_proxy: None,
+        };
+
+        let encoded = encode_message(&req).unwrap();
+        let decoded: AgentRequest = decode_message(&encoded).unwrap();
+
+        let AgentRequest::Pull {
+            image,
+            oci_platform,
+            auth,
+            proxy,
+            no_proxy,
+        } = decoded
+        else {
+            panic!("expected Pull variant, got {:?}", decoded);
+        };
+        assert_eq!(image, "alpine:latest");
+        assert_eq!(oci_platform, Some("linux/arm64".to_string()));
+        assert!(auth.is_none());
+        assert!(proxy.is_none());
+        assert!(no_proxy.is_none());
+    }
+
+    #[test]
+    fn test_encode_decode_with_auth() {
+        let req = AgentRequest::Pull {
+            image: "ghcr.io/owner/repo:latest".to_string(),
+            oci_platform: None,
+            auth: Some(RegistryAuth {
+                username: "testuser".to_string(),
+                password: "testpass".to_string(),
+            }),
+            proxy: None,
+            no_proxy: None,
+        };
+
+        let encoded = encode_message(&req).unwrap();
+        let decoded: AgentRequest = decode_message(&encoded).unwrap();
+
+        let AgentRequest::Pull {
+            image,
+            oci_platform,
+            auth,
+            proxy: _,
+            no_proxy: _,
+        } = decoded
+        else {
+            panic!("expected Pull variant, got {:?}", decoded);
+        };
+        assert_eq!(image, "ghcr.io/owner/repo:latest");
+        assert!(oci_platform.is_none());
+        let auth = auth.expect("auth should be Some");
+        assert_eq!(auth.username, "testuser");
+        assert_eq!(auth.password, "testpass");
+    }
+
+    #[test]
+    fn test_encode_decode_with_proxy() {
+        let req = AgentRequest::Pull {
+            image: "alpine:latest".to_string(),
+            oci_platform: None,
+            auth: None,
+            proxy: Some("http://192.168.127.254:3128".to_string()),
+            no_proxy: Some("127.0.0.1,localhost,.internal".to_string()),
+        };
+
+        let encoded = encode_message(&req).unwrap();
+        let decoded: AgentRequest = decode_message(&encoded).unwrap();
+
+        let AgentRequest::Pull {
+            proxy, no_proxy, ..
+        } = decoded
+        else {
+            panic!("expected Pull variant, got {:?}", decoded);
+        };
+        assert_eq!(proxy.as_deref(), Some("http://192.168.127.254:3128"));
+        assert_eq!(no_proxy.as_deref(), Some("127.0.0.1,localhost,.internal"));
+    }
+
+    #[test]
+    fn test_decode_too_short() {
+        let data = [0u8; 2];
+        let result: Result<AgentRequest, _> = decode_message(&data);
+        assert!(matches!(result, Err(DecodeError::TooShort)));
+    }
+
+    #[test]
+    fn test_decode_incomplete() {
+        let mut data = vec![0, 0, 0, 100]; // claims 100 bytes
+        data.extend_from_slice(b"{}"); // only 2 bytes of payload
+        let result: Result<AgentRequest, _> = decode_message(&data);
+        assert!(matches!(result, Err(DecodeError::Incomplete { .. })));
+    }
+
+    #[test]
+    fn test_agent_request_serialization() {
+        let req = AgentRequest::Ping;
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("ping"));
+
+        let req = AgentRequest::PrepareOverlay {
+            image: "ubuntu:22.04".to_string(),
+            workload_id: "wl-123".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("prepare_overlay"));
+    }
+
+    #[test]
+    fn test_agent_response_serialization() {
+        let resp = AgentResponse::Pong {
+            version: PROTOCOL_VERSION,
+            capabilities: vec![forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string()],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("pong"));
+        assert!(json.contains(forkpoint::TYPED_BRANCHPOINT_CAPABILITY));
+
+        let legacy: AgentResponse =
+            serde_json::from_str(r#"{"status":"pong","version":1}"#).unwrap();
+        assert!(matches!(
+            legacy,
+            AgentResponse::Pong {
+                version: PROTOCOL_VERSION,
+                capabilities
+            } if capabilities.is_empty()
+        ));
+
+        let resp = AgentResponse::Progress {
+            message: "Pulling layer 1/3".to_string(),
+            percent: Some(33),
+            layer: Some("sha256:abc123".to_string()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("progress"));
+    }
+
+    #[test]
+    fn file_write_begin_roundtrips() {
+        let req = AgentRequest::FileWriteBegin {
+            path: "/tmp/target".into(),
+            mode: Some(0o600),
+            uid: Some(1000),
+            gid: Some(1000),
+            total_size: 123_456_789,
+        };
+        let bytes = encode_message(&req).unwrap();
+        let back: AgentRequest = decode_message(&bytes).unwrap();
+        match back {
+            AgentRequest::FileWriteBegin {
+                path,
+                mode,
+                uid,
+                gid,
+                total_size,
+            } => {
+                assert_eq!(path, "/tmp/target");
+                assert_eq!(mode, Some(0o600));
+                assert_eq!(uid, Some(1000));
+                assert_eq!(gid, Some(1000));
+                assert_eq!(total_size, 123_456_789);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn file_write_chunk_roundtrips_binary_data() {
+        // Binary data (bytes outside UTF-8) must survive the base64
+        // trip intact. If the encoding ever silently lossifies, this
+        // fires.
+        let payload: Vec<u8> = (0u8..=255).collect();
+        let req = AgentRequest::FileWriteChunk {
+            data: payload.clone(),
+            done: true,
+        };
+        let bytes = encode_message(&req).unwrap();
+        let back: AgentRequest = decode_message(&bytes).unwrap();
+        match back {
+            AgentRequest::FileWriteChunk { data, done } => {
+                assert_eq!(data, payload);
+                assert!(done);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn file_write_size_constants_are_frame_safe() {
+        // Sanity: a single streaming chunk at FILE_WRITE_CHUNK_SIZE
+        // must fit inside MAX_FRAME_SIZE after base64 (+ ~33%) and
+        // JSON overhead. If anyone bumps CHUNK_SIZE past the limit,
+        // this test fires before production does.
+        let chunk_bytes = FILE_WRITE_CHUNK_SIZE as u64;
+        let base64_bytes = chunk_bytes.div_ceil(3) * 4; // ceil(n/3)*4
+        let json_overhead = 256u64; // method tag, done bool, quotes
+        let total = base64_bytes + json_overhead;
+        assert!(
+            total < MAX_FRAME_SIZE as u64,
+            "FILE_WRITE_CHUNK_SIZE of {} bytes would produce a frame \
+             of ~{} bytes which exceeds MAX_FRAME_SIZE of {}",
+            chunk_bytes,
+            total,
+            MAX_FRAME_SIZE
+        );
+    }
+
+    #[test]
+    fn test_ports_constants() {
+        assert_eq!(ports::WORKLOAD_CONTROL, 5000);
+        assert_eq!(ports::WORKLOAD_LOGS, 5001);
+        assert_eq!(ports::AGENT_CONTROL, 6000);
+        assert_eq!(ports::SSH_AGENT, 6001);
+    }
+
+    #[test]
+    fn test_cid_constants() {
+        assert_eq!(cid::HOST, 2);
+        assert_eq!(cid::GUEST, 3);
+    }
+
+    #[test]
+    fn test_envelope_serialization_with_trace_id() {
+        let req = AgentRequest::Ping;
+        let envelope = Envelope::with_trace_id(&req, Some("abc123".to_string()));
+        let json = serde_json::to_string(&envelope).unwrap();
+
+        // trace_id should be flattened alongside the method tag
+        assert!(json.contains("\"trace_id\":\"abc123\""));
+        assert!(json.contains("\"method\":\"ping\""));
+
+        // Deserialize back — Envelope<AgentRequest> with flatten
+        let parsed: Envelope<AgentRequest> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.trace_id.as_deref(), Some("abc123"));
+        assert!(matches!(parsed.body, AgentRequest::Ping));
+    }
+
+    #[test]
+    fn test_envelope_without_trace_id() {
+        let req = AgentRequest::Ping;
+        let envelope = Envelope::new(&req);
+        let json = serde_json::to_string(&envelope).unwrap();
+
+        // No trace_id field (skip_serializing_if = None)
+        assert!(!json.contains("trace_id"));
+        assert!(json.contains("\"method\":\"ping\""));
+    }
+
+    #[test]
+    fn test_envelope_backward_compat_bare_request() {
+        // A bare AgentRequest (no Envelope) should fail to parse as Envelope
+        // but succeed as bare AgentRequest — this is the agent's fallback path
+        let bare_json = r#"{"method":"ping"}"#;
+
+        // Envelope parse should fail (no body field to flatten into)
+        // Actually with flatten, this may work — let's verify
+        let envelope_result = serde_json::from_str::<Envelope<AgentRequest>>(bare_json);
+        let bare_result = serde_json::from_str::<AgentRequest>(bare_json);
+
+        // At least one must succeed for backward compat
+        assert!(
+            envelope_result.is_ok() || bare_result.is_ok(),
+            "Neither Envelope nor bare parse succeeded"
+        );
+
+        // Bare parse must always work
+        assert!(bare_result.is_ok());
+        assert!(matches!(bare_result.unwrap(), AgentRequest::Ping));
+
+        // If Envelope works, trace_id should be None
+        if let Ok(env) = envelope_result {
+            assert!(env.trace_id.is_none());
+        }
+    }
+}

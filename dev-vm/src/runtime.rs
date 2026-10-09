@@ -6,6 +6,7 @@ use crate::runner::{
     check_vm_status, check_vm_status_with_cancel, log_command_failure, log_command_spawn_failure,
     run_vm_delete, run_vm_start, run_vm_stop,
 };
+use crate::urls::validate_domain;
 use std::path::Path;
 use std::process::Stdio;
 use tokio_util::sync::CancellationToken;
@@ -23,6 +24,8 @@ if [ -s "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then exit 0; 
 log_dir=/devvm-root/.project-logs/{project_id}
 install -d -m 0700 "$log_dir"
 rm -f "$pid_file" "$token_file" "$log_dir/dsh.token"
+export DEVVM_EMBED_PROJECT_ID={project_id}
+export DEVVM_CONTROL_ORIGINS='{control_origins}'
 setsid bash -c '
   echo $$ > /tmp/devvm-daemon-dsh.pid
   cd /root/workspace && devvm-sync-startup
@@ -36,6 +39,7 @@ setsid bash -c '
         printf '%s\n' "$token" > "$log_dir/dsh.token.tmp" && mv -f "$log_dir/dsh.token.tmp" "$log_dir/dsh.token"
         printf '%s\n' "$token" > "$token_file.tmp" && mv -f "$token_file.tmp" "$token_file"
       fi
+      line="${line%%token=*}token=[redacted]"
       ;;
   esac
   printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" "$line"
@@ -73,7 +77,8 @@ fi
 rm -f "$pid_file" "$token_file" "$log_dir/dsh.token"
 "#;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LifecycleAction {
     StartVm,
     StopVm,
@@ -93,6 +98,10 @@ impl LifecycleAction {
             Self::StopDsh => "DSH stopped",
             Self::RestartDsh => "DSH restarted",
         }
+    }
+
+    fn is_stopping(self) -> bool {
+        matches!(self, Self::StopVm | Self::DeleteVm | Self::StopDsh)
     }
 
     fn label(self) -> &'static str {
@@ -166,6 +175,10 @@ impl DshRuntimeManager {
         std::fs::remove_file(crate::logs::dsh_token_path(&config.log_dir, project_id))
     }
 
+    pub fn operations(&self, project_id: Uuid) -> crate::lifecycle::OperationSnapshot {
+        self.operations.snapshot(project_id)
+    }
+
     pub async fn execute(
         &self,
         config: &DaemonConfig,
@@ -176,55 +189,73 @@ impl DshRuntimeManager {
         let manager = self.clone();
         let owned_config = config.clone();
         let path = project_path.to_owned();
-        let stopping = matches!(
-            action,
-            LifecycleAction::StopVm | LifecycleAction::DeleteVm | LifecycleAction::StopDsh
-        );
         self.operations
             .run(
                 config,
                 project_id,
-                stopping,
+                action.is_stopping(),
                 action.label(),
-                move |cancel| async move {
-                    let config = &owned_config;
-                    match action {
-                        LifecycleAction::StartVm => {
-                            run_vm_start(config, project_id, &path, &cancel).await
-                        }
-                        LifecycleAction::LaunchDsh => {
-                            manager.run_launch(config, project_id, &path, &cancel).await
-                        }
-                        LifecycleAction::StopDsh => {
-                            manager.run_stop(config, project_id, &path, &cancel).await
-                        }
-                        LifecycleAction::RestartDsh => {
-                            manager.run_stop(config, project_id, &path, &cancel).await?;
-                            manager.run_launch(config, project_id, &path, &cancel).await
-                        }
-                        LifecycleAction::StopVm | LifecycleAction::DeleteVm => {
-                            // A guest stop error must not prevent stopping the entire VM, but
-                            // request cancellation must not proceed into another command.
-                            if let Err(error) =
-                                manager.run_stop(config, project_id, &path, &cancel).await
-                            {
-                                append_log_logged(
-                                    &config.log_dir,
-                                    project_id,
-                                    "daemon:error",
-                                    &error,
-                                );
-                            }
-                            if matches!(action, LifecycleAction::StopVm) {
-                                run_vm_stop(config, project_id, &path, &cancel).await
-                            } else {
-                                run_vm_delete(config, project_id, &path, &cancel).await
-                            }
-                        }
-                    }
+                move |cancel| {
+                    manager.execute_action(owned_config, project_id, path, action, cancel)
                 },
             )
             .await
+    }
+
+    pub fn submit(
+        &self,
+        config: &DaemonConfig,
+        project_id: Uuid,
+        project_path: &Path,
+        action: LifecycleAction,
+        request_id: Uuid,
+    ) -> Result<crate::lifecycle::OperationView, LifecycleError> {
+        let manager = self.clone();
+        let owned_config = config.clone();
+        let path = project_path.to_owned();
+        self.operations.submit(
+            config,
+            project_id,
+            action.is_stopping(),
+            action.label(),
+            request_id,
+            move |cancel| manager.execute_action(owned_config, project_id, path, action, cancel),
+        )
+    }
+
+    async fn execute_action(
+        self,
+        owned_config: DaemonConfig,
+        project_id: Uuid,
+        path: std::path::PathBuf,
+        action: LifecycleAction,
+        cancel: CancellationToken,
+    ) -> Result<(), String> {
+        let manager = self;
+        let config = &owned_config;
+        match action {
+            LifecycleAction::StartVm => run_vm_start(config, project_id, &path, &cancel).await,
+            LifecycleAction::LaunchDsh => {
+                manager.run_launch(config, project_id, &path, &cancel).await
+            }
+            LifecycleAction::StopDsh => manager.run_stop(config, project_id, &path, &cancel).await,
+            LifecycleAction::RestartDsh => {
+                manager.run_stop(config, project_id, &path, &cancel).await?;
+                manager.run_launch(config, project_id, &path, &cancel).await
+            }
+            LifecycleAction::StopVm | LifecycleAction::DeleteVm => {
+                // A guest stop error must not prevent stopping the entire VM, but
+                // request cancellation must not proceed into another command.
+                if let Err(error) = manager.run_stop(config, project_id, &path, &cancel).await {
+                    append_log_logged(&config.log_dir, project_id, "daemon:error", &error);
+                }
+                if matches!(action, LifecycleAction::StopVm) {
+                    run_vm_stop(config, project_id, &path, &cancel).await
+                } else {
+                    run_vm_delete(config, project_id, &path, &cancel).await
+                }
+            }
+        }
     }
 
     async fn run_launch(
@@ -260,7 +291,7 @@ impl DshRuntimeManager {
         run_guest_command(
             config,
             project_path,
-            &DSH_START_COMMAND.replace("{project_id}", &project_id.to_string()),
+            &launch_command(config, project_id)?,
             "Starting DSH inside DevVM",
             cancel,
         )
@@ -299,6 +330,18 @@ impl DshRuntimeManager {
         }
         result
     }
+}
+
+fn launch_command(config: &DaemonConfig, project_id: Uuid) -> Result<String, String> {
+    let mut origins = vec![format!("http://control.devvm.localhost:{}", config.port)];
+    if let Some(domain) = &config.remote_domain {
+        validate_domain(domain).map_err(str::to_owned)?;
+        origins.push(format!("https://devvm.{domain}"));
+    }
+    let origins = serde_json::to_string(&origins).map_err(|error| error.to_string())?;
+    Ok(DSH_START_COMMAND
+        .replace("{project_id}", &project_id.to_string())
+        .replace("{control_origins}", &origins))
 }
 
 /// The guest distinguishes a live runtime still starting from one that emitted its ready URL.

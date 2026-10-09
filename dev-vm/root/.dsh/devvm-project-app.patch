@@ -1,0 +1,716 @@
+--- a/node_modules/@deepseek-ai/dsh-api-session-controller/lib/client.js
++++ b/node_modules/@deepseek-ai/dsh-api-session-controller/lib/client.js
+@@ -928,6 +928,8 @@
+ 		*/
+ 		var ProjectionValueStore = class {
+ 			rows = /* @__PURE__ */ new Map();
++			displayedRows = new Map();
++			displayedValuesCache;
+ 			channels = /* @__PURE__ */ new Map();
+ 			valuesCache;
+ 			/** Coarse any-key channel (no snapshot cache to rebuild: reads hit rows directly). */
+@@ -956,6 +958,18 @@
+ 			* @param key - projection key.
+ 			* @returns the current sequence, or undefined for absent and cached values.
+ 			*/
++			displayedGet(key) {
++                return (this.rows.get(key) ?? this.displayedRows.get(key))?.value;
++            }
++            displayedValues() {
++                if (this.displayedValuesCache === void 0) this.displayedValuesCache = Object.freeze(Object.fromEntries([...new Map([...this.displayedRows, ...this.rows])].map(([key, row]) => [key, row.value])));
++                return this.displayedValuesCache;
++            }
++            resetGeneration() {
++                this.displayedRows = new Map([...this.displayedRows, ...this.rows]);
++                this.rows.clear();
++                this.valuesCache = void 0;
++            }
+ 			seqOf(key) {
+ 				const row = this.rows.get(key);
+ 				return row?.kind === "sequenced" ? row.seq : void 0;
+@@ -1027,6 +1041,10 @@
+ 					this.rows.delete(key);
+ 					this.changed(key);
+ 				}
++                for (const key of this.displayedRows.keys()) {
++                    this.displayedRows.delete(key);
++                    this.changed(key);
++                }
+ 				const values = baseline.values;
+ 				for (const key of Object.keys(values)) this.apply(key, values[key], baseline.asOfSeq);
+ 				for (const [key, row] of this.rows) {
+@@ -1037,13 +1055,14 @@
+ 				}
+ 			}
+ 			/** Discard one Host generation's values and watermarks while preserving subscribed faces. */
+-			clear() {
+-				for (const key of this.rows.keys()) {
+-					this.rows.delete(key);
+-					this.changed(key);
+-				}
+-			}
++            clear() {
++                const keys = new Set([...this.rows.keys(), ...this.displayedRows.keys()]);
++                this.rows.clear();
++                this.displayedRows.clear();
++                for (const key of keys) this.changed(key);
++            }
+ 			changed(key) {
++                this.displayedValuesCache = void 0;
+ 				this.valuesCache = void 0;
+ 				this.channels.get(key)?.notifier.markDirty();
+ 				this.anyNotifier.markDirty();
+@@ -1055,7 +1074,7 @@
+ 					channel = {
+ 						notifier,
+ 						face: {
+-							getSnapshot: () => this.rows.get(key)?.value,
++							getSnapshot: () => this.displayedGet(key),
+ 							subscribe: (listener) => notifier.subscribe(listener)
+ 						}
+ 					};
+@@ -1682,7 +1701,11 @@
+ 			* @returns the minted identity for {@link prompt} plus the pre-prompt abandon path.
+ 			*/
+ 			beginSubmission(input) {
+-				const requestId = randomUUID();
++				const requestId = input.requestId ?? randomUUID();
++                if (this.pendingSubmissions.some(submission => submission.requestId === requestId)) return {
++                    requestId,
++                    abandon: () => { this.retireFailedSubmission(requestId); }
++                };
+ 				const placement = this.running ? input.mode === "steer" ? "steering" : "queued" : "transcript";
+ 				this.pendingSubmissions = [...this.pendingSubmissions, {
+ 					requestId,
+@@ -2921,11 +2944,11 @@
+ 			* Opened Session follow streams resume independently through API Gateway.
+ 			*/
+ 			handleConnected() {
+-				for (const store of this.projectionStores.values()) store.clear();
++				for (const store of this.projectionStores.values()) store.resetGeneration();
+ 				this.listMutations = null;
+ 				this.listInflight = null;
+ 				this.refreshList();
+-				const parents = new Set(this.projectionLoads.keys());
++				const parents = new Set([...this.projectionLoads.keys(), ...this.projectionStores.keys()]);
+ 				for (const id of this.sessions.keys()) {
+ 					const address = this.addresses.get(id);
+ 					if (address !== void 0) parents.add(address.parentSessionId);
+@@ -2938,8 +2961,8 @@
+ 			buildListSnapshot() {
+ 				const items = flattenLineage(this.summaries.map((summary) => {
+ 					const projectionStore = this.projectionStores.get(summary.sessionId);
+-					const title = projectionStore?.get("title");
+-					const projectionValues = projectionStore?.values();
++					const title = projectionStore?.displayedGet("title");
++					const projectionValues = projectionStore?.displayedValues();
+ 					const metadata = projectionValues?.sessionListMetadata;
+ 					return {
+ 						...summary,
+@@ -2963,7 +2986,7 @@
+ 					phase: this.listPhase,
+ 					error: this.listError,
+ 					projectionsBySession: Object.fromEntries([...this.projectionStores].map(([sessionId, store]) => [sessionId, {
+-						values: store.values(),
++						values: store.displayedValues(),
+ 						state: "idle",
+ 						error: null,
+ 						...this.projectionLoads.get(sessionId)
+--- a/node_modules/@deepseek-ai/dsh-api-session-controller/lib/index.js
++++ b/node_modules/@deepseek-ai/dsh-api-session-controller/lib/index.js
+@@ -665,6 +665,7 @@
+ }
+ /** Implements Session business commands delegated by the Session Controller Remote service. */
+ var SessionCommandController = class {
++    promptAdmissions = new Map();
+ 	ctx;
+ 	agents;
+ 	defaultCwd;
+@@ -847,7 +848,16 @@
+ 	* @param request - Session identity, prompt content, source metadata, and delivery mode.
+ 	* @returns acknowledgement that the Agent accepted the prompt.
+ 	*/
+-	async prompt(request) {
++    async prompt(request) {
++        const key = `${request.sessionId}:${request.requestId}`;
++        const existing = this.promptAdmissions.get(key);
++        if (existing) return existing;
++        const admission = this.admitPrompt(request);
++        this.promptAdmissions.set(key, admission);
++        try { return await admission; }
++        finally { this.promptAdmissions.delete(key); }
++    }
++    async admitPrompt(request) {
+ 		if (!hasPromptContent(request.content)) throw new RemoteError("gateway/bad-request", "prompt content must include non-whitespace text or an attachment", {});
+ 		const clientTimeZone = request.clientTimeZone === void 0 ? void 0 : canonicalClientTimeZone(request.clientTimeZone);
+ 		if (request.clientTimeZone !== void 0 && clientTimeZone === void 0) throw new RemoteError("session/invalid-time-zone", "clientTimeZone must be UTC or a valid IANA Area/Location name", { value: request.clientTimeZone });
+@@ -1067,6 +1077,7 @@
+ 	};
+ 	if (agent.inbox.nextTurn.some(matches) || agent.inbox.nextStep.some(matches)) return true;
+ 	return agent.session.snapshotEvents().some((event) => {
++        if (event.type === "agent/inbox/spliced") return event.data.inserted?.some(matches) === true;
+ 		if (event.type !== "user/message") return false;
+ 		const source = event.data.source;
+ 		return source.kind === "user" && "rpcId" in source && source.rpcId === requestId;
+--- a/node_modules/@deepseek-ai/dsh-api-session-controller/lib/types/client/contract/session.d.ts
++++ b/node_modules/@deepseek-ai/dsh-api-session-controller/lib/types/client/contract/session.d.ts
+@@ -28,6 +28,8 @@
+ };
+ /** Input registering one local submission echo ahead of its prompt call. */
+ export interface BeginSubmissionInput {
++    /** Stable identity for replaying durably saved text. */
++    readonly requestId?: SessionRequestId;
+     /** Delivery mode used with the upcoming prompt. */
+     readonly mode: 'queue' | 'steer';
+     /** Prompt text exactly as the upcoming prompt will send it. */
+--- a/node_modules/@deepseek-ai/dsh-client-ui-conversation/lib/client.js
++++ b/node_modules/@deepseek-ai/dsh-client-ui-conversation/lib/client.js
+@@ -3168,14 +3168,15 @@
+ 		* Declare per-session draft persistence and View selection.
+ 		* @returns the store handle.
+ 		*/
+-		function createConversationStore() {
++		function createConversationStore(embeddedTextPersistence = false) {
+ 			return (0, _deepseek_ai_dsh_client_store.defineStore)({
+ 				init: () => ({
+ 					draft: "",
++                    embeddedTextPersistence,
+ 					view: null,
+ 					viewRequest: null
+ 				}),
+-				persist: CONVERSATION_STORE_KEY,
++				persist: embeddedTextPersistence ? void 0 : CONVERSATION_STORE_KEY,
+ 				actions: {
+ 					setDraft: (d, text) => {
+ 						d.draft = text;
+@@ -3380,6 +3381,12 @@
+ 			* exists for caller choreography (the composer restores the draft on it).
+ 			* @param text - prompt text, sent verbatim as one text block.
+ 			*/
++            setTextPersistence(provider) {
++                return this.input.setTextPersistence(provider);
++            }
++            sendPendingText(session, text, mode, requestId) {
++                return this.sendSession(session, text, [], mode, void 0, requestId);
++            }
+ 			async send(text) {
+ 				const result = await this.scopedSession("send").prompt([{
+ 					type: "text",
+@@ -3401,7 +3408,7 @@
+ 			* @param signal - optional cancellation for the complete Host admission.
+ 			* @returns the Host admission outcome; local attachment preparation failures reject.
+ 			*/
+-			async sendSession(session, text, attachmentIds, mode, signal) {
++			async sendSession(session, text, attachmentIds, mode, signal, requestId) {
+ 				const attachments = this.resolveDraftAttachments(attachmentIds);
+ 				if (attachments.length !== attachmentIds.length) throw new Error("conversation.sendSession: one or more draft attachments are no longer available");
+ 				const uploads = this.fileUploads.getSnapshot();
+@@ -3441,6 +3448,7 @@
+ 					finishRetirement = resolve;
+ 				});
+ 				const submission = session.beginSubmission({
++                    requestId,
+ 					mode,
+ 					text,
+ 					attachments: pendingAttachments,
+@@ -3460,7 +3468,8 @@
+ 					submission.abandon();
+ 					throw error;
+ 				}
+-				if (!(await session.prompt(content, mode, signal, submission.requestId)).ok) return { kind: "error" };
++				const result = await session.prompt(content, mode, signal, submission.requestId);
++                if (!result.ok) return { kind: "error", error: result.error };
+ 				if (retirement !== void 0 && (await retirement).reason !== "observed") return { kind: "error" };
+ 				return { kind: "success" };
+ 			}
+@@ -3893,8 +3902,9 @@
+ 					draft: attempt.draftSnapshot,
+ 					mode: attempt.mode
+ 				}, {
+-					type: "commit-draft",
+-					retainSuffixOf: attempt.draftSnapshot
++                    type: "commit-draft",
++                    defaultSink: true,
++                    retainSuffixOf: attempt.draftSnapshot
+ 				}];
+ 			}
+ 			onEnter(mode, draft, submission) {
+@@ -13624,7 +13634,7 @@
+ 			* dismisses and the menu tracks frozen.
+ 			*/
+ 			submit(mode = "queue", source) {
+-				if (this.disposed) return;
++                if (this.disposed || this.admittingText || this.loadingText) return;
+ 				const timestamp = Date.now();
+ 				let state;
+ 				if (this.snapshot.phase === "plain" && (this.snapshot.draft.trim() !== "" || this.attachmentIds.length > 0)) try {
+@@ -13920,11 +13930,17 @@
+ 					case "begin-submit":
+ 						this.beginSubmit(fx.attempt, fx.claim, fx.args);
+ 						return;
+-					case "default-sink":
+-						this.sinkSerialized(fx.attempt, fx.draft, fx.mode);
+-						return;
+-					case "commit-draft":
+-						this.commitDraft(fx.retainSuffixOf);
++                    case "default-sink":
++                        this.deferDefaultCommit = this.deps.embeddedTextPersistence && this.attachmentIds.length === 0;
++                        if (this.deferDefaultCommit) this.sinkDurableText(fx.attempt, fx.draft, fx.mode);
++                        else this.sinkSerialized(fx.attempt, fx.draft, fx.mode);
++                        return;
++                    case "commit-draft":
++                        if (fx.defaultSink && this.deferDefaultCommit) {
++                            this.deferDefaultCommit = false;
++                            return;
++                        }
++                        this.commitDraft(fx.retainSuffixOf);
+ 						return;
+ 				}
+ 			}
+@@ -13946,6 +13962,27 @@
+ 			* missing or serialization failure rejects the detached send and restores
+ 			* its editor snapshot. Chip-free drafts skip the async detour.
+ 			*/
++            async sinkDurableText(attempt, draft, mode) {
++                this.admittingText = true;
++                this.publish();
++                try {
++                    const inputTriggers = this.deps.inputTriggers?.();
++                    const refs = this.projection.occurrences.filter(entry => entry.kind === "reference");
++                    const body = refs.length && inputTriggers ? await resolveSubmitBodyWithOccurrences(draft, refs, inputTriggers) : draft.trim();
++                    if (this.dead(attempt)) return;
++                    const outcome = await this.deps.defaultSink(body, [], mode, attempt.signal, () => {
++                        this.commitDraft(draft);
++                        this.admittingText = false;
++                        this.publish();
++                    });
++                    this.dispatchRun({type: "sink-settled", attempt, ok: outcome.kind === "success", outcome});
++                } catch (error) {
++                    if (!this.dead(attempt)) this.dispatchRun({type: "sink-settled", attempt, ok: false, message: error instanceof Error ? error.message : String(error)});
++                } finally {
++                    this.admittingText = false;
++                    this.publish();
++                }
++            }
+ 			sinkSerialized(attempt, draft, mode) {
+ 				this.notifySubmission(attempt.submission);
+ 				const attachmentIds = [...this.attachmentIds];
+@@ -14142,7 +14179,7 @@
+ 					draft: this.projection.clipboardText,
+ 					attachmentIds: this.attachmentIds,
+ 					draftRev: this.rev,
+-					phase: core.phase,
++                    phase: this.admittingText || this.loadingText ? "submitting" : core.phase,
+ 					...core.claim !== void 0 ? { claim: core.claim } : {},
+ 					occurrences: this.projection.occurrences,
+ 					queue: this.deps.inbox?.getSnapshot()?.["next-turn"] ?? EMPTY_QUEUE$1
+@@ -14189,10 +14226,31 @@
+ 			* @param ctx - client root context (services resolved lazily per call — boot order stays free).
+ 			* @param t - conversation-namespace translate thunk (reads the active locale at call time).
+ 			*/
+-			constructor(rootCtx, t) {
+-				this.rootCtx = rootCtx;
+-				this.t = t;
+-			}
++            constructor(rootCtx, t, embeddedTextPersistence) {
++                this.rootCtx = rootCtx;
++                this.t = t;
++                this.embeddedTextPersistence = embeddedTextPersistence;
++                this.activeShells = new Map();
++            }
++            setTextPersistence(provider) {
++                if (!this.embeddedTextPersistence) throw new Error("Embedded text persistence is not enabled.");
++                if (this.textPersistence) throw new Error("Text persistence already registered.");
++                this.textPersistence = provider;
++                for (const [binding, shell] of this.activeShells) this.bindTextPersistence(binding, shell);
++                return () => { this.textPersistence = void 0; };
++            }
++            bindTextPersistence(binding, shell) {
++                shell.loadingText = true;
++                shell.publish();
++                this.textPersistence.bind(binding.session, shell).then(dispose => {
++                    if (shell.disposed) { dispose(); return; }
++                    shell.disposeTextPersistence = dispose;
++                    shell.loadingText = false;
++                    shell.publish();
++                }, error => {
++                    shell.notices.set({id: ++shell.noticeSeq, level: "error", text: error.message});
++                });
++            }
+ 			/**
+ 			* Resolve the facade for one session-scope ctx (SessionInputResolver face).
+ 			* @param actx - session-scope context.
+@@ -14218,7 +14276,8 @@
+ 				if (existing !== void 0) return existing;
+ 				const { session, ctx: actx } = binding;
+ 				const shell = new SessionInputShell({
+-					actx,
++                    actx,
++                    embeddedTextPersistence: this.embeddedTextPersistence,
+ 					submissionState: () => {
+ 						const state = session.getSnapshot();
+ 						const model = session.projections.faceOf("modelSelection").getSnapshot();
+@@ -14242,7 +14301,7 @@
+ 					inputTriggers: () => this.controller(actx),
+ 					popup: () => this.popup(actx),
+ 					inbox: session.projections.faceOf("inbox"),
+-					defaultSink: (text, attachmentIds, mode, signal) => this.sink(session, text, attachmentIds, mode, signal),
++					defaultSink: (text, attachmentIds, mode, signal, commit) => this.sink(session, text, attachmentIds, mode, signal, commit),
+ 					steerQueue: () => {
+ 						this.steerQueue(session, shell);
+ 					},
+@@ -14257,7 +14316,13 @@
+ 						unsupportedNotice: (token) => this.t("command.attachmentsUnsupported", { command: token.trim().replace(/^\//u, "") })
+ 					}
+ 				});
+-				this.shells.set(binding, shell);
++                this.shells.set(binding, shell);
++                if (this.embeddedTextPersistence) {
++                    shell.loadingText = true;
++                    shell.publish();
++                    this.activeShells.set(binding, shell);
++                    if (this.textPersistence) this.bindTextPersistence(binding, shell);
++                }
+ 				actx.effect(() => {
+ 					const offs = [
+ 						actx.on("slash/input-begin-command", (req) => shell.beginCommand(req.claim, req.span) ? true : void 0),
+@@ -14267,6 +14332,8 @@
+ 					];
+ 					return () => {
+ 						for (const off of offs) off();
++                        shell.disposeTextPersistence?.();
++                        this.activeShells.delete(binding);
+ 						const drafts = shell.dispose();
+ 						this.shells.delete(binding);
+ 						const conversation = this.rootCtx.get("conversation");
+@@ -14329,10 +14396,17 @@
+ 			* exactly one path; a failed first prompt is an ordinary prompt failure
+ 			* (banner via promptError, draft restored only while untouched).
+ 			*/
+-			sink(session, text, attachmentIds, mode, signal) {
+-				if (text === "" && attachmentIds.length === 0) return Promise.resolve({ kind: "success" });
+-				return this.conversation().sendSession(session, text, attachmentIds, mode, signal);
+-			}
++            async sink(session, text, attachmentIds, mode, signal, commit) {
++                if (commit && session.getSnapshot().subagent === null) {
++                    if (!this.textPersistence) throw new Error("Waiting for text storage.");
++                    const requestId = randomUUID();
++                    await this.textPersistence.admit(session, text, mode, requestId);
++                    commit();
++                    return this.textPersistence.dispatch(session, text, mode, requestId, () => this.conversation().sendSession(session, text, attachmentIds, mode, signal, requestId));
++                }
++                commit?.();
++                return this.conversation().sendSession(session, text, attachmentIds, mode, signal);
++            }
+ 			/**
+ 			* Submit every still-pending queued message through QueueDock Steer, in FIFO
+ 			* request order — the same operation as the queue dock's per-row button.
+@@ -16400,9 +16474,10 @@
+ 			const conversation = useConversation((s) => s);
+ 			const inputState = useInput((s) => s);
+ 			const storedDraft = useStore((s) => s.draft);
++            const embeddedTextPersistence = useStore((s) => s.embeddedTextPersistence);
+ 			const viewRequest = useStore((s) => s.viewRequest ?? null);
+ 			(0, react.useEffect)(() => {
+-				if (inputState.draft === "" && storedDraft !== "") inputActions.setDraft(storedDraft);
++				if (!embeddedTextPersistence && inputState.draft === "" && storedDraft !== "") inputActions.setDraft(storedDraft);
+ 				const unmirror = bindDraftMirror(actions.setDraft);
+ 				return () => {
+ 					unmirror();
+@@ -17896,7 +17971,7 @@
+ 			"configForms"
+ 		];
+ 		/** Validated Conversation runtime configuration. */
+-		const Config = Schema.object({ maxConcurrentFileUploads: Schema.natural().min(1).default(2) });
++		const Config = Schema.object({ maxConcurrentFileUploads: Schema.natural().min(1).default(2), embeddedTextPersistence: Schema.boolean().default(window.parent !== window && Boolean(window.__DEVVM_EMBED__)) });
+ 		const ABSENT_NOTICES = {
+ 			getSnapshot: () => null,
+ 			subscribe: () => () => {}
+@@ -17941,7 +18016,60 @@
+ 		* Mount the Conversation core and target-neutral presentation.
+ 		* @param ctx - Client root context.
+ 		*/
+-		function apply(ctx, config = Config({})) {
++        const EMBEDDED_STYLES = `
++html[data-devvm-embedded] { font-size: 100%; }
++html[data-devvm-embedded] .wSkVaW_body {
++  --dsh-chat-content-width: min(100%, 820px);
++  --dsh-composer-text-max-height: min(35dvh, 336px);
++}
++html[data-devvm-embedded] [data-composer-input] { font-size: max(1rem, var(--dsh-content-font-size, 14px)); line-height: 1.55; }
++html[data-devvm-embedded] .uV2eYG_root { padding-bottom: max(8px, env(safe-area-inset-bottom)); }
++html[data-devvm-embedded] .wSkVaW_scrollBody { overscroll-behavior: contain; }
++html[data-devvm-embedded] .wSkVaW_viewArea { min-width: 0; }
++html[data-devvm-embedded] .wSkVaW_header { padding-left: 12px; padding-right: 12px; }
++html[data-devvm-embedded] [data-devvm-narrow] > .pI_x6G_sidebarCol { transition: transform 220ms ease, visibility 220ms; }
++html[data-devvm-embedded] [data-devvm-sidebar-backdrop] { transition: opacity 220ms ease, visibility 220ms; }
++@media (prefers-reduced-motion: reduce) {
++  html[data-devvm-embedded] [data-devvm-narrow] > .pI_x6G_sidebarCol,
++  html[data-devvm-embedded] [data-devvm-sidebar-backdrop] { transition: none; }
++}
++@media (max-width: 959px) {
++  html[data-devvm-embedded] .Sixlwa_bubble,
++  html[data-devvm-embedded] .hWmORq_root {
++    font-size: max(1rem, var(--dsh-content-font-size, 14px));
++    line-height: 1.55;
++  }
++  html[data-devvm-embedded] .wSkVaW_body {
++    --dsw-font-markdown-base: max(1rem, var(--dsh-content-font-size, 14px)) / 1.55 var(--dsw-font-family);
++    --dsw-font-markdown-base-strong: 600 max(1rem, var(--dsh-content-font-size, 14px)) / 1.55 var(--dsw-font-family);
++    --dsw-font-markdown-base-italic: italic max(1rem, var(--dsh-content-font-size, 14px)) / 1.55 var(--dsw-font-family);
++    --dsw-font-markdown-base-strong-italic: italic 600 max(1rem, var(--dsh-content-font-size, 14px)) / 1.55 var(--dsw-font-family);
++  }
++}
++@media (max-width: 700px) {
++  html[data-devvm-embedded] .wSkVaW_body { --dsh-composer-side-clearance: 8px; }
++  html[data-devvm-embedded] .wSkVaW_header { padding: 6px 8px 0; }
++  html[data-devvm-embedded] .wSkVaW_crumb { max-width: 180px; }
++  html[data-devvm-embedded] .uV2eYG_row { gap: 4px; }
++}
++@media (max-width: 959px), (pointer: coarse) {
++  html[data-devvm-embedded] .uV2eYG_add, html[data-devvm-embedded] .IW6AQa_iconButton,
++  html[data-devvm-embedded] .uV2eYG_primary,
++  html[data-devvm-embedded] .uV2eYG_retry,
++  html[data-devvm-embedded] [data-sidebar-right-expand],
++  html[data-devvm-embedded] [data-sidebar-right-toggle],
++  html[data-devvm-embedded] [data-sidebar-right-mode] { min-width: 44px; min-height: 44px; }
++  html[data-devvm-embedded] .uV2eYG_select { min-height: 44px; }
++}
++`;
++        function apply(ctx, config = Config({})) {
++            if (config.embeddedTextPersistence) ctx.effect(() => {
++                const style = document.createElement("style");
++                style.textContent = EMBEDDED_STYLES;
++                document.head.append(style);
++                document.documentElement.dataset.devvmEmbedded = "true";
++                return () => { style.remove(); delete document.documentElement.dataset.devvmEmbedded; };
++            });
+ 			const sessions = ctx.sessions;
+ 			const slots = ctx.slots;
+ 			const maxConcurrentFileUploads = config.maxConcurrentFileUploads;
+@@ -17952,7 +18080,7 @@
+ 				en
+ 			}), "ui-conversation: dictionaries");
+ 			const t = ctx.locale.bind(NS);
+-			const conversationStore = createConversationStore();
++			const conversationStore = createConversationStore(config.embeddedTextPersistence);
+ 			const submissionPolicy = new ComposerSubmissionPolicy(ctx.configForms.get(CONVERSATION_SETTINGS_NAMESPACE));
+ 			ctx.effect(() => () => {
+ 				submissionPolicy.dispose();
+@@ -18106,7 +18234,7 @@
+ 					};
+ 				}, "ui-conversation: fixed stop reference");
+ 			});
+-			const inputHub = new InputHub(ctx, t);
++			const inputHub = new InputHub(ctx, t, config.embeddedTextPersistence);
+ 			const composerBlocks = new ComposerBlockRegistry();
+ 			ctx.inject(["commandUi"], (scope) => {
+ 				const commands = scope.get("commandUi");
+--- a/node_modules/@deepseek-ai/dsh-client-ui-conversation/lib/types/client/contract/input.d.ts
++++ b/node_modules/@deepseek-ai/dsh-client-ui-conversation/lib/types/client/contract/input.d.ts
+@@ -29,6 +29,7 @@
+ /** Settled result of a command or default composer submission. */
+ export interface SubmitOutcome {
+     readonly kind: 'success' | 'error';
++    readonly error?: import('@deepseek-ai/dsh-typert-protocol').RemoteFailure;
+     readonly text?: string;
+ }
+ /** Command-mode credential supplied by one input-trigger source. */
+--- a/node_modules/@deepseek-ai/dsh-client-ui-conversation/lib/types/client/service.d.ts
++++ b/node_modules/@deepseek-ai/dsh-client-ui-conversation/lib/types/client/service.d.ts
+@@ -23,7 +23,14 @@
+  * verbs and the input registry other plugins may reach — and exactly what a
+  * test fake must supply.
+  */
++export interface EmbeddedTextPersistence {
++    bind(session: SessionFace, input: import('./contract/input.ts').SessionInput): Promise<() => void>;
++    admit(session: SessionFace, text: string, mode: 'queue' | 'steer', requestId: string): Promise<void>;
++    dispatch(session: SessionFace, text: string, mode: 'queue' | 'steer', requestId: string, send: () => Promise<SubmitOutcome>): Promise<SubmitOutcome>;
++}
+ export interface IConversation {
++    setTextPersistence(provider: EmbeddedTextPersistence): () => void;
++    sendPendingText(session: SessionFace, text: string, mode: 'queue' | 'steer', requestId: string): Promise<SubmitOutcome>;
+     /** The per-session input machine registry (SessionInputResolver face). */
+     readonly input: SessionInputResolver;
+     /**
+@@ -109,7 +116,7 @@
+      * @param signal - optional cancellation for the complete Host admission.
+      * @returns the Host admission outcome; local attachment preparation failures reject.
+      */
+-    sendSession(session: SessionFace, text: string, attachmentIds: readonly DraftAttachmentId[], mode: InputSubmitMode, signal?: AbortSignal): Promise<SubmitOutcome>;
++    sendSession(session: SessionFace, text: string, attachmentIds: readonly DraftAttachmentId[], mode: InputSubmitMode, signal?: AbortSignal, requestId?: string): Promise<SubmitOutcome>;
+     /**
+      * Create runtime-only draft attachments. Files whose browser MIME is an
+      * accepted image type become image drafts (object URL preview, bytes sent
+--- a/node_modules/@deepseek-ai/dsh-client-ui-layout/lib/client.js
++++ b/node_modules/@deepseek-ai/dsh-client-ui-layout/lib/client.js
+@@ -110,6 +110,7 @@
+ 		function CenterColumn(props) {
+ 			return (0, react_jsx_runtime.jsx)("div", {
+ 				className: AppFrame_module_css_default.centerCol,
++                style: {gridColumn: 2},
+ 				children: props.children
+ 			});
+ 		}
+@@ -125,6 +126,7 @@
+ 		function RightbarColumn(props) {
+ 			return (0, react_jsx_runtime.jsx)("div", {
+ 				className: AppFrame_module_css_default.rightbarCol,
++                style: {gridColumn: 3},
+ 				"data-rightbar-col": true,
+ 				children: props.children
+ 			});
+@@ -204,7 +206,7 @@
+ 			});
+ 		}
+ 		/** The three-column frame (see module doc). */
+-		function AppFrame({ useStore, useSessions, usePanelInfo, actions, renderSlot, t }) {
++		function AppFrame({ useStore, useSessions, usePanelInfo, actions, renderSlot, t, embedded }) {
+ 			const layoutInfo = useStore((state) => state.layoutInfo);
+ 			const frameRef = (0, react.useRef)(null);
+ 			const viewport = layoutInfo.viewportWidth;
+@@ -238,9 +240,10 @@
+ 			const sidebarPreference = sidebarCollapsed ? 0 : layoutInfo.sidebar === 0 ? 280 : layoutInfo.sidebar;
+ 			const rightbarPreference = layoutInfo.rightbar ?? viewport * .45;
+ 			const darwin = document.documentElement.dataset.platform === "darwin";
+-			const collapsedWidth = darwin || document.documentElement.hasAttribute("data-windows-titlebar") ? 0 : 56;
++			const collapsedWidth = embedded && narrow || darwin || document.documentElement.hasAttribute("data-windows-titlebar") ? 0 : 56;
+ 			const normal = computeColumns(viewport, !layoutInfo.rightbarShown && narrow ? 0 : sidebarPreference, rightbarPreference, collapsedWidth);
+ 			const cols = computeColumns(viewport, sidebarPreference, layoutInfo.rightbarTrack ? rightbarPreference : 0, collapsedWidth);
++			const sidebarWidth = embedded && narrow ? Math.min(280, Math.max(0, viewport - 48)) : cols.sidebar;
+ 			const colsRef = (0, react.useRef)(cols);
+ 			colsRef.current = cols;
+ 			const rightbarWidth = (0, react.useRef)(normal.rightbar);
+@@ -298,12 +301,14 @@
+ 			const productTitle = "DeepSeek Harness";
+ 			const rightbarMax = cols.rightbar === 0 ? 0 : clampWidth(rightbarPreference, 300, viewport * RIGHTBAR_MAX_RATIO);
+ 			const sidebar = (0, react.useMemo)(() => renderSlot("sidebar", {
+-				collapsed: sidebarCollapsed,
+-				width: cols.sidebar
++				collapsed: embedded && narrow ? false : sidebarCollapsed,
++				width: sidebarWidth
+ 			}), [
+ 				renderSlot,
+ 				sidebarCollapsed,
+-				cols.sidebar
++				sidebarWidth,
++				embedded,
++				narrow
+ 			]);
+ 			const main = (0, react.useMemo)(() => (0, react_jsx_runtime.jsx)(MainPanel, {
+ 				usePanelInfo,
+@@ -311,15 +316,17 @@
+ 			}), [usePanelInfo, renderSlot]);
+ 			const overlays = (0, react.useMemo)(() => renderSlot("shell.overlay", {}), [renderSlot]);
+ 			const leading = (0, react.useMemo)(() => renderSlot("shell.leading", {}), [renderSlot]);
+-			const leadingMounted = darwin && sidebarCollapsed;
++			const leadingMounted = !embedded && darwin && sidebarCollapsed;
+ 			return (0, react_jsx_runtime.jsxs)("div", {
+ 				ref: frameRef,
+ 				className: AppFrame_module_css_default.frame,
+ 				style: {
+ 					...document.documentElement.hasAttribute("data-windows-titlebar") ? { "--dsh-windows-sidebar-width": `${cols.sidebar}px` } : {},
+-					gridTemplateColumns: `${cols.sidebar}px minmax(${cols.rightbar === 0 ? 0 : 400}px, 1fr) minmax(0px, ${rightbarMax}px)`
++					gridTemplateColumns: embedded && narrow ? "0px minmax(0px, 1fr) 0px" : `${cols.sidebar}px minmax(${cols.rightbar === 0 ? 0 : 400}px, 1fr) minmax(0px, ${rightbarMax}px)`
+ 				},
+-				"data-sidebar-collapsed": sidebarCollapsed || void 0,
++				"data-devvm-embedded": embedded || void 0,
++                "data-devvm-narrow": embedded && narrow || void 0,
++                "data-sidebar-collapsed": sidebarCollapsed || void 0,
+ 				"data-rightbar-collapsed": cols.rightbar === 0 || void 0,
+ 				"data-rightbar-fullscreen": layoutInfo.rightbarFullscreen || void 0,
+ 				"data-rightbar-instant": layoutInfo.rightbarInstant || void 0,
+@@ -333,6 +340,7 @@
+ 					}),
+ 					(0, react_jsx_runtime.jsx)("div", {
+ 						className: AppFrame_module_css_default.sidebarCol,
++                        style: embedded && narrow ? {position: "absolute", inset: "0 auto 0 0", width: sidebarWidth, zIndex: 41, transform: sidebarCollapsed ? "translateX(-100%)" : "translateX(0)", visibility: sidebarCollapsed ? "hidden" : "visible", pointerEvents: sidebarCollapsed ? "none" : "auto"} : void 0,
+ 						children: sidebar
+ 					}),
+ 					(0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [(0, react_jsx_runtime.jsx)(CenterColumn, { children: main }), (0, react_jsx_runtime.jsx)(RightbarColumn, { children: renderSlot("rightbar", {
+@@ -350,7 +358,8 @@
+ 						"data-shell-leading": true,
+ 						children: leading
+ 					}),
+-					!sidebarCollapsed && (0, react_jsx_runtime.jsx)(DragHandle, {
++                    embedded && narrow && (0, react_jsx_runtime.jsx)("button", {"aria-label": "Close Sessions", "data-devvm-sidebar-backdrop": true, tabIndex: sidebarCollapsed ? -1 : 0, onClick: () => actions.setSidebarOpen(false), style: {position: "absolute", inset: 0, border: 0, background: "#0005", zIndex: 40, opacity: sidebarCollapsed ? 0 : 1, visibility: sidebarCollapsed ? "hidden" : "visible", pointerEvents: sidebarCollapsed ? "none" : "auto"}}),
++					!sidebarCollapsed && !(embedded && narrow) && (0, react_jsx_runtime.jsx)(DragHandle, {
+ 						side: "sidebar",
+ 						left: cols.sidebar,
+ 						onStart: onSidebarStart,
+@@ -408,6 +417,10 @@
+ 						d.layoutInfo.rightbarInstant = false;
+ 						d.layoutInfo.sidebar = clampWidth(px, 264, 420);
+ 					},
++                    setSidebarOpen: (d, isOpen) => {
++                        if (d.layoutInfo.viewportWidth < 1024) d.layoutInfo.narrowExpanded = isOpen;
++                        else d.layoutInfo.sidebar = isOpen ? d.layoutInfo.sidebar || 280 : 0;
++                    },
+ 					toggleSidebar: (d) => {
+ 						d.layoutInfo.rightbarInstant = false;
+ 						if (d.layoutInfo.viewportWidth < 1024) d.layoutInfo.narrowExpanded = !d.layoutInfo.narrowExpanded;
+@@ -475,6 +488,9 @@
+ 				this.navigation.abort();
+ 			}
+ 			/** Toggle the sidebar panel (closed ⟷ contract default width). */
++            setSidebarOpen(isOpen) {
++                this.panels.setSidebarOpen(isOpen);
++            }
+ 			toggleSidebar() {
+ 				this.panels.toggleSidebar();
+ 			}
+@@ -565,6 +581,7 @@
+ 		//#region lib/types/client/index.js
+ 		/** Required services (cordis fiber inject — the loader passes all module exports as an object plugin). */
+ 		const inject = [
++            "uiSession",
+ 			"slots",
+ 			"theme",
+ 			"locale",
+@@ -576,7 +593,7 @@
+ 		* and the shared root instance supplying commands and the panel-info source.
+ 		* @param ctx - client root context.
+ 		*/
+-		function apply(ctx) {
++        function apply(ctx, config = {embedded: window.parent !== window && Boolean(window.__DEVVM_EMBED__)}) {
+ 			ctx.effect(() => ctx.locale.register("shortcuts.layout", {
+ 				zh,
+ 				en
+@@ -623,7 +640,8 @@
+ 							scope: "root"
+ 						}
+ 					},
+-					store
++                    store,
++                    inject: () => ({embedded: config.embedded})
+ 				}, AppFrame);
+ 				const disposeShortcut = ctx.shortcuts.register({
+ 					id: "sidebar.left.toggle",
+@@ -685,7 +703,7 @@
+ 		}
+ 		//#endregion
+ 		exports.LayoutController = LayoutController;
+-		exports.apply = apply;
++        exports.apply = apply;
+ 		exports.inject = inject;
+ 		return module.exports;
+ 	}
+--- a/node_modules/@deepseek-ai/dsh-client-ui-layout/lib/types/client/service.d.ts
++++ b/node_modules/@deepseek-ai/dsh-client-ui-layout/lib/types/client/service.d.ts
+@@ -35,6 +35,8 @@
+      * @returns a signal aborted by the next navigation or layout disposal; check it before committing UI state.
+      */
+     beginNavigation(): AbortSignal;
++    /** Open or close the sidebar without changing its stored width preference. */
++    setSidebarOpen(isOpen: boolean): void;
+     /** Toggle the sidebar panel (closed ⟷ contract default width). */
+     toggleSidebar(): void;
+     /**
+@@ -67,6 +69,7 @@
+     /** Invalidate pending navigations when the layout owner is unloaded. */
+     dispose(): void;
+     /** Toggle the sidebar panel (closed ⟷ contract default width). */
++    setSidebarOpen(isOpen: boolean): void;
+     toggleSidebar(): void;
+     /** Report the right panel's track and fullscreen presentation. */
+     openRightbar(track: boolean, fullscreen: boolean): void;

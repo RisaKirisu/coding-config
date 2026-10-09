@@ -1,0 +1,3 @@
+- insert:
+    - id: devvm-project-app
+      name: '@devvm/dsh-project-app'

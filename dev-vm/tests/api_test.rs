@@ -72,7 +72,32 @@ async fn wait_for_dsh_status(ctx: &TestContext, proj_url: &str, expected: &str) 
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("DSH never reached status {expected}");
+    let logs: Value = ctx
+        .client
+        .get(format!("{proj_url}/logs"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for entry in fs::read_dir(&ctx.config.log_dir).unwrap() {
+        let path = entry.unwrap().path().join("dsh.log");
+        if path.exists() {
+            let text = fs::read_to_string(path).unwrap();
+            eprintln!(
+                "isolated dsh.log: {}",
+                text.lines()
+                    .filter(|line| !line.contains("token="))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+    }
+    panic!(
+        "DSH never reached status {expected}; isolated guest logs: {}",
+        logs["entries"]
+    );
 }
 
 async fn wait_for_dsh_token(project_dir: &std::path::Path) -> String {
@@ -203,7 +228,18 @@ async fn test_embedded_ui_served() {
 
     assert_eq!(res.status(), StatusCode::OK);
     let body = res.text().await.unwrap();
-    assert!(body.contains("<!DOCTYPE html>"));
+    assert!(body.contains("<!doctype html>"));
+    assert!(body.contains("Your workspace"));
+    assert!(body.contains("/manifest.webmanifest"));
+    assert!(body.contains("/app/app.js"));
+    let res = ctx
+        .client
+        .get(format!("{url}/manage"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.text().await.unwrap();
     assert!(body.contains("DevVM Control Daemon"));
     assert!(body.contains("fetchProjects"));
     assert!(body.contains("openProjectPort"));
@@ -506,6 +542,7 @@ async fn test_vm_lifecycle_operations() {
     let res = ctx.client.get(&proj_url).send().await.unwrap();
     let data: Value = res.json().await.unwrap();
     assert_eq!(data["vm_status"], "stopped");
+    assert!(data["memory"].is_null());
 
     // 2. Start VM
     let start_url = format!(
@@ -515,10 +552,14 @@ async fn test_vm_lifecycle_operations() {
     let res = ctx.client.post(&start_url).send().await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    // Verify VM is now running
+    // Verify VM is now running with memory metrics
     let res = ctx.client.get(&proj_url).send().await.unwrap();
     let data: Value = res.json().await.unwrap();
     assert_eq!(data["vm_status"], "running");
+    assert_eq!(data["memory"]["formatted"], "1.5 GiB (1 GiB) / 8 GiB");
+    assert_eq!(data["memory"]["host_bytes"], 1610612736);
+    assert_eq!(data["memory"]["guest_bytes"], 1073741824);
+    assert_eq!(data["memory"]["limit_bytes"], 8589934592_u64);
 
     // 3. Stop VM
     let stop_url = format!(
@@ -528,10 +569,11 @@ async fn test_vm_lifecycle_operations() {
     let res = ctx.client.post(&stop_url).send().await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    // Verify VM is now stopped
+    // Verify VM is now stopped and memory is null
     let res = ctx.client.get(&proj_url).send().await.unwrap();
     let data: Value = res.json().await.unwrap();
     assert_eq!(data["vm_status"], "stopped");
+    assert!(data["memory"].is_null());
 
     // 4. Delete VM
     let del_url = format!(
@@ -1026,23 +1068,52 @@ async fn test_disconnect_during_vm_boot_does_not_leak_dsh_operation() {
     fs::create_dir_all(&project_dir).unwrap();
     fs::write(project_dir.join(".vm_start_slow"), "1").unwrap();
     let project_id = register(&ctx, &project_dir).await;
-    let mut socket = tokio::net::TcpStream::connect(ctx.server_addr).await.unwrap();
+    let mut socket = tokio::net::TcpStream::connect(ctx.server_addr)
+        .await
+        .unwrap();
     socket.write_all(format!(
         "POST /api/projects/{project_id}/dsh/launch HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
     ).as_bytes()).await.unwrap();
-    let log = ctx.config.log_dir.join(project_id.to_string()).join("daemon.log");
+    let log = ctx
+        .config
+        .log_dir
+        .join(project_id.to_string())
+        .join("daemon.log");
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if fs::read_to_string(&log).unwrap_or_default().contains("Invoking `devvm start`") { break; }
+            if fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("Invoking `devvm start`")
+            {
+                break;
+            }
             tokio::task::yield_now().await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     drop(socket);
     tokio::time::sleep(Duration::from_millis(600)).await;
-    let view: Value = ctx.client.get(format!("http://{}/api/projects/{project_id}", ctx.server_addr))
-        .send().await.unwrap().json().await.unwrap();
-    assert_eq!(view["dsh_status"], "stopped", "a disconnected launch must release its operation");
-    assert!(!project_dir.join(".vm_running").exists(), "cancelled VM start must not keep executing");
+    let view: Value = ctx
+        .client
+        .get(format!(
+            "http://{}/api/projects/{project_id}",
+            ctx.server_addr
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        view["dsh_status"], "stopped",
+        "a disconnected launch must release its operation"
+    );
+    assert!(
+        !project_dir.join(".vm_running").exists(),
+        "cancelled VM start must not keep executing"
+    );
     assert!(fs::read_to_string(log).unwrap().contains("cancelled"));
 }
 
@@ -1056,34 +1127,90 @@ async fn test_two_clients_coordinate_vm_start_and_stop() {
     let base = format!("http://{}/api/projects/{project_id}", ctx.server_addr);
     let other = reqwest::Client::new();
     for action in ["vm/start", "dsh/launch"] {
-        let log = ctx.config.log_dir.join(project_id.to_string()).join("daemon.log");
-        let before = fs::read_to_string(&log).unwrap_or_default().matches("Invoking `devvm start`").count();
+        let log = ctx
+            .config
+            .log_dir
+            .join(project_id.to_string())
+            .join("daemon.log");
+        let before = fs::read_to_string(&log)
+            .unwrap_or_default()
+            .matches("Invoking `devvm start`")
+            .count();
         let (client, url) = (ctx.client.clone(), format!("{base}/{action}"));
         let start = tokio::spawn(async move { client.post(url).send().await.unwrap() });
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                if fs::read_to_string(&log).unwrap_or_default().matches("Invoking `devvm start`").count() > before { break; }
+                if fs::read_to_string(&log)
+                    .unwrap_or_default()
+                    .matches("Invoking `devvm start`")
+                    .count()
+                    > before
+                {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         // UI B reads observed status, not UI A's pending action.
         let view: Value = other.get(&base).send().await.unwrap().json().await.unwrap();
         assert_eq!(view["vm_status"], "stopped");
         assert_eq!(view["dsh_status"], "stopped");
         for duplicate in ["vm/start", "dsh/launch", "dsh/restart"] {
-            assert_eq!(other.post(format!("{base}/{duplicate}")).send().await.unwrap().status(), StatusCode::CONFLICT);
+            assert_eq!(
+                other
+                    .post(format!("{base}/{duplicate}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::CONFLICT
+            );
         }
-        assert_eq!(other.post(format!("{base}/vm/stop")).send().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            other
+                .post(format!("{base}/vm/stop"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
         assert_eq!(start.await.unwrap().status(), StatusCode::CONFLICT);
         assert!(!project_dir.join(".vm_running").exists());
         assert_eq!(mock_dsh_start_count(&project_dir), 0);
         // Re-registering preserves identity but cannot preserve an abandoned lock.
-        assert_eq!(other.post(format!("{base}/unregister")).send().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            other
+                .post(format!("{base}/unregister"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
         assert_eq!(register(&ctx, &project_dir).await, project_id);
     }
     fs::remove_file(project_dir.join(".vm_start_slow")).unwrap();
-    assert_eq!(other.post(format!("{base}/vm/start")).send().await.unwrap().status(), StatusCode::OK);
-    assert_eq!(other.post(format!("{base}/vm/stop")).send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        other
+            .post(format!("{base}/vm/start"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        other
+            .post(format!("{base}/vm/stop"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
@@ -1693,7 +1820,15 @@ async fn test_local_only_mode_omits_remote_links() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(saw_running, "DSH never reached running with local link");
-    assert_eq!(client.post(format!("{proj_url}/dsh/stop")).send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        client
+            .post(format!("{proj_url}/dsh/stop"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
@@ -1784,4 +1919,223 @@ async fn test_remote_url_dns_label_limit_handling() {
         host_part.len()
     );
     assert!(host_part.ends_with("-8080"), "Must end with port");
+}
+
+async fn wait_for_operation_result(ctx: &TestContext, project: Uuid, operation: &str) -> Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot: Value = ctx
+                .client
+                .get(format!(
+                    "http://{}/api/projects/{project}/operations",
+                    ctx.server_addr
+                ))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if let Some(result) = snapshot["recent"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|record| record["id"] == operation)
+            {
+                return result.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("accepted operation did not settle")
+}
+
+#[tokio::test]
+async fn test_submitted_operation_survives_lost_http_acknowledgement() {
+    use tokio::io::AsyncWriteExt;
+    let ctx = setup_test_server().await;
+    let project_dir = ctx.home_dir.join("submitted-start");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::write(project_dir.join(".vm_start_slow"), "1").unwrap();
+    let project = register(&ctx, &project_dir).await;
+    let request_id = Uuid::new_v4();
+    let body = json!({"action": "start_vm", "request_id": request_id}).to_string();
+    let mut socket = tokio::net::TcpStream::connect(ctx.server_addr)
+        .await
+        .unwrap();
+    socket.write_all(format!("POST /api/projects/{project}/operations HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+    let operation = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let snapshot: Value = ctx
+                .client
+                .get(format!(
+                    "http://{}/api/projects/{project}/operations",
+                    ctx.server_addr
+                ))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if snapshot["active"]["request_id"] == request_id.to_string() {
+                break snapshot["active"]["id"].as_str().unwrap().to_owned();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(socket); // The client never consumes the accepted HTTP response.
+    let result = wait_for_operation_result(&ctx, project, &operation).await;
+    assert_eq!(result["state"], "succeeded");
+    assert_eq!(result["request_id"], request_id.to_string());
+    assert!(project_dir.join(".vm_running").exists());
+    let view: Value = ctx
+        .client
+        .get(format!("http://{}/api/projects/{project}", ctx.server_addr))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(view["vm_status"], "running");
+    assert!(view["operation"].is_null());
+    assert_eq!(view["last_operation"]["id"], operation);
+    let restarted = spawn_daemon(&ctx.config).await;
+    let after: Value = ctx
+        .client
+        .get(format!("http://{restarted}/api/projects/{project}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["vm_status"], "running");
+    assert_ne!(after["daemon_instance_id"], view["daemon_instance_id"]);
+    assert!(
+        after["last_operation"].is_null(),
+        "restart must not invent the lost operation result"
+    );
+}
+
+#[tokio::test]
+async fn test_legacy_stop_preempts_submitted_start_and_preserves_both_results() {
+    let ctx = setup_test_server().await;
+    let project_dir = ctx.home_dir.join("mixed-ownership");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::write(project_dir.join(".vm_start_slow"), "1").unwrap();
+    let project = register(&ctx, &project_dir).await;
+    let base = format!("http://{}/api/projects/{project}", ctx.server_addr);
+    let accepted = ctx
+        .client
+        .post(format!("{base}/operations"))
+        .json(&json!({"action": "start_vm", "request_id": Uuid::new_v4()}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let receipt: Value = accepted.json().await.unwrap();
+    assert_eq!(
+        ctx.client
+            .post(format!("{base}/vm/start"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        ctx.client
+            .post(format!("{base}/vm/stop"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let cancelled = wait_for_operation_result(&ctx, project, receipt["id"].as_str().unwrap()).await;
+    assert_eq!(cancelled["state"], "cancelled");
+    let snapshot: Value = ctx
+        .client
+        .get(format!("{base}/operations"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(snapshot["active"].is_null());
+    assert_eq!(snapshot["recent"][0]["action"], "VM stop");
+    assert_eq!(snapshot["recent"][0]["state"], "succeeded");
+    assert!(!project_dir.join(".vm_running").exists());
+}
+
+#[tokio::test]
+async fn test_submitted_failure_is_observable_and_logged_once_after_unregister() {
+    let ctx = setup_test_server().await;
+    let project_dir = ctx.home_dir.join("submitted-failure");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::write(project_dir.join(".dsh_start_fail"), "1").unwrap();
+    let project = register(&ctx, &project_dir).await;
+    let base = format!("http://{}/api/projects/{project}", ctx.server_addr);
+    let accepted = ctx
+        .client
+        .post(format!("{base}/operations"))
+        .json(&json!({"action": "launch_dsh", "request_id": Uuid::new_v4()}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let receipt: Value = accepted.json().await.unwrap();
+    let failed = wait_for_operation_result(&ctx, project, receipt["id"].as_str().unwrap()).await;
+    assert_eq!(failed["state"], "failed");
+    let error = failed["error"].as_str().unwrap();
+    let log = fs::read_to_string(
+        ctx.config
+            .log_dir
+            .join(project.to_string())
+            .join("daemon.log"),
+    )
+    .unwrap();
+    assert_eq!(
+        log.matches(error).count(),
+        1,
+        "async failure must be logged exactly once"
+    );
+    assert_eq!(
+        ctx.client
+            .post(format!("{base}/unregister"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let snapshot: Value = ctx
+        .client
+        .get(format!("{base}/operations"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(snapshot["recent"][0]["id"], receipt["id"]);
+    assert_eq!(
+        ctx.client
+            .get(format!(
+                "http://{}/api/projects/{}/operations",
+                ctx.server_addr,
+                Uuid::new_v4()
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
 }

@@ -110,6 +110,14 @@ case "$cmd" in
             exit 1
         fi
         ;;
+    memory)
+        if [[ -f ".vm_running" ]]; then
+            echo '{"host_bytes": 1610612736, "guest_bytes": 1073741824, "limit_bytes": 8589934592}'
+            exit 0
+        else
+            exit 1
+        fi
+        ;;
     start)
         if [[ -f ".vm_start_slow" ]]; then
             sleep 0.4
@@ -146,11 +154,13 @@ case "$cmd" in
                 echo "Mock DevVM: dsh could not be started" >&2
                 exit 7
             fi
-            mapped_cmd="${cmd_body//\/tmp\/devvm-daemon-dsh.pid/$PWD/.mock_dsh.pid}"
+            # Rewrite the guest workspace before inserting workspace-contained test paths.
+            # Otherwise a later replacement rewrites the TMPDIR/log paths a second time.
+            mapped_cmd="${cmd_body//\/root\/workspace/$PWD}"
+            mapped_cmd="${mapped_cmd//\/tmp\/devvm-daemon-dsh.pid/$PWD/.mock_dsh.pid}"
             mapped_cmd="${mapped_cmd//\/tmp\/devvm-daemon-dsh.token/$PWD/.mock_dsh.token}"
             mapped_cmd="${mapped_cmd//\/devvm-root\/.project-logs/__LOG_DIR__}"
             mapped_cmd="${mapped_cmd//\/run\/devvm/$VM_RUN}"
-            mapped_cmd="${mapped_cmd//\/root\/workspace/$PWD}"
             mapped_cmd="${mapped_cmd//\/root\/.dsh/$VM_DSH}"
             PATH="__GUEST_BIN__:$PATH" \
                 MOCK_DSH_START_COUNTER="$PWD/.mock_dsh_starts" \

@@ -11,7 +11,9 @@
     "@hytime/dsh-thinking-effort": "0.3.6",
     "dsh-better-sidebar": "0.24.1",
     "dsh-context": "^0.60.0",
-    "dsh-skill-mcp-panel": "file:../../plugins/dsh-skill-mcp-panel"
+    "dsh-skill-mcp-panel": "file:../../plugins/dsh-skill-mcp-panel",
+    "@devvm/dsh-project-app": "file:../../plugins/project-app",
+    "@devvm/dsh-model-fallback": "file:../../plugins/model-fallback"
   },
   "dsh": {
     "profile": {
@@ -27,7 +29,9 @@
         "@devvm/dsh-style-control",
         "dsh-skill-mcp-panel",
         "@devvm/dsh-build-loop",
-        "dsh-context"
+        "dsh-context",
+        "@devvm/dsh-project-app",
+        "@devvm/dsh-model-fallback"
       ]
     }
   }

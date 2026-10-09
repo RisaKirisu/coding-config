@@ -1,35 +1,23 @@
-# DSH 0.2.0-rc.2 upgrade
+# DSH 0.2.0-rc.2 integration handoff
 
-The upgrade is applied directly to `/root/.dsh/`, the shared source under `dev-vm/root/.dsh/`, and `Dockerfile`. Run `./setup-devvm.sh` through the existing host setup process. No manual patch application or separate profile dependency installation is required. Setup retains its original generic image-build flow.
+The repository prepares exact DSH `0.2.0-rc.2` integration. [Runtime maintenance](dsh-runtime-maintenance.md) owns active deployment/adaptation commands; [the release requirements](dsh-0.2.0-rc.2-upgrade-plan.md) own configuration/plugin boundaries. Source preparation does not establish live host/VM deployment.
 
-## Installation
+## Installation and version ownership
 
-The Dockerfile pins DSH to `0.2.0-rc.2`. Setup rebuilds the image when its inputs change. Guest initialization in `devvm` only runs native frozen-lockfile installs for the Web/headless profiles using the existing workspace pnpm store. The Web profile declares local bundles as relative `file:../../plugins/<dir>` packages, so pnpm installs their ordinary dependencies in the same operation. DSH resolves runtime peers natively; there is no plugin-specific install or fallback-link creation. Installation runs only when the installed lock differs or is absent. `--skip-image` retains its existing meaning.
+The image installs the pinned CLI and applies both [localhost](../patches/deepseek-harness-localhost-subdomains.patch) and [Project-app](../patches/deepseek-harness-project-app.patch) native patches. Build applicability checks are zero-fuzz. Setup conditionally builds/exports the image and rebuilds the daemon. New images affect new VMs; existing VMs keep their global installation until explicitly migrated.
 
-Installed local packages are snapshots. After source-only changes, run `dsh plugin --profile web install --force --frozen-lockfile` with the configured store, then restart the runtime through the existing lifecycle. After dependency changes, regenerate and retain the Web profile lockfile. Startup reconciliation uses the installed Remote Sync package rather than its source tree. See `AGENTS.md` for the plugin update procedure.
+Guest initialization mounts shared configuration and VM-local portable state, then installs Web/headless profiles when locks differ or installation is absent. The native Web manifest uses relative `file:` plugin packages, ordinary dependencies, and runtime peers. Installed file packages are snapshots; unchanged locks do not trigger source-only refresh.
 
-Only `patches/deepseek-harness-localhost-subdomains.patch` remains required for DSH's existing DevVM browser origins. The obsolete DSH hash guards are removed; patch applicability still fails the build on error. There is no MCP source patch and no separate installation patch file.
+Use the forced native install with `/root/workspace/.pnpm-store/v11`, then a fresh target Runtime process. Existing-VM owner updates require the exact deployed receipt and a complete old-to-new transition; a CLI release update also requires replacing that VM's CLI and validating candidate data/tool requirements. See [deployment](dsh-runtime-maintenance.md#deployment). Never restart/probe the Runtime hosting the agent session.
 
-The running guest runtime observed during preparation still used `0.1.5-rc.2`. Source preparation does not replace an already running guest process. Existing VM recreation/restart remains governed by the existing DevVM lifecycle; setup does not delete existing VM state.
+## Configuration and settings
 
-## Configuration and plugins
+Web fields live in its profile patch; headless is independent. Shared execution policy/local Bash live in the home patch. The active `standard-bash` preset is declarative and retains its historical ID; dormant experiments are unregistered. Native Browser supplies browsing. Web Subagent Manager owns child provider/model/effort. HTTP MCP uses native environment-backed headers with private values preserved.
 
-Web-editable settings live in `profiles/web/cordis.patch.yml`. Headless owns its independent provider/default-model copy and native spawn defaults. Shared execution policy and the twenty-minute Bash default/cap with 20,000 retained output bytes live in the home patch. The complete legacy settings document is archived as `settings.yaml.pre-020-rc2`.
+Web defaults remain Steer and Simplified Chinese. Stock rc.2's non-loopback native form provider uses memory-only state and does not load/save profile fields. Remote preference persistence is therefore unresolved through this release's supported config/Cordis surface. Client-state recreation uses the browser-derived locale with English fallback and the Queue send default. This is distinct from successful loopback form saves and custom plugin endpoints. [Settings policy admission](dsh-runtime-maintenance.md#settings-policy-admission) records the exact boundary and conformance probe.
 
-`plugins/agent-presets/cordis.patch.yml` is a declarative Cordis bundle using rc.2's native `@deepseek-ai/dsh-agent-preset` entry. It registers the historical `standard-bash` ID once, preserving terminal-only filesystem tools, native PTC workflow, Ralph, and configured compaction/pruner budgets. It contains no custom preset implementation. The duplicated legacy preset directory is removed; dormant experimental directories stay unregistered.
+## Current verification scope
 
-Better Sidebar is pinned to `0.24.1`; Browser uses rc.2's native sidebar entry. Thinking Effort is pinned to `0.3.6`; Web Subagent Manager remains the child model/effort authority. Local packages declare exact rc.2 admission/peers. The panel is upstream published `2.1.3` with local dependency packaging; custom bearer-reference code is removed.
+The [app verification guide](project-app.md#verification) describes owned real-native carriers and targeted tests. Current controls/mobile evidence covers neutral focus, real refresh, icons/action rows, compact header, native navigation, drawer width and animations, both swipe directions, reduced motion, viewport/draft retention, and pinch zoom. Full delivery/recovery checks remain required when their native owners change. Complete patch-state validation covers pristine/current and exact older-to-current transitions across eight generated targets.
 
-## Native MCP authentication
-
-HTTP MCP uses stock rc.2 `headers` configuration. The existing Context7 token is preserved in the private, gitignored DSH-home `.env`; a native Cordis `!!js` expression supplies its `Authorization` header at startup. No token literal is committed, and no MCP package code is changed. The upstream panel's ordinary secret-header editor remains available and redacts values in its server list responses. Environment-backed authentication updates take effect on reload/restart under native configuration behavior.
-
-There is no `.dsh/tests` directory. The native tool integration check now lives at `tests/dsh-rc2-tools.test.mjs`; local plugin checks remain with their plugins.
-
-## Verification
-
-- Before the native-MCP change, completed isolated runs covered settings save/restart, job ownership/cancellation, voice/style, and V3-to-V4 persistence/rsync, with 62 distinct passing tests. Authentication tests for the removed custom extension are superseded.
-- Final native MCP test passes against exact unmodified rc.2 artifacts and a real local HTTP MCP server: headers arrive, tools discover/call successfully, and the upstream panel redacts and preserves secret headers.
-- `bash -n setup-devvm.sh`, `bash -n devvm`, and `bash -n build.sh` pass. Setup is byte-for-byte unchanged from Git; setup and the guest wrapper retain executable mode.
-- Cargo installation checks were attempted but blocked on the package-cache lock; they are not reported as passed.
-- No image build or setup invocation was performed inside the current guest. Real provider requests, production Context7 calls, and native Browser interaction through actual local/remote Project URLs remain live acceptance checks after the host rebuild.
+The settings probe reproduces non-loopback policy failures while actual saved profile fields stay intact; do not list it as a passing remote-settings test. Native package/source/defaults review does not prove provider requests, real production MCP access, actual guest Browser use, remote FRP/Tailscale stability, or physical Samsung installation/IME/hinge/permission behavior. Those remain explicit acceptance checks. Image deployment, existing-VM migration, and fresh target Runtime activation must be reported only after performed.
