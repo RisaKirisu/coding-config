@@ -113,7 +113,7 @@ node tests/project_app_mobile.cjs
 node tests/project_app_selection.cjs
 # Broader delivery/recovery changes:
 node tests/project_app_browser.cjs
-# Diagnostic/admission probe; remote checks currently fail on stock rc.2:
+# Settings admission probe:
 node tests/project_app_settings.cjs
 ```
 
