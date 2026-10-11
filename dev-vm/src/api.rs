@@ -10,7 +10,7 @@ use crate::models::{
 use crate::registry::{
     get_project, load_projects, register_project, unregister_project, RegistryError,
 };
-use crate::runner::{check_vm_memory, check_vm_status};
+use crate::runner::{CommandRunner, Devvm};
 use crate::runtime::{DshRuntimeManager, LifecycleAction};
 use crate::sync::{load_sync_config, provision_sync_setup, SyncConfig, SyncManager};
 use crate::ui::INDEX_HTML;
@@ -33,8 +33,22 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct AppState {
     pub config: DaemonConfig,
+    pub devvm: Devvm,
     pub dsh_runtime_manager: DshRuntimeManager,
     pub sync_manager: SyncManager,
+}
+
+impl AppState {
+    /// Every `devvm` and `ssh` command the daemon issues goes through `runner`.
+    pub fn new(config: DaemonConfig, runner: Arc<dyn CommandRunner>) -> Self {
+        let devvm = Devvm::new(config.devvm_bin.clone(), runner.clone());
+        Self {
+            dsh_runtime_manager: DshRuntimeManager::new(devvm.clone()),
+            sync_manager: SyncManager::new(runner, devvm.clone()),
+            devvm,
+            config,
+        }
+    }
 }
 
 /// The single place a handler error is recorded: one `tracing` event, one `[daemon:error]`
@@ -178,7 +192,10 @@ async fn build_project_view(state: &AppState, record: &ProjectRecord) -> Project
         .to_string();
 
     let project_host = compute_project_host(&record.path);
-    let vm_status = check_vm_status(&state.config, &record.path).await;
+    let vm_status = state
+        .devvm
+        .status(&record.path, &tokio_util::sync::CancellationToken::new())
+        .await;
     let dsh_status = state
         .dsh_runtime_manager
         .get_status_for_vm(&state.config, record.id, &record.path, vm_status)
@@ -196,7 +213,7 @@ async fn build_project_view(state: &AppState, record: &ProjectRecord) -> Project
     };
 
     let memory = if vm_status == crate::models::VmStatus::Running {
-        check_vm_memory(&state.config, &record.path).await
+        state.devvm.memory(&record.path).await
     } else {
         None
     };

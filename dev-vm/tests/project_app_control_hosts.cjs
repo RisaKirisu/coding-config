@@ -1,3 +1,4 @@
+const {routeProjects} = require('./project_app_daemon_routes.cjs');
 // Verify aliases against the owned HTTPS Caddy + real native DSH fixture.
 const playwrightModule = process.env.PLAYWRIGHT_MODULE || 'playwright';
 const {chromium} = require(playwrightModule);
@@ -12,7 +13,7 @@ assert(fixtureRoot && path.resolve(fixtureRoot).startsWith(path.resolve('.agents
   const fixture = JSON.parse(await fs.readFile(path.join(fixtureRoot, 'ready.json'), 'utf8'));
   assert(fixture.remoteControlUrls?.length);
   const browser = await chromium.launch({channel:'chrome', args:[
-    '--host-resolver-rules=MAP *.devvm.test 127.0.0.2', '--no-proxy-server', '--ignore-certificate-errors',
+    `--host-resolver-rules=MAP *.devvm.test 127.0.0.2:${fixture.remoteTransportPort}`, '--no-proxy-server', '--ignore-certificate-errors',
   ]});
   const results = [];
   const project = fixture.projects[0];
@@ -21,6 +22,7 @@ assert(fixtureRoot && path.resolve(fixtureRoot).startsWith(path.resolve('.agents
       const context = await browser.newContext({viewport:{width:412,height:915}, isMobile:true, hasTouch:true, ignoreHTTPSErrors:true});
       try {
         const page = await context.newPage();
+        await routeProjects(page, fixture);
         const messages = [];
         await page.exposeFunction('recordBridgeMessage', message => messages.push(message));
         await page.addInitScript(() => window.addEventListener('message', event => {
@@ -66,14 +68,13 @@ assert(fixtureRoot && path.resolve(fixtureRoot).startsWith(path.resolve('.agents
     const context = await browser.newContext({ignoreHTTPSErrors:true});
     try {
       const page = await context.newPage();
+        await routeProjects(page, fixture);
       for (const label of ['devvm2', 'devvm-', 'other']) {
         const response = await page.goto(`https://${label}.devvm.test`);
         assert.equal(response.status(), 400, `${label}: rejected by shipped Caddy matcher`);
       }
       // Native DSH still loads under an unauthorized sibling, but its embed bridge must stay inactive.
-      const response = await context.request.get(`${fixture.apiUrl}/api/projects/${project.id}`);
-      assert.equal(response.status(), 200);
-      const projectView = await response.json();
+      const projectView = project.view;
       const probe = name => `<script>
         window.bridgeMessages = [];
         addEventListener('message', event => {

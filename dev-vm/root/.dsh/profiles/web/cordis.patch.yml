@@ -231,8 +231,8 @@
 - id: agent-default-model
   config:
     provider: proxy-cli-claude
-    model: claude-haiku-5-5
-    reasoningEffort: medium
+    model: claude-opus-5-5
+    reasoningEffort: high
 - id: ui-settings-general
   config:
     welcomeNoticeVersion: 2026-09-28.1
@@ -245,7 +245,7 @@
     busyEnter: steer
 - id: locale
   config:
-    preference: en
+    preference: zh
 - id: ui-theme
   config:
     preference: system

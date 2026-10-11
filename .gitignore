@@ -2,3 +2,4 @@
 node_modules
 thinking-effort-loaded.json
 .pnpm-store
+.agents/scratch/

@@ -15,6 +15,7 @@ pub mod urls;
 pub use api::{create_router, AppState};
 pub use config::{determine_bind_address, DaemonConfig};
 pub use logs::LogEntry;
+pub use runner::{CommandFuture, CommandRunner, CommandSpec, Devvm, ProcessCommandRunner};
 pub use runtime::DshRuntimeManager;
 pub use service::{
     default_home_dir, generate_launchd_plist, generate_systemd_unit, get_launchd_plist_path,
@@ -23,7 +24,7 @@ pub use service::{
 };
 pub use sync::{
     load_sync_config, provision_sync_setup, resolve_host_ssh_key_path, save_sync_config,
-    shell_quote, SyncConfig, SyncError, SyncManager, SyncRunner, SystemSyncRunner,
+    shell_quote, SyncConfig, SyncError, SyncManager,
 };
 pub use urls::{
     build_local_port_template, build_local_project_url, build_remote_port_template,

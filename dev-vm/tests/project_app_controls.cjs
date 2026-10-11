@@ -1,3 +1,4 @@
+const {routeProjects} = require('./project_app_daemon_routes.cjs');
 // Focused controls checks against the owned native fixture, not a deployed daemon.
 const playwrightModule = process.env.PLAYWRIGHT_MODULE || 'playwright';
 const {chromium} = require(playwrightModule);
@@ -17,6 +18,7 @@ assert(root.startsWith(path.resolve('.agents') + path.sep));
   const browser = await chromium.launch({channel: 'chrome'});
   const context = await browser.newContext({viewport: {width: 1280, height: 800}, colorScheme: 'light'});
   const page = await context.newPage();
+  await routeProjects(page, fixture);
   page.setDefaultTimeout(7000);
   const results = [];
   const errors = [];
@@ -37,12 +39,13 @@ assert(root.startsWith(path.resolve('.agents') + path.sep));
       const border = await page.locator('.project-search').evaluate(element => getComputedStyle(element).borderColor);
       assert.equal(border, 'rgb(112, 112, 112)');
     });
-    await check('refresh tooltip busy state and real HTTP feedback', async () => {
+    await check('refresh tooltip busy state and Project response feedback', async () => {
       const button = page.locator('#refresh-projects');
       await expect(button).toHaveAttribute('title', 'Refresh Project status');
       let release;
       const gate = new Promise(resolve => { release = resolve; });
-      await page.route('**/api/projects', async route => { await gate; await route.continue(); });
+      const delayedProjects = async route => { await gate; await route.fulfill({json: fixture.projects.map(project => project.view)}); };
+      await page.route('**/api/projects', delayedProjects);
       const response = page.waitForResponse(response => new URL(response.url()).pathname === '/api/projects');
       await button.click();
       await expect(button).toBeDisabled();
@@ -51,7 +54,7 @@ assert(root.startsWith(path.resolve('.agents') + path.sep));
       assert.equal((await response).status(), 200);
       await expect(page.locator('#notice-text')).toHaveText('Project status refreshed.');
       await expect(button).toBeEnabled();
-      await page.unroute('**/api/projects');
+      await page.unroute('**/api/projects', delayedProjects);
       await page.locator('#dismiss-notice').click();
     });
     await check('management icon matches DevVM webpage symbol', async () => {

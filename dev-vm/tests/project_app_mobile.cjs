@@ -1,3 +1,4 @@
+const {routeProjects} = require('./project_app_daemon_routes.cjs');
 // Run only against the owned real-runtime fixture described in docs/project-app.md.
 const {chromium} = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const {expect} = require((process.env.PLAYWRIGHT_MODULE || 'playwright') + '/test');
@@ -15,6 +16,7 @@ assert(root.startsWith(path.resolve('.agents') + path.sep));
   const browser = await chromium.launch({channel: 'chrome'});
   const context = await browser.newContext({viewport: {width: 412, height: 915}, hasTouch: true, isMobile: true});
   const page = await context.newPage();
+  await routeProjects(page, fixture);
   const results = [];
   const check = async (name, run) => {
     try { await run(); results.push({name, passed: true}); }

@@ -1,13 +1,15 @@
 use crate::config::DaemonConfig;
 use crate::logs::append_log_logged;
 use crate::models::SyncStatus;
-use crate::runner::{log_command_failure, log_command_spawn_failure};
+use crate::runner::{
+    log_command_failure, log_command_spawn_failure, CommandRunner, CommandSpec, Devvm,
+};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,64 +191,27 @@ impl From<io::Error> for SyncError {
     }
 }
 
-#[async_trait::async_trait]
-pub trait SyncRunner: Send + Sync {
-    /// Host-side reachability check, used only while provisioning Sync Store credentials.
-    async fn verify(&self, config: &SyncConfig) -> Result<(), SyncError>;
-    async fn delete_store(&self, config: &SyncConfig, project_id: Uuid) -> Result<(), SyncError>;
-    async fn read_status(&self, project_path: &Path) -> Result<Option<SyncStatus>, SyncError>;
+pub fn verify_remote_command(config: &SyncConfig) -> String {
+    let root = shell_quote(&config.remote_sync_root);
+    format!("mkdir -p {0} && test -w {0}", root)
 }
 
-#[derive(Clone, Debug)]
-pub struct SystemSyncRunner {
-    pub devvm_bin: PathBuf,
+pub fn delete_remote_command(config: &SyncConfig, project_id: Uuid) -> String {
+    format!(
+        "rm -rf {}",
+        shell_quote(&format!(
+            "{}/{}",
+            config.remote_sync_root.trim_end_matches('/'),
+            project_id
+        ))
+    )
 }
 
-impl Default for SystemSyncRunner {
-    fn default() -> Self {
-        Self {
-            devvm_bin: std::env::var("DEVVM_BIN")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("devvm")),
-        }
-    }
-}
-
-impl SystemSyncRunner {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_devvm_bin(devvm_bin: PathBuf) -> Self {
-        Self { devvm_bin }
-    }
-
-    fn ssh_bin(&self) -> PathBuf {
-        self.devvm_bin
-            .parent()
-            .map(|p| p.join("ssh"))
-            .filter(|p| p.is_file())
-            .unwrap_or_else(|| PathBuf::from("ssh"))
-    }
-
-    pub fn verify_remote_command(config: &SyncConfig) -> String {
-        let root = shell_quote(&config.remote_sync_root);
-        format!("mkdir -p {0} && test -w {0}", root)
-    }
-
-    pub fn delete_remote_command(config: &SyncConfig, project_id: Uuid) -> String {
-        format!(
-            "rm -rf {}",
-            shell_quote(&format!(
-                "{}/{}",
-                config.remote_sync_root.trim_end_matches('/'),
-                project_id
-            ))
-        )
-    }
-
-    fn ssh_args(config: &SyncConfig, remote_command: &str) -> Vec<String> {
-        vec![
+/// The `ssh` invocation that runs `remote_command` on the Sync Store host.
+pub fn ssh_command(config: &SyncConfig, remote_command: &str) -> CommandSpec {
+    CommandSpec {
+        program: PathBuf::from("ssh"),
+        args: vec![
             "-p".to_string(),
             config.ssh_port.to_string(),
             "-i".to_string(),
@@ -261,107 +226,12 @@ impl SystemSyncRunner {
             "BatchMode=yes".to_string(),
             format!("{}@{}", config.ssh_user, config.ssh_host),
             remote_command.to_string(),
-        ]
-    }
-
-    fn ssh_command(&self, config: &SyncConfig, remote_command: &str) -> Command {
-        let mut cmd = Command::new(self.ssh_bin());
-        cmd.args(Self::ssh_args(config, remote_command));
-        cmd
+        ],
+        current_dir: None,
     }
 }
 
-#[async_trait::async_trait]
-impl SyncRunner for SystemSyncRunner {
-    async fn verify(&self, config: &SyncConfig) -> Result<(), SyncError> {
-        let remote_command = Self::verify_remote_command(config);
-        let program = self.ssh_bin().display().to_string();
-        let args = Self::ssh_args(config, &remote_command);
-        let mut cmd = self.ssh_command(config, &remote_command);
-        match cmd.output().await {
-            Ok(output) if output.status.success() => Ok(()),
-            Ok(output) => {
-                log_command_failure(&program, &args, &output);
-                Err(SyncError::Failed(format!(
-                    "SSH connection check failed (exit code {:?}): {}",
-                    output.status.code(),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )))
-            }
-            Err(e) => {
-                log_command_spawn_failure(&program, &args, &e);
-                Err(SyncError::Failed(format!("Failed to execute ssh: {}", e)))
-            }
-        }
-    }
-
-    async fn delete_store(&self, config: &SyncConfig, project_id: Uuid) -> Result<(), SyncError> {
-        let remote_command = Self::delete_remote_command(config, project_id);
-        let program = self.ssh_bin().display().to_string();
-        let args = Self::ssh_args(config, &remote_command);
-        let mut cmd = self.ssh_command(config, &remote_command);
-        match cmd.output().await {
-            Ok(output) if output.status.success() => Ok(()),
-            Ok(output) => {
-                log_command_failure(&program, &args, &output);
-                Err(SyncError::Failed(format!(
-                    "Remote sync store deletion failed (exit code {:?}): {}",
-                    output.status.code(),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )))
-            }
-            Err(e) => {
-                log_command_spawn_failure(&program, &args, &e);
-                Err(SyncError::Failed(format!(
-                    "Failed to execute ssh for sync deletion: {}",
-                    e
-                )))
-            }
-        }
-    }
-
-    async fn read_status(&self, project_path: &Path) -> Result<Option<SyncStatus>, SyncError> {
-        let status_command = "cat /run/devvm/sync-status.json 2>/dev/null";
-        let program = self.devvm_bin.display().to_string();
-        let args = [
-            "exec".to_string(),
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            status_command.to_string(),
-        ];
-        let mut cmd = Command::new(&self.devvm_bin);
-        cmd.arg("exec")
-            .arg("/bin/sh")
-            .arg("-c")
-            .arg(status_command)
-            .current_dir(project_path);
-
-        match cmd.output().await {
-            Ok(output) if output.status.success() => {
-                Ok(parse_status_file(&String::from_utf8_lossy(&output.stdout)))
-            }
-            // A non-zero exit means the Sync Status file does not exist yet, which is the
-            // ordinary state, so it is reported at debug level rather than as an error.
-            Ok(output) => {
-                tracing::debug!(
-                    program,
-                    args = ?args,
-                    exit_code = ?output.status.code(),
-                    stderr = %String::from_utf8_lossy(&output.stderr),
-                    "no Sync Status file inside DevVM"
-                );
-                Ok(None)
-            }
-            Err(e) => {
-                log_command_spawn_failure(&program, &args, &e);
-                Err(SyncError::Failed(format!(
-                    "Failed to read Sync Status inside DevVM: {}",
-                    e
-                )))
-            }
-        }
-    }
-}
+const SYNC_STATUS_COMMAND: &str = "cat /run/devvm/sync-status.json 2>/dev/null";
 
 #[derive(Deserialize)]
 struct SyncStatusFile {
@@ -376,39 +246,86 @@ fn parse_status_file(contents: &str) -> Option<SyncStatus> {
 
 #[derive(Clone)]
 pub struct SyncManager {
-    runner: Arc<dyn SyncRunner>,
-}
-
-impl Default for SyncManager {
-    fn default() -> Self {
-        Self::new()
-    }
+    runner: Arc<dyn CommandRunner>,
+    devvm: Devvm,
 }
 
 impl SyncManager {
-    pub fn new() -> Self {
-        Self {
-            runner: Arc::new(SystemSyncRunner::new()),
+    pub fn new(runner: Arc<dyn CommandRunner>, devvm: Devvm) -> Self {
+        Self { runner, devvm }
+    }
+
+    /// Runs `remote_command` over ssh; `failure` names the operation in the returned error.
+    async fn run_ssh(
+        &self,
+        config: &SyncConfig,
+        remote_command: &str,
+        failure: &str,
+    ) -> Result<(), SyncError> {
+        let command = ssh_command(config, remote_command);
+        let program = command.program.display().to_string();
+        let args = command.args.clone();
+        match self.runner.run(command, CancellationToken::new()).await {
+            Ok(output) if output.status.success() => Ok(()),
+            Ok(output) => {
+                log_command_failure(&program, &args, &output);
+                Err(SyncError::Failed(format!(
+                    "{} (exit code {:?}): {}",
+                    failure,
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )))
+            }
+            Err(e) => {
+                log_command_spawn_failure(&program, &args, &e);
+                Err(SyncError::Failed(format!("Failed to execute ssh: {}", e)))
+            }
         }
     }
 
-    pub fn with_devvm_bin(devvm_bin: PathBuf) -> Self {
-        Self {
-            runner: Arc::new(SystemSyncRunner::with_devvm_bin(devvm_bin)),
-        }
-    }
-
-    pub fn with_runner(runner: Arc<dyn SyncRunner>) -> Self {
-        Self { runner }
-    }
-
+    /// Host-side reachability check, used only while provisioning Sync Store credentials.
     pub async fn verify(&self, config: &SyncConfig) -> Result<(), SyncError> {
-        self.runner.verify(config).await
+        self.run_ssh(
+            config,
+            &verify_remote_command(config),
+            "SSH connection check failed",
+        )
+        .await
     }
 
     /// An unreadable status file is indistinguishable from an unreported one: the UI shows no badge.
     pub async fn read_status(&self, project_path: &Path) -> Option<SyncStatus> {
-        self.runner.read_status(project_path).await.ok().flatten()
+        let args = vec![
+            "exec".to_string(),
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            SYNC_STATUS_COMMAND.to_string(),
+        ];
+        match self
+            .devvm
+            .output(project_path, args.clone(), &CancellationToken::new())
+            .await
+        {
+            Ok(output) if output.status.success() => {
+                parse_status_file(&String::from_utf8_lossy(&output.stdout))
+            }
+            // A non-zero exit means the Sync Status file does not exist yet, which is the
+            // ordinary state, so it is reported at debug level rather than as an error.
+            Ok(output) => {
+                tracing::debug!(
+                    program = %self.devvm.program(),
+                    args = ?args,
+                    exit_code = ?output.status.code(),
+                    stderr = %String::from_utf8_lossy(&output.stderr),
+                    "no Sync Status file inside DevVM"
+                );
+                None
+            }
+            Err(e) => {
+                log_command_spawn_failure(&self.devvm.program(), &args, &e);
+                None
+            }
+        }
     }
 
     pub async fn delete_sync_store(
@@ -435,7 +352,14 @@ impl SyncManager {
             ),
         );
 
-        match self.runner.delete_store(&sync_config, project_id).await {
+        match self
+            .run_ssh(
+                &sync_config,
+                &delete_remote_command(&sync_config, project_id),
+                "Remote sync store deletion failed",
+            )
+            .await
+        {
             Ok(()) => {
                 append_log_logged(
                     &daemon_config.log_dir,
@@ -507,13 +431,13 @@ mod tests {
         config.remote_sync_root = "/tmp/x; rm -rf /".to_string();
         let project_id = Uuid::new_v4();
 
-        let verify_cmd = SystemSyncRunner::verify_remote_command(&config);
+        let verify_cmd = verify_remote_command(&config);
         assert_eq!(
             verify_cmd,
             "mkdir -p '/tmp/x; rm -rf /' && test -w '/tmp/x; rm -rf /'"
         );
 
-        let delete_cmd = SystemSyncRunner::delete_remote_command(&config, project_id);
+        let delete_cmd = delete_remote_command(&config, project_id);
         assert_eq!(
             delete_cmd,
             format!("rm -rf '/tmp/x; rm -rf /{}'", project_id)

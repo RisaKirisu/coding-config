@@ -5,6 +5,7 @@ DevVM Workspace Supervision: isolated development microVMs for OpenCode and Deep
 ## System Architecture
 
 - **Isolation**: One microVM per Project with CPUs/RAM configured from `smolvm.toml`.
+- **Guest Page Cache Budget**: Smolvm's balloon returns only free guest pages to the host, and the guest kernel otherwise keeps file cache until memory pressure. `devvm start` runs a guest loop that every 30 seconds writes the excess above 512 MiB to `/sys/fs/cgroup/memory.reclaim`, evicting the least recently used file cache so host memory tracks actual guest use.
 - **Stable Working Directory**: Every Project is mounted at `/root/workspace` inside its microVM, providing a stable working directory across workstations.
 - **DSH State Architecture**:
   - *Centrally Shared DSH Config*: Workstation-wide plugins, profiles, skills, presets, settings, and credentials reside on the host (`root/.dsh/`) and are mounted at `/devvm-root/.dsh`, linked into `/root/.dsh`.

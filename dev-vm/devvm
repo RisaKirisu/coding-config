@@ -1,34 +1,91 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DEVVM_HOME="${DEVVM_HOME:-$HOME/coding-config/dev-vm}"
-FRPS_BIN="${FRPS_BIN:-$HOME/.local/bin/frps}"
+project_name() {
+    local name
+    name="$(printf '%s' "$(basename "$1")" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-')"
+    name="${name#-}"
+    name="${name%-}"
+    printf '%s\n' "${name:-project}"
+}
 
-ARCH="$(uname -m)"
-case "$ARCH" in
-    x86_64)        ARCH=amd64 ;;
-    aarch64|arm64) ARCH=arm64 ;;
-    *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
-esac
+project_hash() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$1" | sha256sum | cut -c1-8
+    else
+        printf '%s' "$1" | shasum -a 256 | cut -c1-8
+    fi
+}
 
-INGRESS_PORT=17007
-HTTP_PORT=8102
-FRPS_TIMEOUT=1800
+project_host() {
+    local host="$1-$2"
+    if [[ ${#host} -gt 57 ]]; then host="$2"; fi
+    printf '%s\n' "$host"
+}
 
-PROJECT_DIR="$(realpath "$PWD")"
-PROJECT_NAME="$(printf '%s' "$(basename "$PROJECT_DIR")" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-')"
-PROJECT_NAME="${PROJECT_NAME#-}"
-PROJECT_NAME="${PROJECT_NAME%-}"
-[[ -z "$PROJECT_NAME" ]] && PROJECT_NAME="project"
-if command -v sha256sum >/dev/null 2>&1; then sha256() { sha256sum; }; else sha256() { shasum -a 256; }; fi
-PROJECT_HASH="$(printf '%s' "$PROJECT_DIR" | sha256 | cut -c1-8)"
-PROJECT_HOST="${PROJECT_NAME}-${PROJECT_HASH}"
-if [[ ${#PROJECT_HOST} -gt 57 ]]; then PROJECT_HOST="$PROJECT_HASH"; fi
-NAME="dev-${PROJECT_NAME}-${PROJECT_HASH}"
+machine_name() {
+    printf 'dev-%s-%s\n' "$1" "$2"
+}
 
-IMAGE="$DEVVM_HOME/rust-dev-opencode-$ARCH.tar"
-SMOLFILE="$DEVVM_HOME/smolvm.toml"
-DEVVM_ROOT="$DEVVM_HOME/root"
+# Argument builders emit NUL-delimited words to preserve spaces and empty arguments.
+smolvm_create_args() {
+    printf '%s\0' machine create --name "$NAME" -s "$SMOLFILE" \
+        --net-backend virtio-net --image "$IMAGE" -e "DEVVM_PROJECT_HOST=$PROJECT_HOST" \
+        -v "$PROJECT_DIR:/root/workspace" -v "$DEVVM_ROOT:/devvm-root"
+}
+
+smolvm_start_args() { printf '%s\0' machine start --name "$NAME"; }
+smolvm_stop_args() { printf '%s\0' machine stop --name "$NAME"; }
+smolvm_delete_args() { printf '%s\0' machine delete --name "$NAME" -f; }
+smolvm_list_args() { printf '%s\0' machine ls --json; }
+
+smolvm_exec_args() {
+    local mode="$1"
+    shift
+    printf '%s\0' machine exec
+    case "$mode" in
+        interactive) printf '%s\0' -it ;;
+        stream) printf '%s\0' --stream ;;
+    esac
+    printf '%s\0' --name "$NAME" -- "$@"
+}
+
+run_smolvm() {
+    local argument
+    local args=()
+    while IFS= read -r -d '' argument; do args+=("$argument"); done < <("$@")
+    smolvm "${args[@]}"
+}
+
+machine_exists() {
+    jq -r --arg name "$1" 'any(.[]; .name == $name)'
+}
+
+machine_running() {
+    jq -r --arg name "$1" 'any(.[]; .name == $name and .state == "running")'
+}
+
+memory_json() {
+    local host_bytes="$1" limit_mib="$2" meminfo total_kb avail_kb
+    local guest_bytes="" limit_bytes=""
+    meminfo="$(cat)"
+    total_kb="$(printf '%s\n' "$meminfo" | awk '/^MemTotal:/ {print $2}')"
+    avail_kb="$(printf '%s\n' "$meminfo" | awk '/^MemAvailable:/ {print $2}')"
+    if [[ -n "$total_kb" && -n "$avail_kb" ]] && (( total_kb >= avail_kb )); then
+        guest_bytes=$(( (total_kb - avail_kb) * 1024 ))
+    fi
+    if [[ -n "$limit_mib" && "$limit_mib" =~ ^[0-9]+$ ]]; then
+        limit_bytes=$(( limit_mib * 1048576 ))
+    fi
+    printf '{"host_bytes":%s,"guest_bytes":%s,"limit_bytes":%s}\n' \
+        "${host_bytes:-null}" "${guest_bytes:-null}" "${limit_bytes:-null}"
+}
+
+ingress_args() {
+    printf '%s\0' "$FRPS_BIN" --bind-addr 127.0.0.1 --bind-port "$INGRESS_PORT" \
+        --proxy-bind-addr 127.0.0.1 --vhost-http-port "$HTTP_PORT" \
+        --vhost-http-timeout "$FRPS_TIMEOUT"
+}
 
 ensure_ingress() {
     if [[ ! -x "$FRPS_BIN" ]]; then
@@ -36,14 +93,9 @@ ensure_ingress() {
         exit 1
     fi
 
-    local command=(
-        "$FRPS_BIN"
-        --bind-addr 127.0.0.1
-        --bind-port "$INGRESS_PORT"
-        --proxy-bind-addr 127.0.0.1
-        --vhost-http-port "$HTTP_PORT"
-        --vhost-http-timeout "$FRPS_TIMEOUT"
-    )
+    local argument
+    local command=()
+    while IFS= read -r -d '' argument; do command+=("$argument"); done < <(ingress_args)
     if pgrep -u "$(id -u)" -f "^${command[*]}$" >/dev/null; then
         return
     fi
@@ -79,15 +131,11 @@ ensure_project_id() {
 }
 
 exists() {
-    smolvm machine ls --json |
-        jq -e --arg name "$NAME" \
-        'any(.[]; .name == $name)' >/dev/null
+    [[ "$(run_smolvm smolvm_list_args | machine_exists "$NAME")" == true ]]
 }
 
 running() {
-    smolvm machine ls --json |
-        jq -e --arg name "$NAME" \
-        'any(.[]; .name == $name and .state == "running")' >/dev/null
+    [[ "$(run_smolvm smolvm_list_args | machine_running "$NAME")" == true ]]
 }
 
 create() {
@@ -97,18 +145,11 @@ create() {
     fi
 
     echo "Creating $NAME"
-    smolvm machine create \
-         --name "$NAME" \
-         -s "$SMOLFILE" \
-         --net-backend virtio-net \
-         --image "$IMAGE" \
-         -e "DEVVM_PROJECT_HOST=$PROJECT_HOST" \
-         -v "$PROJECT_DIR:/root/workspace" \
-         -v "$DEVVM_ROOT:/devvm-root"
+    run_smolvm smolvm_create_args
 }
 
-link_root() {
-    smolvm machine exec --name "$NAME" -- /bin/bash -c '
+link_root_args() {
+    smolvm_exec_args plain /bin/bash -c '
         set -euo pipefail
         shopt -s dotglob nullglob
 
@@ -165,16 +206,48 @@ link_root() {
     ' link-root
 }
 
-start_ingress() {
-    smolvm machine exec --name "$NAME" -- /usr/local/bin/devvm-ingress
+link_root() { run_smolvm link_root_args; }
+
+start_ingress_args() {
+    smolvm_exec_args plain /usr/local/bin/devvm-ingress
 }
 
-clear_crane() {
-    smolvm machine exec \
-        --name "$NAME" \
-        -- /bin/bash \
+start_ingress() { run_smolvm start_ingress_args; }
+
+start_cache_reclaim_args() {
+    # Free page reporting returns only free guest pages to the host, and without memory
+    # pressure the guest kernel keeps file cache indefinitely, so the host holds it too.
+    # Every 30 seconds, evict the least recently used file cache above 512 MiB; the freed
+    # pages are then reported back to the host.
+    smolvm_exec_args plain /bin/bash -c '
+        set -euo pipefail
+        test -w /sys/fs/cgroup/memory.reclaim
+
+        reclaim_cache_above_budget() {
+            local budget_bytes=$((512 * 1024 * 1024))
+            local cache_bytes
+            while sleep 30; do
+                cache_bytes="$(awk "/^(active|inactive)_file / { sum += \$2 } END { print sum }" /sys/fs/cgroup/memory.stat)"
+                if (( cache_bytes > budget_bytes )); then
+                    # memory.reclaim fails with EAGAIN when it frees less than requested;
+                    # the next pass retries.
+                    echo "$((cache_bytes - budget_bytes))" > /sys/fs/cgroup/memory.reclaim || true
+                fi
+            done
+        }
+
+        reclaim_cache_above_budget </dev/null >/dev/null 2>&1 &
+    ' cache-reclaim
+}
+
+start_cache_reclaim() { run_smolvm start_cache_reclaim_args; }
+
+clear_crane_args() {
+    smolvm_exec_args plain /bin/bash \
         -c "rm -rf /storage/tmp/* && fstrim /storage"
 }
+
+clear_crane() { run_smolvm clear_crane_args; }
 
 start() {
     if running; then
@@ -182,106 +255,117 @@ start() {
     fi
 
     ensure_ingress
-    smolvm machine start --name "$NAME"
+    run_smolvm smolvm_start_args
     start_ingress
     link_root
     clear_crane
+    start_cache_reclaim
 }
 
-case "${1:-shell}" in
-    start)
-        create
-        start
-        ;;
+main() {
+    DEVVM_HOME="${DEVVM_HOME:-$HOME/coding-config/dev-vm}"
+    FRPS_BIN="${FRPS_BIN:-$HOME/.local/bin/frps}"
 
-    shell)
-        create
-        start
-        echo "HTTP: http://<port>.$PROJECT_HOST.devvm.localhost:$HTTP_PORT"
-        smolvm machine exec -it --name "$NAME" -- /bin/bash
-        ;;
+    ARCH="$(uname -m)"
+    case "$ARCH" in
+        x86_64)        ARCH=amd64 ;;
+        aarch64|arm64) ARCH=arm64 ;;
+        *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
+    esac
 
-    exec)
-        shift
-        if [[ "${1:-}" == "--" ]]; then
+    INGRESS_PORT=17007
+    HTTP_PORT=8102
+    FRPS_TIMEOUT=1800
+
+    PROJECT_DIR="$(realpath "$PWD")"
+    PROJECT_NAME="$(project_name "$PROJECT_DIR")"
+    PROJECT_HASH="$(project_hash "$PROJECT_DIR")"
+    PROJECT_HOST="$(project_host "$PROJECT_NAME" "$PROJECT_HASH")"
+    NAME="$(machine_name "$PROJECT_NAME" "$PROJECT_HASH")"
+
+    IMAGE="$DEVVM_HOME/rust-dev-opencode-$ARCH.tar"
+    SMOLFILE="$DEVVM_HOME/smolvm.toml"
+    DEVVM_ROOT="$DEVVM_HOME/root"
+
+    case "${1:-shell}" in
+        start)
+            create
+            start
+            ;;
+
+        shell)
+            create
+            start
+            echo "HTTP: http://<port>.$PROJECT_HOST.devvm.localhost:$HTTP_PORT"
+            run_smolvm smolvm_exec_args interactive /bin/bash
+            ;;
+
+        exec)
             shift
-        fi
-        create
-        start
-        smolvm machine exec --stream --name "$NAME" -- "$@"
-        ;;
-
-    stop)
-        smolvm machine stop --name "$NAME"
-        ;;
-
-    status)
-        smolvm machine ls --json |
-        jq -r --arg name "$NAME" '
-            .[] | select(.name == $name) |
-            "Machine '\''\(.name)'\'': \(.state)"
-        '
-        ;;
-
-    memory)
-        if ! running; then
-            exit 1
-        fi
-        machine_info="$(smolvm machine ls --json 2>/dev/null | jq -c --arg name "$NAME" '.[] | select(.name == $name)' 2>/dev/null || true)"
-        if [[ -z "$machine_info" ]]; then
-            exit 1
-        fi
-        limit_mib="$(printf '%s' "$machine_info" | jq -r '.memory_mib // empty')"
-        pid="$(printf '%s' "$machine_info" | jq -r '.pid // empty')"
-
-        host_bytes=""
-        if [[ -n "$pid" && -d "/proc/$pid" ]]; then
-            pages="$(awk '{print $2}' "/proc/$pid/statm" 2>/dev/null || true)"
-            if [[ -n "$pages" ]]; then
-                page_size="$(getconf PAGESIZE 2>/dev/null || echo 4096)"
-                host_bytes=$(( pages * page_size ))
+            if [[ "${1:-}" == "--" ]]; then
+                shift
             fi
-        fi
-        if [[ -z "$host_bytes" && -n "$pid" ]]; then
-            rss_kb="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
-            if [[ -n "$rss_kb" && "$rss_kb" =~ ^[0-9]+$ ]]; then
-                host_bytes=$(( rss_kb * 1024 ))
-            fi
-        fi
+            create
+            start
+            run_smolvm smolvm_exec_args stream "$@"
+            ;;
 
-        guest_bytes=""
-        meminfo="$(smolvm machine exec --name "$NAME" -- /bin/sh -c 'cat /proc/meminfo' 2>/dev/null || true)"
-        if [[ -n "$meminfo" ]]; then
-            total_kb="$(printf '%s\n' "$meminfo" | awk '/^MemTotal:/ {print $2}')"
-            avail_kb="$(printf '%s\n' "$meminfo" | awk '/^MemAvailable:/ {print $2}')"
-            if [[ -n "$total_kb" && -n "$avail_kb" ]]; then
-                used_kb=$(( total_kb - avail_kb ))
-                if (( used_kb >= 0 )); then
-                    guest_bytes=$(( used_kb * 1024 ))
+        stop)
+            run_smolvm smolvm_stop_args
+            ;;
+
+        status)
+            run_smolvm smolvm_list_args |
+            jq -r --arg name "$NAME" '
+                .[] | select(.name == $name) |
+                "Machine '\''\(.name)'\'': \(.state)"
+            '
+            ;;
+
+        memory)
+            if ! running; then
+                exit 1
+            fi
+            machine_info="$(run_smolvm smolvm_list_args 2>/dev/null | jq -c --arg name "$NAME" '.[] | select(.name == $name)' 2>/dev/null || true)"
+            if [[ -z "$machine_info" ]]; then
+                exit 1
+            fi
+            limit_mib="$(printf '%s' "$machine_info" | jq -r '.memory_mib // empty')"
+            pid="$(printf '%s' "$machine_info" | jq -r '.pid // empty')"
+
+            host_bytes=""
+            if [[ -n "$pid" && -d "/proc/$pid" ]]; then
+                pages="$(awk '{print $2}' "/proc/$pid/statm" 2>/dev/null || true)"
+                if [[ -n "$pages" ]]; then
+                    page_size="$(getconf PAGESIZE 2>/dev/null || echo 4096)"
+                    host_bytes=$(( pages * page_size ))
                 fi
             fi
-        fi
+            if [[ -z "$host_bytes" && -n "$pid" ]]; then
+                rss_kb="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+                if [[ -n "$rss_kb" && "$rss_kb" =~ ^[0-9]+$ ]]; then
+                    host_bytes=$(( rss_kb * 1024 ))
+                fi
+            fi
 
-        limit_bytes=""
-        if [[ -n "$limit_mib" && "$limit_mib" =~ ^[0-9]+$ ]]; then
-            limit_bytes=$(( limit_mib * 1048576 ))
-        fi
+            meminfo="$(run_smolvm smolvm_exec_args plain /bin/sh -c 'cat /proc/meminfo' 2>/dev/null || true)"
+            printf '%s\n' "$meminfo" | memory_json "$host_bytes" "$limit_mib"
+            ;;
 
-        printf '{"host_bytes":%s,"guest_bytes":%s,"limit_bytes":%s}\n' \
-            "${host_bytes:-null}" "${guest_bytes:-null}" "${limit_bytes:-null}"
-        ;;
+        rm|delete)
+            run_smolvm smolvm_stop_args 2>/dev/null || true
+            run_smolvm smolvm_delete_args
+            ;;
 
-    rm|delete)
-        smolvm machine stop --name "$NAME" 2>/dev/null || true
-        smolvm machine delete --name "$NAME" -f
-        ;;
+        name)
+            echo "$NAME"
+            ;;
 
-    name)
-        echo "$NAME"
-        ;;
+        *)
+            echo "Usage: devvm {start|shell|exec|stop|status|memory|rm|name}"
+            exit 1
+            ;;
+    esac
+}
 
-    *)
-        echo "Usage: devvm {start|shell|exec|stop|status|memory|rm|name}"
-        exit 1
-        ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

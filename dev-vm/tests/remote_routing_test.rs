@@ -1,7 +1,7 @@
 mod common;
 
-use common::{echo_headers_handler, CaddyGuard};
-use devvm_daemon::{create_router, AppState, DaemonConfig, DshRuntimeManager, SyncManager};
+use common::{echo_headers_handler, CaddyGuard, MockRunner, DEVVM};
+use devvm_daemon::{create_router, AppState, DaemonConfig};
 use reqwest::redirect::Policy;
 use reqwest::StatusCode;
 use serde_json::Value;
@@ -157,16 +157,15 @@ customDomains = [
         sync_config_path: config_dir.join("sync.json"),
         log_dir: temp_dir.path().join("logs"),
         home_dir: temp_dir.path().join("home"),
-        devvm_bin: PathBuf::from("true"),
+        devvm_bin: PathBuf::from(DEVVM),
         ingress_port: frps_vhost_port,
         remote_domain: Some("risak.dev".to_string()),
     };
-    let app_state = AppState {
-        config: config.clone(),
-        dsh_runtime_manager: DshRuntimeManager::new(),
-        sync_manager: SyncManager::new(),
-    };
-    let control_router = create_router(app_state);
+    // No Project is registered, so Control routing must not run any command.
+    let control_router = create_router(AppState::new(
+        config.clone(),
+        std::sync::Arc::new(MockRunner::new()),
+    ));
     let control_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let control_port = control_listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -357,7 +356,20 @@ customDomains = [
         .await
         .unwrap();
     assert_eq!(token_res.status(), StatusCode::SEE_OTHER);
-    assert_eq!(token_res.headers().get("location").unwrap(), "/");
+    // DSH answers with a relative Location; the browser resolves it against the token URL.
+    let location = token_res
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let redirect_target = token_res.url().join(location).unwrap();
+    assert_eq!(redirect_target.path(), "/");
+    assert_eq!(
+        redirect_target.query(),
+        None,
+        "the token must not survive the redirect"
+    );
 
     let set_cookie = token_res
         .headers()
@@ -397,12 +409,13 @@ customDomains = [
     assert!(body.contains("<!doctype html>"));
 
     // --- TEST 7: WebSocket Upgrade against Installed DSH Runtime through the Proxy Chain ---
+    // `/api/remote.mux` is DSH's own authenticated WebSocket; the cookie admits the upgrade.
     let mut tcp_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", host_caddy_port))
         .await
         .expect("Failed to connect TCP to Host Caddy");
 
     let ws_request = format!(
-        "GET /sidebar/ws/agent-terminals HTTP/1.1\r\n\
+        "GET /api/remote.mux HTTP/1.1\r\n\
          Host: {}\r\n\
          Upgrade: websocket\r\n\
          Connection: Upgrade\r\n\

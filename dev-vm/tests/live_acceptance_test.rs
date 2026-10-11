@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Json},
     Router,
 };
-use devvm_daemon::{create_router, AppState, DaemonConfig, DshRuntimeManager, SyncManager};
+use devvm_daemon::{create_router, AppState, DaemonConfig, ProcessCommandRunner};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use std::env;
@@ -525,15 +525,10 @@ async fn test_live_complete_version_one_system() {
         remote_domain: Some("risak.dev".to_string()),
     };
 
-    let dsh_runtime_manager = DshRuntimeManager::new();
-    let sync_manager = SyncManager::new();
-
-    let state = AppState {
-        config: daemon_config.clone(),
-        dsh_runtime_manager,
-        sync_manager,
-    };
-
+    let state = AppState::new(
+        daemon_config.clone(),
+        std::sync::Arc::new(ProcessCommandRunner),
+    );
     let router = create_router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let daemon_addr = listener.local_addr().unwrap();

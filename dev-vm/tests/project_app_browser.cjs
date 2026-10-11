@@ -1,3 +1,4 @@
+const {routeProjects, controlProjectProcess} = require('./project_app_daemon_routes.cjs');
 // Run against the explicitly owned real-runtime fixture, never a deployed daemon.
 const playwrightModule = process.env.PLAYWRIGHT_MODULE || 'playwright';
 const {chromium} = require(playwrightModule);
@@ -13,7 +14,7 @@ const sizes = [[1440,1000],[360,800],[412,915],[344,882],[768,900],[800,1280],[1
 const sanitize = text => String(text).replace(/([?&]token=)[^\s&"']+/g, '$1[redacted]').replace(/(cookie: )[^\n]+/gi, '$1[redacted]');
 
 (async () => {
-  const fixture = JSON.parse(await fs.readFile(path.join(fixtureRoot, 'ready.json'), 'utf8'));
+  let fixture = JSON.parse(await fs.readFile(path.join(fixtureRoot, 'ready.json'), 'utf8'));
   const apiUrl = new URL(fixture.apiUrl);
   assert.equal(apiUrl.hostname, '127.0.0.1');
   assert(!['3080','8100','8101','8102'].includes(apiUrl.port));
@@ -21,6 +22,7 @@ const sanitize = text => String(text).replace(/([?&]token=)[^\s&"']+/g, '$1[reda
   const browserProfile = await fs.mkdtemp(path.join(output, 'chromium-profile-'));
   let context;
   let page;
+  let removeProjectRoutes;
   const errors = [];
   const results = [];
   const bridgeMessages = [];
@@ -30,6 +32,7 @@ const sanitize = text => String(text).replace(/([?&]token=)[^\s&"']+/g, '$1[reda
       channel:'chrome', viewport:{width:1440,height:1000}, hasTouch:true,
     });
     page = context.pages()[0];
+    removeProjectRoutes = await routeProjects(page, fixture);
     await page.addLocatorHandler(
       page.frameLocator('.project-frame[data-active="true"]').getByRole('button', {name:'Continue',exact:true}),
       async button => { await button.click(); },
@@ -82,17 +85,37 @@ const sanitize = text => String(text).replace(/([?&]token=)[^\s&"']+/g, '$1[reda
     results.push({check:'native-restart-retains-frame-root-route-and-draft',passed:true});
   }
   async function runSelectedAction(project,label) {
-    const receipt = page.waitForResponse(response => response.url() === new URL(`/api/projects/${project.id}/operations`, fixture.controlUrl).href && response.request().method() === 'POST');
+    const actions = {'Restart DSH': ['restart_dsh', 'restart'], 'Stop DSH': ['stop_dsh', 'stop'], 'Launch DSH': ['launch_dsh', 'start']};
+    const [action, processAction] = actions[label];
+    const operation = {id: crypto.randomUUID(), project_id: project.id, request_id: null,
+      action: {restart_dsh: "DSH restart", stop_dsh: "DSH stop", launch_dsh: "DSH launch"}[action], state: 'accepted', accepted_at: Date.now(), finished_at: null, error: null};
+    const endpoint = new URL(`/api/projects/${project.id}/operations`, fixture.controlUrl).href;
+    const submit = async route => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      const request = route.request().postDataJSON();
+      assert.equal(request.action, action);
+      assert.match(request.request_id, /^[0-9a-f-]{36}$/);
+      await route.fulfill({status: 202, json: {...operation, request_id: request.request_id}, headers: {'cache-control': 'no-store'}});
+    };
+    await page.route(endpoint, submit);
+    const receipt = page.waitForResponse(response => response.url() === endpoint && response.request().method() === 'POST');
     await page.locator('#project-actions').click();
     await page.locator('#action-list').getByRole('button', {name:label,exact:true}).click();
     if (await page.locator('#confirmation-dialog').isVisible()) await page.locator('#confirm-action').click();
-    const operation = await (await receipt).json();
-    await expect.poll(async () => {
-      const response = await context.request.get(`${fixture.apiUrl}/api/projects/${project.id}/operations`);
-      const snapshot = await response.json();
-      return [snapshot.active, ...snapshot.recent].find(item => item?.id === operation.id)?.state;
-    }, {timeout:30000}).toBe('succeeded');
+    const accepted = await (await receipt).json();
+    fixture = await controlProjectProcess(fixtureRoot, project, processAction);
+    await removeProjectRoutes();
+    const finished = {...accepted, state: 'succeeded', finished_at: Date.now()};
+    const snapshots = {[project.id]: {daemon_instance_id: project.view.daemon_instance_id, active: null, recent: [finished]}};
+    removeProjectRoutes = await routeProjects(page, fixture, snapshots);
+    await page.unroute(endpoint, submit);
+    await expect.poll(() => page.evaluate(async url => {
+      const snapshot = await (await fetch(url)).json();
+      return snapshot.recent[0]?.state;
+    }, endpoint)).toBe("succeeded");
     await page.getByRole('button', {name:'Close Project actions',exact:true}).click();
+    await page.locator('#refresh-projects').click();
+    await expect(page.locator('#refresh-projects')).toBeEnabled();
   }
   async function fillDraft(text) {
     const editor = active().locator('[data-composer-input]');

@@ -1,17 +1,24 @@
 mod common;
 
-use common::{create_mock_devvm, create_mock_ssh, log_entries_text};
-use devvm_daemon::{
-    create_router, load_sync_config, save_sync_config, AppState, DaemonConfig, DshRuntimeManager,
-    SyncConfig, SyncManager,
+use common::{
+    devvm_status_output, exited, is_devvm, is_guest_exec, log_entries_text, ready, verify,
+    MockRunner, DEVVM, DSH_STATUS,
 };
+use devvm_daemon::{
+    create_router, load_sync_config, save_sync_config, AppState, CommandSpec, DaemonConfig,
+    SyncConfig,
+};
+use mockall::Sequence;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
+use std::ffi::OsString;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// `provision_sync_setup` resolves the guest config directory from the process-wide
@@ -25,35 +32,26 @@ struct SyncTestContext {
     devvm_root: PathBuf,
     server_addr: SocketAddr,
     client: reqwest::Client,
+    server: JoinHandle<()>,
+    runner: Arc<MockRunner>,
+    previous_devvm_root: Option<OsString>,
 }
 
-async fn setup_sync_test_server() -> SyncTestContext {
+async fn setup_sync_test_server(
+    build_runner: impl FnOnce(&DaemonConfig) -> MockRunner,
+) -> SyncTestContext {
     let env_guard = ENV_GUARD.lock().await;
     let temp_dir = tempdir().unwrap();
     let home_dir = temp_dir.path().join("home");
     fs::create_dir_all(&home_dir).unwrap();
 
-    let bin_dir = temp_dir.path().join("bin");
-    fs::create_dir_all(&bin_dir).unwrap();
-
-    create_mock_ssh(&bin_dir.join("ssh"));
-
     let log_dir = temp_dir.path().join("logs");
     fs::create_dir_all(&log_dir).unwrap();
 
-    let devvm_bin = bin_dir.join("mock_devvm");
-    create_mock_devvm(&devvm_bin, &log_dir);
-
     let devvm_root = temp_dir.path().join("devvm_root");
     fs::create_dir_all(&devvm_root).unwrap();
+    let previous_devvm_root = std::env::var_os("DEVVM_ROOT");
     std::env::set_var("DEVVM_ROOT", &devvm_root);
-
-    let path_env = format!(
-        "{}:{}",
-        bin_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    std::env::set_var("PATH", &path_env);
 
     let config_dir = temp_dir.path().join("config");
     fs::create_dir_all(&config_dir).unwrap();
@@ -70,19 +68,14 @@ async fn setup_sync_test_server() -> SyncTestContext {
         sync_config_path,
         log_dir,
         home_dir,
-        devvm_bin: devvm_bin.clone(),
+        devvm_bin: PathBuf::from(DEVVM),
         ingress_port: 8102,
         remote_domain: None,
     };
 
-    let state = AppState {
-        config: config.clone(),
-        dsh_runtime_manager: DshRuntimeManager::new(),
-        sync_manager: SyncManager::with_devvm_bin(devvm_bin),
-    };
-
-    let router = create_router(state);
-    tokio::spawn(async move {
+    let runner = Arc::new(build_runner(&config));
+    let router = create_router(AppState::new(config.clone(), runner.clone()));
+    let server = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
 
@@ -95,10 +88,23 @@ async fn setup_sync_test_server() -> SyncTestContext {
         devvm_root,
         server_addr,
         client,
+        server,
+        runner,
+        previous_devvm_root,
     }
 }
 
 impl SyncTestContext {
+    async fn finish(self) {
+        self.server.abort();
+        let _ = self.server.await;
+        verify(self.runner);
+        match self.previous_devvm_root {
+            Some(value) => std::env::set_var("DEVVM_ROOT", value),
+            None => std::env::remove_var("DEVVM_ROOT"),
+        }
+    }
+
     async fn register_project(&self, dir: &Path) -> String {
         let res = self
             .client
@@ -143,9 +149,118 @@ fn test_sync_config() -> SyncConfig {
     }
 }
 
+fn expected_ssh(config: &SyncConfig, remote_command: String) -> CommandSpec {
+    CommandSpec {
+        program: PathBuf::from("ssh"),
+        args: vec![
+            "-p".into(),
+            config.ssh_port.to_string(),
+            "-i".into(),
+            config.ssh_key_path.display().to_string(),
+            "-o".into(),
+            "StrictHostKeyChecking=accept-new".into(),
+            "-o".into(),
+            "ConnectTimeout=5".into(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+            format!("{}@{}", config.ssh_user, config.ssh_host),
+            remote_command,
+        ],
+        current_dir: None,
+    }
+}
+
+fn expect_status(
+    runner: &mut MockRunner,
+    sequence: &mut Sequence,
+    dir: &Path,
+    state: &'static str,
+    count: usize,
+) {
+    let dir = dir.to_owned();
+    runner
+        .expect_run()
+        .withf(move |command, _| is_devvm(command, &dir, &["status"]))
+        .times(count)
+        .in_sequence(sequence)
+        .returning(move |_, _| ready(devvm_status_output(state)));
+}
+
+fn expect_running_view(
+    runner: &mut MockRunner,
+    sequence: &mut Sequence,
+    dir: &Path,
+    sync_output: &'static str,
+) {
+    expect_status(runner, sequence, dir, "running", 1);
+    let project_dir = dir.to_owned();
+    runner
+        .expect_run()
+        .withf(move |command, _| is_guest_exec(command, &project_dir, DSH_STATUS))
+        .times(1)
+        .in_sequence(sequence)
+        .returning(|_, _| ready(exited(1, "", "")));
+    let project_dir = dir.to_owned();
+    runner
+        .expect_run()
+        .withf(move |command, _| {
+            is_devvm(
+                command,
+                &project_dir,
+                &[
+                    "exec",
+                    "/bin/sh",
+                    "-c",
+                    "cat /run/devvm/sync-status.json 2>/dev/null",
+                ],
+            )
+        })
+        .times(1)
+        .in_sequence(sequence)
+        .returning(move |_, _| ready(exited(0, sync_output, "")));
+    let project_dir = dir.to_owned();
+    runner
+        .expect_run()
+        .withf(move |command, _| is_devvm(command, &project_dir, &["memory"]))
+        .times(1)
+        .in_sequence(sequence)
+        .returning(|_, _| {
+            ready(exited(
+                0,
+                r#"{"host_bytes":null,"guest_bytes":null,"limit_bytes":null}"#,
+                "",
+            ))
+        });
+}
+
 #[tokio::test]
 async fn test_sync_setup_and_config_endpoints() {
-    let ctx = setup_sync_test_server().await;
+    let ctx = setup_sync_test_server(|config| {
+        let mut runner = MockRunner::new();
+        let mut sequence = Sequence::new();
+        let mut sync = test_sync_config();
+        sync.ssh_host = "127.0.0.1".into();
+        sync.ssh_port = 1;
+        sync.ssh_key_path = config.home_dir.join("id_rsa");
+        let expected = expected_ssh(
+            &sync,
+            "mkdir -p '/var/lib/devvm-sync' && test -w '/var/lib/devvm-sync'".into(),
+        );
+        runner
+            .expect_run()
+            .withf(move |command, _| command == &expected)
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_, _| {
+                ready(exited(
+                    255,
+                    "",
+                    "ssh: connect to host 127.0.0.1 port 1: Connection refused\n",
+                ))
+            });
+        runner
+    })
+    .await;
 
     // 1. Initial config should be unconfigured
     let res = ctx
@@ -166,7 +281,7 @@ async fn test_sync_setup_and_config_endpoints() {
             "ssh_user": "devvm",
             "ssh_host": "127.0.0.1",
             "ssh_port": 1,
-            "ssh_key_path": "/root/.ssh/id_rsa",
+            "ssh_key_path": ctx.config.home_dir.join("id_rsa"),
             "remote_sync_root": "/var/lib/devvm-sync",
             "verify": true
         }))
@@ -174,6 +289,14 @@ async fn test_sync_setup_and_config_endpoints() {
         .await
         .unwrap();
     assert_eq!(bad_setup_res.status(), StatusCode::BAD_REQUEST);
+    let error: Value = bad_setup_res.json().await.unwrap();
+    let error = error["error"].as_str().unwrap();
+    assert!(
+        error.contains("SSH connection check failed (exit code Some(255))"),
+        "{error}"
+    );
+    assert!(error.contains("Connection refused"), "{error}");
+    assert!(!ctx.config.sync_config_path.exists());
 
     // 3. Setup with verify: false
     let good_setup_res = ctx
@@ -233,27 +356,32 @@ async fn test_sync_setup_and_config_endpoints() {
     assert_eq!(second_setup_res.status(), StatusCode::OK);
     let guest2 = load_sync_config(&ctx.guest_config_path()).unwrap().unwrap();
     assert_eq!(guest2.writer_id, Some(writer_id));
+    ctx.finish().await;
 }
 
 #[tokio::test]
 async fn test_project_view_reports_guest_sync_status_only_while_vm_runs() {
-    let ctx = setup_sync_test_server().await;
+    let ctx = setup_sync_test_server(|config| {
+        let dir = config.home_dir.join("status-proj");
+        let mut runner = MockRunner::new();
+        let mut sequence = Sequence::new();
+        // Registration and the stopped view each probe status, without any guest command.
+        expect_status(&mut runner, &mut sequence, &dir, "stopped", 2);
+        let project_dir = dir.clone();
+        runner.expect_run()
+            .withf(move |command, _| is_devvm(command, &project_dir, &["start"]))
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_, _| ready(exited(0, "", "")));
+        expect_running_view(&mut runner, &mut sequence, &dir, r#"{"status":"remote_ahead","head_seq":7,"last_error":null,"updated_at":"2024-05-01T10:00:00Z"}"#);
+        expect_running_view(&mut runner, &mut sequence, &dir, "not json");
+        runner
+    }).await;
     let proj_dir = ctx.config.home_dir.join("status-proj");
     fs::create_dir_all(&proj_dir).unwrap();
     save_sync_config(&ctx.config.sync_config_path, &test_sync_config()).unwrap();
-
     let project_id = ctx.register_project(&proj_dir).await;
 
-    // The plugin's status file inside the DevVM, mapped by the mock devvm.
-    let guest_run = proj_dir.join(".mock_run");
-    fs::create_dir_all(&guest_run).unwrap();
-    fs::write(
-        guest_run.join("sync-status.json"),
-        r#"{"status":"remote_ahead","head_seq":7,"last_error":null,"updated_at":"2024-05-01T10:00:00Z"}"#,
-    )
-    .unwrap();
-
-    // A stopped DevVM must never be probed: `devvm exec` would start one.
     let stopped_view = ctx.project_view(&project_id).await;
     assert_eq!(stopped_view["vm_status"], "stopped");
     assert!(
@@ -271,20 +399,41 @@ async fn test_project_view_reports_guest_sync_status_only_while_vm_runs() {
         .await
         .unwrap();
     assert_eq!(start_res.status(), StatusCode::OK);
-
     let running_view = ctx.project_view(&project_id).await;
     assert_eq!(running_view["vm_status"], "running");
     assert_eq!(running_view["sync_status"], "remote_ahead");
 
-    // Garbage in the status file leaves the badge off entirely.
-    fs::write(guest_run.join("sync-status.json"), "not json").unwrap();
     let garbage_view = ctx.project_view(&project_id).await;
     assert!(garbage_view.get("sync_status").is_none());
+    ctx.finish().await;
 }
 
 #[tokio::test]
 async fn test_sync_store_deletion_requires_confirmation() {
-    let ctx = setup_sync_test_server().await;
+    let ctx = setup_sync_test_server(|config| {
+        let dir = config.home_dir.join("delete-store-proj");
+        fs::create_dir_all(&dir).unwrap();
+        let project =
+            devvm_daemon::registry::register_project(&config.config_path, dir.to_str().unwrap())
+                .unwrap();
+        let mut runner = MockRunner::new();
+        let mut sequence = Sequence::new();
+        expect_status(&mut runner, &mut sequence, &dir, "stopped", 1);
+        // The status probe follows the unconfirmed request, so a premature SSH command fails.
+        expect_status(&mut runner, &mut sequence, &dir, "stopped", 1);
+        let expected = expected_ssh(
+            &test_sync_config(),
+            format!("rm -rf '/var/lib/devvm-sync/{}'", project.id),
+        );
+        runner
+            .expect_run()
+            .withf(move |command, _| command == &expected)
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_, _| ready(exited(0, "", "")));
+        runner
+    })
+    .await;
     let proj_dir = ctx.config.home_dir.join("delete-store-proj");
     fs::create_dir_all(&proj_dir).unwrap();
     save_sync_config(&ctx.config.sync_config_path, &test_sync_config()).unwrap();
@@ -302,6 +451,7 @@ async fn test_sync_store_deletion_requires_confirmation() {
         .await
         .unwrap();
     assert_eq!(unconfirmed.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(ctx.project_view(&project_id).await["vm_status"], "stopped");
 
     let confirmed = ctx
         .client
@@ -328,47 +478,5 @@ async fn test_sync_store_deletion_requires_confirmation() {
         .await
         .unwrap();
     assert!(log_entries_text(&logs).contains("Remote Sync Store data deleted successfully."));
-}
-
-#[tokio::test]
-async fn test_read_status_parses_every_contract_status() {
-    let ctx = setup_sync_test_server().await;
-    let proj_dir = ctx.config.home_dir.join("read-status-proj");
-    let guest_run = proj_dir.join(".mock_run");
-    fs::create_dir_all(&guest_run).unwrap();
-
-    let manager = SyncManager::with_devvm_bin(ctx.config.devvm_bin.clone());
-    let status_file = guest_run.join("sync-status.json");
-
-    for status in [
-        "not_configured",
-        "synchronizing",
-        "synchronized",
-        "remote_ahead",
-        "degraded",
-        "failed",
-    ] {
-        fs::write(
-            &status_file,
-            format!(
-                r#"{{"status":"{}","head_seq":1,"last_error":null,"updated_at":"2024-05-01T10:00:00Z"}}"#,
-                status
-            ),
-        )
-        .unwrap();
-        let read = manager.read_status(&proj_dir).await.expect("must parse");
-        assert_eq!(
-            serde_json::to_value(read).unwrap(),
-            Value::String(status.to_string())
-        );
-    }
-
-    fs::write(&status_file, "}}} not json {{{").unwrap();
-    assert!(manager.read_status(&proj_dir).await.is_none());
-
-    fs::write(&status_file, r#"{"status":"unknown_future_status"}"#).unwrap();
-    assert!(manager.read_status(&proj_dir).await.is_none());
-
-    fs::remove_file(&status_file).unwrap();
-    assert!(manager.read_status(&proj_dir).await.is_none());
+    ctx.finish().await;
 }

@@ -1,3 +1,4 @@
+const {routeProjects, controlProjectProcess} = require('./project_app_daemon_routes.cjs');
 // Real preferences over local and non-loopback origins in an owned native fixture.
 const playwrightModule = process.env.PLAYWRIGHT_MODULE || 'playwright';
 const {chromium} = require(playwrightModule);
@@ -20,6 +21,7 @@ const sanitize = text => String(text).replace(/([?&]token=)[^\s&"']+/g, '$1<REDA
   const browser = await chromium.launch({channel: 'chrome', args: ['--host-resolver-rules=MAP *.devvm.test 127.0.0.1']});
   let context = await browser.newContext({viewport: {width: 1280, height: 900}, locale: 'en-US'});
   let page = await context.newPage();
+  await routeProjects(page, fixture);
   const results = [];
   const check = async (name, run) => {
     try { await run(); results.push({name, passed: true}); }
@@ -76,8 +78,8 @@ const sanitize = text => String(text).replace(/([?&]token=)[^\s&"']+/g, '$1<REDA
     await waitStored();
     results.push({name: 'loopback choices commit to the actual profile', passed: true});
     async function remoteUrl() {
-      const projects = await (await context.request.get(`${fixture.apiUrl}/api/projects`)).json();
-      const record = projects.find(record => record.id === project.id);
+      const ready = JSON.parse(await fs.readFile(path.join(root, 'ready.json'), 'utf8'));
+      const record = ready.projects.find(record => record.id === project.id).view;
       const url = new URL(record.links.local_dsh_url);
       url.hostname = `settings.${record.project_host}.devvm.test`;
       url.port = fixture.ingressPort;
@@ -108,12 +110,7 @@ const sanitize = text => String(text).replace(/([?&]token=)[^\s&"']+/g, '$1<REDA
     await check('offline state retains displayed choices', () => current(page));
     await context.setOffline(false);
     await check('reconnect retains saved choices', () => current(page));
-    const response = await context.request.post(`${fixture.apiUrl}/api/projects/${project.id}/dsh/restart`);
-    assert(response.ok(), 'Owned runtime restart failed.');
-    await expect.poll(async () => {
-      const records = await (await context.request.get(`${fixture.apiUrl}/api/projects`)).json();
-      return records.find(record => record.id === project.id).dsh_status;
-    }, {timeout: 30000}).toBe('running');
+    await controlProjectProcess(root, project, 'restart');
     await loadRemote(await remoteUrl());
     await check('runtime restart retains saved choices', () => current(page));
     await waitStored();

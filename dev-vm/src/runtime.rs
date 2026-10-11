@@ -1,14 +1,10 @@
 use crate::config::DaemonConfig;
-use crate::lifecycle::{command_output, LifecycleError, Operations};
+use crate::lifecycle::{LifecycleError, Operations};
 use crate::logs::{append_log, append_log_logged};
 use crate::models::{DshStatus, VmStatus};
-use crate::runner::{
-    check_vm_status, check_vm_status_with_cancel, log_command_failure, log_command_spawn_failure,
-    run_vm_delete, run_vm_start, run_vm_stop,
-};
+use crate::runner::{log_command_failure, log_command_spawn_failure, Devvm};
 use crate::urls::validate_domain;
 use std::path::Path;
-use std::process::Stdio;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -119,25 +115,18 @@ impl LifecycleAction {
 
 /// The DevVM owns DSH state. This manager coordinates commands, never caches or
 /// manufactures runtime status from an HTTP request's progress.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct DshRuntimeManager {
+    devvm: Devvm,
     operations: Operations,
 }
 
 impl DshRuntimeManager {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub async fn get_status(
-        &self,
-        config: &DaemonConfig,
-        project_id: Uuid,
-        project_path: &Path,
-    ) -> DshStatus {
-        let vm_status = check_vm_status(config, project_path).await;
-        self.get_status_for_vm(config, project_id, project_path, vm_status)
-            .await
+    pub fn new(devvm: Devvm) -> Self {
+        Self {
+            devvm,
+            operations: Operations::default(),
+        }
     }
 
     pub(crate) async fn get_status_for_vm(
@@ -154,7 +143,7 @@ impl DshRuntimeManager {
             VmStatus::Running => {}
             _ => return DshStatus::Unknown,
         }
-        let status = probe_dsh(config, project_path).await;
+        let status = probe_dsh(&self.devvm, project_path).await;
         if status == DshStatus::Stopped {
             // The DevVM owns DSH and its token file; when the guest probe finds no live DSH the
             // daemon drops its copy so no stale token ever authenticates a stopped runtime.
@@ -234,8 +223,13 @@ impl DshRuntimeManager {
     ) -> Result<(), String> {
         let manager = self;
         let config = &owned_config;
+        let devvm = &manager.devvm;
         match action {
-            LifecycleAction::StartVm => run_vm_start(config, project_id, &path, &cancel).await,
+            LifecycleAction::StartVm => {
+                devvm
+                    .run_lifecycle(config, project_id, &path, "start", &cancel)
+                    .await
+            }
             LifecycleAction::LaunchDsh => {
                 manager.run_launch(config, project_id, &path, &cancel).await
             }
@@ -250,11 +244,14 @@ impl DshRuntimeManager {
                 if let Err(error) = manager.run_stop(config, project_id, &path, &cancel).await {
                     append_log_logged(&config.log_dir, project_id, "daemon:error", &error);
                 }
-                if matches!(action, LifecycleAction::StopVm) {
-                    run_vm_stop(config, project_id, &path, &cancel).await
+                let subcmd = if matches!(action, LifecycleAction::StopVm) {
+                    "stop"
                 } else {
-                    run_vm_delete(config, project_id, &path, &cancel).await
-                }
+                    "rm"
+                };
+                devvm
+                    .run_lifecycle(config, project_id, &path, subcmd, &cancel)
+                    .await
             }
         }
     }
@@ -266,7 +263,7 @@ impl DshRuntimeManager {
         project_path: &Path,
         cancel: &CancellationToken,
     ) -> Result<(), String> {
-        if check_vm_status_with_cancel(config, project_path, cancel).await != VmStatus::Running {
+        if self.devvm.status(project_path, cancel).await != VmStatus::Running {
             append_log(
                 &config.log_dir,
                 project_id,
@@ -274,7 +271,9 @@ impl DshRuntimeManager {
                 "DevVM is not running. Starting DevVM before launching DSH...",
             )
             .map_err(|error| error.to_string())?;
-            run_vm_start(config, project_id, project_path, cancel).await?;
+            self.devvm
+                .run_lifecycle(config, project_id, project_path, "start", cancel)
+                .await?;
         }
 
         append_log(
@@ -290,7 +289,7 @@ impl DshRuntimeManager {
         // Stale pid and token state is removed by the snippet itself, only on an actual
         // launch; an idempotent relaunch must not wipe the token the running DSH emitted.
         run_guest_command(
-            config,
+            &self.devvm,
             project_path,
             &launch_command(config, project_id)?,
             "Starting DSH inside DevVM",
@@ -307,7 +306,7 @@ impl DshRuntimeManager {
         cancel: &CancellationToken,
     ) -> Result<(), String> {
         // A stopped DevVM has no DSH Runtime, and `devvm exec` would start the DevVM to look.
-        match check_vm_status_with_cancel(config, project_path, cancel).await {
+        match self.devvm.status(project_path, cancel).await {
             VmStatus::Stopped => {
                 let _ = self.remove_token(config, project_id);
                 return Ok(());
@@ -319,7 +318,7 @@ impl DshRuntimeManager {
         append_log_logged(&config.log_dir, project_id, "daemon", "DSH stop requested");
         let stop_command = DSH_STOP_COMMAND.replace("{project_id}", &project_id.to_string());
         let result = run_guest_command(
-            config,
+            &self.devvm,
             project_path,
             &stop_command,
             "Stopping DSH inside DevVM",
@@ -350,24 +349,24 @@ fn launch_command(config: &DaemonConfig, project_id: Uuid) -> Result<String, Str
 }
 
 /// The guest distinguishes a live runtime still starting from one that emitted its ready URL.
-async fn probe_dsh(config: &DaemonConfig, project_path: &Path) -> DshStatus {
-    let command = guest_command(config, project_path, DSH_STATUS_COMMAND);
-    match command_output(command, &CancellationToken::new()).await {
+async fn probe_dsh(devvm: &Devvm, project_path: &Path) -> DshStatus {
+    let args = guest_args(DSH_STATUS_COMMAND);
+    match devvm
+        .output(project_path, args.clone(), &CancellationToken::new())
+        .await
+    {
         Ok(output) if output.status.success() => DshStatus::Running,
         Ok(output) if output.status.code() == Some(2) => DshStatus::Starting,
         Ok(output) if output.status.code() == Some(1) => DshStatus::Stopped,
         Ok(_) => DshStatus::Unknown,
         Err(error) => {
-            log_command_spawn_failure(
-                &config.devvm_bin.display().to_string(),
-                &guest_args(DSH_STATUS_COMMAND),
-                &error,
-            );
+            log_command_spawn_failure(&devvm.program(), &args, &error);
             DshStatus::Unknown
         }
     }
 }
 
+/// `devvm exec` arguments that run `snippet` with bash inside the guest.
 fn guest_args(snippet: &str) -> Vec<String> {
     vec![
         "exec".to_string(),
@@ -377,35 +376,18 @@ fn guest_args(snippet: &str) -> Vec<String> {
     ]
 }
 
-fn guest_command(
-    config: &DaemonConfig,
-    project_path: &Path,
-    snippet: &str,
-) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(&config.devvm_bin);
-    command
-        .arg("exec")
-        .arg("/bin/bash")
-        .arg("-c")
-        .arg(snippet)
-        .current_dir(project_path)
-        .stdin(Stdio::null());
-    command
-}
-
 async fn run_guest_command(
-    config: &DaemonConfig,
+    devvm: &Devvm,
     project_path: &Path,
     snippet: &str,
     context: &str,
     cancel: &CancellationToken,
 ) -> Result<(), String> {
-    let program = config.devvm_bin.display().to_string();
     let args = guest_args(snippet);
-    let output = match command_output(guest_command(config, project_path, snippet), cancel).await {
+    let output = match devvm.output(project_path, args.clone(), cancel).await {
         Ok(output) => output,
         Err(error) => {
-            log_command_spawn_failure(&program, &args, &error);
+            log_command_spawn_failure(&devvm.program(), &args, &error);
             return Err(format!("{}: {}", context, error));
         }
     };
@@ -414,7 +396,7 @@ async fn run_guest_command(
         return Ok(());
     }
 
-    log_command_failure(&program, &args, &output);
+    log_command_failure(&devvm.program(), &args, &output);
     Err(format!(
         "{} exited with status {:?}: {}",
         context,
@@ -429,8 +411,10 @@ mod tests {
 
     #[test]
     fn test_launch_command_provisions_configured_control_domain() {
-        let mut config = crate::config::DaemonConfig::default();
-        config.remote_domain = Some("risak.dev".into());
+        let mut config = crate::config::DaemonConfig {
+            remote_domain: Some("risak.dev".into()),
+            ..Default::default()
+        };
         let command = super::launch_command(&config, uuid::Uuid::nil()).unwrap();
         assert!(command.contains("export DEVVM_CONTROL_DOMAIN='risak.dev'"));
         assert!(command.contains("https://devvm.risak.dev"));

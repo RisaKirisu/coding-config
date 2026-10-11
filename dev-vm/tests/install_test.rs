@@ -423,453 +423,375 @@ fn test_service_installation_with_custom_host_and_default_host() {
     assert!(content_custom.contains("devvm-daemon serve --port 8100 --host 127.0.0.1"));
 }
 
+// Real Bash sources the production functions without running setup or a VM.
+fn script_function(script: &str, body: &str, args: &[&str], stdin: &str) -> Vec<String> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let temp = tempdir().unwrap();
+    let mut child = Command::new("bash")
+        .args(["-c", &format!("source \"$1\"; shift; {body}"), "test"])
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(script))
+        .args(args)
+        .current_dir(temp.path())
+        .env("HOME", temp.path())
+        .env("DEVVM_HOME", temp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{script}: {body}: {output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    if stdout.contains('\0') {
+        stdout.split_terminator('\0').map(str::to_owned).collect()
+    } else {
+        stdout.lines().map(str::to_owned).collect()
+    }
+}
+
 #[test]
-fn test_devvm_start_is_idempotent_and_exec_reuses_running_machine() {
-    use std::os::unix::fs::PermissionsExt;
+fn test_scripts_can_be_sourced_without_actions() {
+    for script in ["devvm", "setup-devvm.sh"] {
+        assert_eq!(
+            script_function(
+                script,
+                "printf '%s\\n' sourced; test -z \"$(ls -A)\"",
+                &["start"],
+                ""
+            ),
+            ["sourced"]
+        );
+    }
+}
 
-    let temp_dir = tempdir().unwrap();
-    let bin_dir = temp_dir.path().join("bin");
-    fs::create_dir_all(&bin_dir).unwrap();
-
-    let smolvm_log = temp_dir.path().join("smolvm.log");
-    let smolvm_running = temp_dir.path().join("smolvm.running");
-    let lifecycle_events = temp_dir.path().join("lifecycle-events.log");
-
-    // Fake external CLI: expose machine state and observable dispatched operations.
-    let smolvm_script = format!(
-        r#"#!/usr/bin/env bash
-printf '%s\n' "$*" >> "{0}"
-if [[ "$1" == "machine" && "$2" == "status" ]]; then
-    if [[ -f "{1}" ]]; then
-        echo "running"
-    else
-        echo "stopped"
-    fi
-    exit 0
-fi
-if [[ "$1" == "machine" && "$2" == "create" ]]; then
-    echo "machine-create" >> "{2}"
-elif [[ "$1" == "machine" && "$2" == "start" ]]; then
-    touch "{1}"
-    echo "machine-start" >> "{2}"
-elif [[ "$*" == *"devvm-ingress"* ]]; then
-    echo "ingress-start" >> "{2}"
-elif [[ "$*" == *"link-root"* ]]; then
-    if [[ "$*" != *"CI=true DSH_HOME=/root/.dsh"* ]]; then
-        echo "[ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY] Aborted removal of modules directory due to no TTY" >&2
-        exit 1
-    fi
-    echo "profile-prepare" >> "{2}"
-fi
-exit 0
-"#,
-        smolvm_log.display(),
-        smolvm_running.display(),
-        lifecycle_events.display()
-    );
-    let smolvm_bin = bin_dir.join("smolvm");
-    fs::write(&smolvm_bin, smolvm_script).unwrap();
-    let mut perms = fs::metadata(&smolvm_bin).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&smolvm_bin, perms).unwrap();
-
-    // Fake frps script
-    let frps_bin = bin_dir.join("frps");
-    fs::write(&frps_bin, "#!/usr/bin/env bash\nsleep 10\n").unwrap();
-    let mut frps_perms = fs::metadata(&frps_bin).unwrap().permissions();
-    frps_perms.set_mode(0o755);
-    fs::set_permissions(&frps_bin, frps_perms).unwrap();
-
-    // Mock devvm home & project
-    let devvm_home = temp_dir.path().join("devvm_home");
-    fs::create_dir_all(devvm_home.join("root/.dsh/profiles/web")).unwrap();
-    fs::write(devvm_home.join("root/.dsh/profiles/web/package.json"), "{}").unwrap();
-    fs::write(devvm_home.join("smolvm.toml"), "# smolvm").unwrap();
-
-    let proj_dir = temp_dir.path().join("my-project");
-    fs::create_dir_all(&proj_dir).unwrap();
-    fs::write(
-        proj_dir.join(".devvm-id"),
-        "00000000-0000-0000-0000-000000000001\n",
-    )
-    .unwrap();
-
-    let devvm_script = Path::new(env!("CARGO_MANIFEST_DIR")).join("devvm");
-
-    let path_env = format!(
-        "{}:{}",
-        bin_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-
-    // 1. Test `devvm start`
-    let output_start = Command::new(&devvm_script)
-        .arg("start")
-        .current_dir(&proj_dir)
-        .env("PATH", &path_env)
-        .env("DEVVM_HOME", &devvm_home)
-        .env("DEVVM_ROOT", devvm_home.join("root"))
-        .env("FRPS_BIN", &frps_bin)
-        .output()
-        .expect("Failed to run devvm start");
-    assert!(
-        output_start.status.success(),
-        "devvm start failed: {:?}",
-        output_start
-    );
-
-    assert!(
-        smolvm_running.exists(),
-        "start must leave the machine running"
-    );
-    let first_events = fs::read_to_string(&lifecycle_events).unwrap();
+#[test]
+fn test_devvm_smolvm_command_arguments() {
+    // smolvm v1.19.3: README.md, docs/smolfile.md and src/cli/machine.rs.
+    // https://github.com/smol-machines/smolvm/tree/v1.19.3
+    let context = r#"NAME=dev-project-abcd1234; SMOLFILE='/vm home/smolvm.toml'; IMAGE='/vm home/image.tar'; PROJECT_HOST=project-abcd1234; PROJECT_DIR='/project dir'; DEVVM_ROOT='/vm home/root'; "#;
     assert_eq!(
-        first_events
-            .lines()
-            .filter(|line| *line == "machine-create")
-            .count(),
-        0
+        script_function("devvm", &format!("{context}smolvm_create_args"), &[], ""),
+        [
+            "machine",
+            "create",
+            "--name",
+            "dev-project-abcd1234",
+            "-s",
+            "/vm home/smolvm.toml",
+            "--net-backend",
+            "virtio-net",
+            "--image",
+            "/vm home/image.tar",
+            "-e",
+            "DEVVM_PROJECT_HOST=project-abcd1234",
+            "-v",
+            "/project dir:/root/workspace",
+            "-v",
+            "/vm home/root:/devvm-root",
+        ]
     );
+    for (function, expected) in [
+        (
+            "smolvm_start_args",
+            vec!["machine", "start", "--name", "dev-project-abcd1234"],
+        ),
+        (
+            "smolvm_stop_args",
+            vec!["machine", "stop", "--name", "dev-project-abcd1234"],
+        ),
+        (
+            "smolvm_delete_args",
+            vec!["machine", "delete", "--name", "dev-project-abcd1234", "-f"],
+        ),
+        ("smolvm_list_args", vec!["machine", "ls", "--json"]),
+    ] {
+        assert_eq!(
+            script_function("devvm", &format!("{context}{function}"), &[], ""),
+            expected
+        );
+    }
+    for (mode, flag) in [
+        ("plain", None),
+        ("stream", Some("--stream")),
+        ("interactive", Some("-it")),
+    ] {
+        let mut expected = vec!["machine", "exec"];
+        expected.extend(flag);
+        expected.extend([
+            "--name",
+            "dev-project-abcd1234",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '%s' \"$1\"",
+            "guest",
+            "a b",
+            "",
+        ]);
+        assert_eq!(
+            script_function(
+                "devvm",
+                &format!("{context}smolvm_exec_args \"$@\""),
+                &[
+                    mode,
+                    "/bin/sh",
+                    "-c",
+                    "printf '%s' \"$1\"",
+                    "guest",
+                    "a b",
+                    ""
+                ],
+                ""
+            ),
+            expected
+        );
+    }
+}
+
+#[test]
+fn test_devvm_ingress_and_guest_initialization_arguments() {
+    assert_eq!(script_function("devvm",
+        "FRPS_BIN='/bin dir/frps'; INGRESS_PORT=17007; HTTP_PORT=8102; FRPS_TIMEOUT=1800; ingress_args", &[], ""),
+        ["/bin dir/frps", "--bind-addr", "127.0.0.1", "--bind-port", "17007", "--proxy-bind-addr", "127.0.0.1", "--vhost-http-port", "8102", "--vhost-http-timeout", "1800"]);
     assert_eq!(
-        first_events
-            .lines()
-            .filter(|line| *line == "machine-start")
-            .count(),
-        1
-    );
-    assert_eq!(
-        first_events
-            .lines()
-            .filter(|line| *line == "ingress-start")
-            .count(),
-        1
+        script_function("devvm", "NAME=project; start_ingress_args", &[], ""),
+        [
+            "machine",
+            "exec",
+            "--name",
+            "project",
+            "--",
+            "/usr/local/bin/devvm-ingress"
+        ]
     );
     assert_eq!(
-        first_events
-            .lines()
-            .filter(|line| *line == "profile-prepare")
-            .count(),
-        1
+        script_function("devvm", "NAME=project; clear_crane_args", &[], ""),
+        [
+            "machine",
+            "exec",
+            "--name",
+            "project",
+            "--",
+            "/bin/bash",
+            "-c",
+            "rm -rf /storage/tmp/* && fstrim /storage"
+        ]
     );
+    for (builder, marker, required) in [
+        ("link_root_args", "link-root", "CI=true DSH_HOME=/root/.dsh dsh plugin --profile \"$name\" install --frozen-lockfile --store-dir \"$store\""),
+        ("start_cache_reclaim_args", "cache-reclaim", "reclaim_cache_above_budget </dev/null >/dev/null 2>&1 &"),
+    ] {
+        let args = script_function("devvm", &format!("NAME=project; {builder}"), &[], "");
+        assert_eq!(&args[..7], ["machine", "exec", "--name", "project", "--", "/bin/bash", "-c"]);
+        assert_eq!(args.len(), 9);
+        assert_eq!(args[8], marker);
+        assert!(args[7].contains(required), "{}", args[7]);
+        assert!(Command::new("bash").args(["-n", "-c", &args[7]]).status().unwrap().success());
+        if builder == "start_cache_reclaim_args" {
+            assert!(args[7].contains("local budget_bytes=$((512 * 1024 * 1024))"));
+            assert!(args[7].contains("while sleep 30; do"));
+            assert!(args[7].contains("/sys/fs/cgroup/memory.reclaim || true"));
+        }
+    }
+}
 
-    // 2. Repeated start is a no-op once the machine is running.
-    let events_before_repeat = fs::read_to_string(&lifecycle_events).unwrap();
-    let output_start_again = Command::new(&devvm_script)
-        .arg("start")
-        .current_dir(&proj_dir)
-        .env("PATH", &path_env)
-        .env("DEVVM_HOME", &devvm_home)
-        .env("DEVVM_ROOT", devvm_home.join("root"))
-        .env("FRPS_BIN", &frps_bin)
-        .output()
-        .expect("Failed to rerun devvm start");
-    assert!(output_start_again.status.success());
+#[test]
+fn test_devvm_machine_state_decisions() {
+    // v1.19.3 src/cli/vm_common.rs: machine_status_json/list_vms emits an array.
+    for (json, exists, running) in [
+        ("[]", "false", "false"),
+        (
+            r#"[{"name":"other","state":"running","memory_mib":8192,"pid":123}]"#,
+            "false",
+            "false",
+        ),
+        (
+            r#"[{"name":"project","state":"stopped","memory_mib":8192,"pid":null}]"#,
+            "true",
+            "false",
+        ),
+        (
+            r#"[{"name":"other","state":"stopped"},{"name":"project","state":"running","memory_mib":8192,"pid":123}]"#,
+            "true",
+            "true",
+        ),
+        (
+            r#"[{"name":"project","state":"unreachable"}]"#,
+            "true",
+            "false",
+        ),
+    ] {
+        assert_eq!(
+            script_function("devvm", "machine_exists \"$1\"", &["project"], json),
+            [exists]
+        );
+        assert_eq!(
+            script_function("devvm", "machine_running \"$1\"", &["project"], json),
+            [running]
+        );
+    }
+}
+
+#[test]
+fn test_devvm_project_identity() {
+    for (path, name) in [
+        ("/work/My Project!", "my-project"),
+        ("/work/---", "project"),
+        ("/work/Project-", "project"),
+    ] {
+        assert_eq!(
+            script_function("devvm", "project_name \"$1\"", &[path], ""),
+            [name]
+        );
+    }
     assert_eq!(
-        fs::read_to_string(&lifecycle_events).unwrap(),
-        events_before_repeat,
-        "repeated start must not dispatch lifecycle side effects"
+        script_function("devvm", "project_hash \"$1\"", &["/work/project"], ""),
+        ["65d80d2c"]
     );
-
-    // 3. Regular exec reuses the running machine and dispatches only the payload.
-    fs::write(&smolvm_log, "").unwrap();
-    let events_before_exec = fs::read_to_string(&lifecycle_events).unwrap();
-    let output_exec = Command::new(&devvm_script)
-        .args(["exec", "--", "echo", "running_guest_payload"])
-        .current_dir(&proj_dir)
-        .env("PATH", &path_env)
-        .env("DEVVM_HOME", &devvm_home)
-        .env("DEVVM_ROOT", devvm_home.join("root"))
-        .env("FRPS_BIN", &frps_bin)
-        .output()
-        .expect("Failed to run devvm exec");
-    assert!(
-        output_exec.status.success(),
-        "devvm exec failed: {output_exec:?}"
-    );
-
-    let running_log = fs::read_to_string(&smolvm_log).unwrap();
-    assert!(running_log
-        .lines()
-        .any(|line| line.ends_with("echo running_guest_payload")));
     assert_eq!(
-        fs::read_to_string(&lifecycle_events).unwrap(),
-        events_before_exec,
-        "exec on a running machine must not dispatch lifecycle side effects"
+        script_function("devvm", "machine_name \"$@\"", &["project", "abcd1234"], ""),
+        ["dev-project-abcd1234"]
+    );
+    for (length, expected) in [
+        (48, format!("{}-abcd1234", "a".repeat(48))),
+        (49, "abcd1234".into()),
+    ] {
+        assert_eq!(
+            script_function(
+                "devvm",
+                "project_host \"$@\"",
+                &[&"a".repeat(length), "abcd1234"],
+                ""
+            ),
+            [expected]
+        );
+    }
+}
+
+#[test]
+fn test_devvm_memory_json() {
+    for (host, limit, meminfo, expected) in [
+        (
+            "123456",
+            "8192",
+            "MemTotal: 8388608 kB\nMemAvailable: 7340032 kB\n",
+            r#"{"host_bytes":123456,"guest_bytes":1073741824,"limit_bytes":8589934592}"#,
+        ),
+        (
+            "",
+            "",
+            "",
+            r#"{"host_bytes":null,"guest_bytes":null,"limit_bytes":null}"#,
+        ),
+        (
+            "0",
+            "invalid",
+            "MemTotal: 100 kB\n",
+            r#"{"host_bytes":0,"guest_bytes":null,"limit_bytes":null}"#,
+        ),
+        (
+            "",
+            "0",
+            "MemTotal: 100 kB\nMemAvailable: 101 kB\n",
+            r#"{"host_bytes":null,"guest_bytes":null,"limit_bytes":0}"#,
+        ),
+        (
+            "",
+            "1",
+            "MemTotal: 100 kB\nMemAvailable: 100 kB\n",
+            r#"{"host_bytes":null,"guest_bytes":0,"limit_bytes":1048576}"#,
+        ),
+    ] {
+        assert_eq!(
+            script_function("devvm", "memory_json \"$@\"", &[host, limit], meminfo),
+            [expected]
+        );
+    }
+}
+
+#[test]
+fn test_setup_version_decisions_and_downloads() {
+    for (installed, expected) in [
+        ("", "install"),
+        ("1.19.3", "skip"),
+        ("1.12.0", "replace"),
+        ("1.20.0", "replace"),
+    ] {
+        assert_eq!(
+            script_function(
+                "setup-devvm.sh",
+                "smolvm_install_decision \"$1\"",
+                &[installed],
+                ""
+            ),
+            [expected]
+        );
+    }
+    assert_eq!(
+        script_function("setup-devvm.sh", "smolvm_installer_url", &[], ""),
+        ["https://smolmachines.com/install.sh"]
+    );
+    assert_eq!(
+        script_function("setup-devvm.sh", "smolvm_installer_args", &[], ""),
+        ["-s", "--", "--version", "1.19.3"]
+    );
+    for (os, arch) in [
+        ("linux", "amd64"),
+        ("linux", "arm64"),
+        ("darwin", "amd64"),
+        ("darwin", "arm64"),
+    ] {
+        assert_eq!(script_function("setup-devvm.sh", "frp_download_url \"$@\"", &[os, arch], ""),
+            [format!("https://github.com/fatedier/frp/releases/download/v0.71.0/frp_0.71.0_{os}_{arch}.tar.gz")]);
+    }
+    assert_eq!(
+        script_function(
+            "setup-devvm.sh",
+            r#"mkdir -p "$HOME/.smolvm"; printf ' 1.19.3\n' > "$HOME/.smolvm/.version"; installed_smolvm_version"#,
+            &[],
+            ""
+        ),
+        ["1.19.3"]
     );
 }
 
 #[test]
-fn test_setup_installs_upgrades_and_skips_current_versions() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let temp = tempdir().unwrap();
-    let home = temp.path().join("home");
-    let devvm_home = temp.path().join("devvm");
-    let fake_bin = temp.path().join("bin");
-    fs::create_dir_all(home.join(".local/bin")).unwrap();
-    fs::create_dir_all(&devvm_home).unwrap();
-    fs::create_dir_all(&fake_bin).unwrap();
-
-    fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("setup-devvm.sh"),
-        devvm_home.join("setup-devvm.sh"),
-    )
-    .unwrap();
-    fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("devvm"),
-        devvm_home.join("devvm"),
-    )
-    .unwrap();
-    fs::create_dir_all(devvm_home.join("scripts")).unwrap();
-    fs::copy(
-        "scripts/Caddyfile.host",
-        devvm_home.join("scripts/Caddyfile.host"),
-    )
-    .unwrap();
-    fs::write(devvm_home.join("smolvm.toml"), "# test\n").unwrap();
-
-    let frps = home.join(".local/bin/frps");
-    fs::write(&frps, "#!/usr/bin/env bash\nexit 0\n").unwrap();
-    fs::set_permissions(&frps, fs::Permissions::from_mode(0o755)).unwrap();
-
-    let install_log = temp.path().join("smolvm-installs.log");
-    let curl = fake_bin.join("curl");
-    fs::write(
-        &curl,
-        r#"#!/usr/bin/env bash
-if [[ "$*" == *"github.com/smol-machines/smolvm/releases/latest"* ]]; then
-    printf 'https://github.com/smol-machines/smolvm/releases/tag/v1.13.1'
-elif [[ "$*" == *"smolmachines.com/install.sh"* ]]; then
-    cat <<'INSTALLER'
-#!/usr/bin/env bash
-set -e
-version=""
-while [[ $# -gt 0 ]]; do
-    if [[ "$1" == "--version" ]]; then version="$2"; shift 2; else shift; fi
-done
-mkdir -p "$HOME/.smolvm" "$HOME/.local/bin"
-printf '%s\n' "$version" > "$HOME/.smolvm/.version"
-printf '#!/usr/bin/env bash\nprintf "smolvm %s\\n"\n' "$version" > "$HOME/.smolvm/smolvm"
-chmod +x "$HOME/.smolvm/smolvm"
-ln -sfn "$HOME/.smolvm/smolvm" "$HOME/.local/bin/smolvm"
-printf '%s\n' "$version" >> "$FAKE_SMOLVM_INSTALL_LOG"
-INSTALLER
-else
-    exit 1
-fi
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
-
-    let cargo = fake_bin.join("cargo");
-    fs::write(
-        &cargo,
-        r#"#!/usr/bin/env bash
-set -e
-mkdir -p "$DEVVM_HOME/target/release"
-printf '%s' "$FAKE_DAEMON_BUILD" > "$DEVVM_HOME/target/release/devvm-daemon"
-chmod +x "$DEVVM_HOME/target/release/devvm-daemon"
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
-
-    let path = format!(
-        "{}:{}:{}",
-        home.join(".local/bin").display(),
-        fake_bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let setup = devvm_home.join("setup-devvm.sh");
-    let run_setup = |daemon_build: &str| {
-        Command::new(&setup)
-            .arg("--skip-image")
-            .current_dir(&devvm_home)
-            .env("HOME", &home)
-            .env("DEVVM_HOME", &devvm_home)
-            .env("PATH", &path)
-            .env("FAKE_SMOLVM_INSTALL_LOG", &install_log)
-            .env("FAKE_DAEMON_BUILD", daemon_build)
-            .output()
-            .unwrap()
-    };
-
-    let first = run_setup("daemon-v1");
-    assert!(first.status.success(), "first setup failed: {first:?}");
-    assert_eq!(
-        fs::read_to_string(home.join(".smolvm/.version"))
-            .unwrap()
-            .trim(),
-        "1.19.3"
-    );
-    assert_eq!(
-        fs::read_to_string(home.join(".local/bin/devvm-daemon")).unwrap(),
-        "daemon-v1"
-    );
-
-    let second = run_setup("daemon-v1");
-    assert!(second.status.success(), "second setup failed: {second:?}");
-    assert_eq!(fs::read_to_string(&install_log).unwrap().lines().count(), 1);
-    assert_eq!(
-        fs::read_to_string(home.join(".smolvm/.version"))
-            .unwrap()
-            .trim(),
-        "1.19.3"
-    );
-    assert_eq!(
-        fs::read_to_string(home.join(".local/bin/devvm-daemon")).unwrap(),
-        "daemon-v1"
-    );
-
-    fs::write(home.join(".smolvm/.version"), "1.12.0\n").unwrap();
-    let upgrade = run_setup("daemon-v2");
-    assert!(
-        upgrade.status.success(),
-        "upgrade setup failed: {upgrade:?}"
-    );
-    assert_eq!(fs::read_to_string(&install_log).unwrap().lines().count(), 2);
-    assert_eq!(
-        fs::read_to_string(home.join(".local/bin/devvm-daemon")).unwrap(),
-        "daemon-v2"
-    );
-
-    // Service setup: ordinary --service is local-only; --remote opts into remote HTTPS
-    let command_log = temp.path().join("service-commands.log");
-    for (name, body) in [
-        (
-            "systemctl",
-            "#!/usr/bin/env bash\nprintf 'systemctl %s\\n' \"$*\" >> \"$FAKE_SERVICE_COMMAND_LOG\"\n",
-        ),
-        ("sudo", "#!/usr/bin/env bash\nexec \"$@\"\n"),
-    ] {
-        let path = fake_bin.join(name);
-        fs::write(&path, body).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+fn test_setup_service_arguments_and_start_choice() {
+    for (os, method) in [("Linux", "systemctl"), ("Darwin", "launchd")] {
+        assert_eq!(
+            script_function("setup-devvm.sh", "service_start_method \"$1\"", &[os], ""),
+            [method]
+        );
+        for domain in ["", "risak.dev", "custom.org"] {
+            let mut expected = vec!["service", "install", "--enable"];
+            if !domain.is_empty() {
+                expected.extend(["--remote-domain", domain]);
+            }
+            if os == "Darwin" {
+                expected.push("--start");
+            }
+            assert_eq!(
+                script_function(
+                    "setup-devvm.sh",
+                    "daemon_service_args \"$@\"",
+                    &[os, domain],
+                    ""
+                ),
+                expected
+            );
+        }
     }
-    let daemon_script = format!(
-        "#!/usr/bin/env bash\nprintf 'daemon %s\\n' \"$*\" >> '{}'\n",
-        command_log.display()
-    );
-
-    // 1. Local-only service setup
-    let serviced_local = Command::new(&setup)
-        .args(["--skip-image", "--service"])
-        .current_dir(&devvm_home)
-        .env("HOME", &home)
-        .env("DEVVM_HOME", &devvm_home)
-        .env("PATH", &path)
-        .env("FAKE_SMOLVM_INSTALL_LOG", &install_log)
-        .env("FAKE_DAEMON_BUILD", &daemon_script)
-        .env("FAKE_SERVICE_COMMAND_LOG", &command_log)
-        .output()
-        .unwrap();
-    assert!(
-        serviced_local.status.success(),
-        "local service setup failed: {serviced_local:?}"
-    );
-
-    let commands_local = fs::read_to_string(&command_log).unwrap();
-    assert!(commands_local.contains("daemon service install --enable"));
-    assert!(!commands_local.contains("--remote-domain"));
-    assert!(commands_local.contains("systemctl --user restart devvm-daemon.service"));
-    assert!(!home
-        .join(".config/systemd/user/devvm-daemon-dns.service")
-        .exists());
-    assert!(!devvm_home
-        .join("root/.config/devvm/Caddyfile.host")
-        .exists());
-
-    // Clear command log for next run
-    fs::write(&command_log, "").unwrap();
-
-    // 2. Opt-in remote service setup with defaults (risak.dev, 100.67.154.69)
-    let serviced_remote = Command::new(&setup)
-        .args(["--skip-image", "--service", "--remote"])
-        .current_dir(&devvm_home)
-        .env("HOME", &home)
-        .env("DEVVM_HOME", &devvm_home)
-        .env("PATH", &path)
-        .env("FAKE_SMOLVM_INSTALL_LOG", &install_log)
-        .env("FAKE_DAEMON_BUILD", &daemon_script)
-        .env("FAKE_SERVICE_COMMAND_LOG", &command_log)
-        .output()
-        .unwrap();
-    assert!(
-        serviced_remote.status.success(),
-        "remote service setup failed: {serviced_remote:?}"
-    );
-
-    let commands_remote = fs::read_to_string(&command_log).unwrap();
-    assert!(commands_remote.contains("daemon service install --enable --remote-domain risak.dev"));
-    let output = String::from_utf8_lossy(&serviced_remote.stdout);
-    assert!(output.contains(&fs::read_to_string("scripts/Caddyfile.host").unwrap()));
-    assert!(output.contains("REMOTE_DOMAIN=risak.dev REMOTE_IP=100.67.154.69"));
-    assert!(!devvm_home
-        .join("root/.config/devvm/Caddyfile.host")
-        .exists());
-
-    // 3. Remote service setup with overrides
-    fs::write(&command_log, "").unwrap();
-    let serviced_override = Command::new(&setup)
-        .args([
-            "--skip-image",
-            "--service",
-            "--remote",
-            "--remote-domain",
-            "custom.org",
-            "--remote-ip",
-            "100.64.0.1",
-        ])
-        .current_dir(&devvm_home)
-        .env("HOME", &home)
-        .env("DEVVM_HOME", &devvm_home)
-        .env("PATH", &path)
-        .env("FAKE_SMOLVM_INSTALL_LOG", &install_log)
-        .env("FAKE_DAEMON_BUILD", &daemon_script)
-        .env("FAKE_SERVICE_COMMAND_LOG", &command_log)
-        .output()
-        .unwrap();
-    assert!(
-        serviced_override.status.success(),
-        "remote override setup failed: {serviced_override:?}"
-    );
-
-    let commands_override = fs::read_to_string(&command_log).unwrap();
-    assert!(
-        commands_override.contains("daemon service install --enable --remote-domain custom.org")
-    );
-    let output = String::from_utf8_lossy(&serviced_override.stdout);
-    assert!(output.contains(
-        "REMOTE_DOMAIN=custom.org REMOTE_IP=100.64.0.1 REMOTE_DOMAIN_REGEXP=custom\\.org"
-    ));
-    assert!(!devvm_home
-        .join("root/.config/devvm/Caddyfile.host")
-        .exists());
-
-    // 4. Remote setup without --service prints config without touching system service
-    fs::write(&command_log, "").unwrap();
-    let setup_remote_only = Command::new(&setup)
-        .args(["--skip-image", "--remote"])
-        .current_dir(&devvm_home)
-        .env("HOME", &home)
-        .env("DEVVM_HOME", &devvm_home)
-        .env("PATH", &path)
-        .env("FAKE_SMOLVM_INSTALL_LOG", &install_log)
-        .env("FAKE_DAEMON_BUILD", &daemon_script)
-        .env("FAKE_SERVICE_COMMAND_LOG", &command_log)
-        .output()
-        .unwrap();
-    assert!(setup_remote_only.status.success());
-    assert!(!devvm_home
-        .join("root/.config/devvm/Caddyfile.host")
-        .exists());
-    assert!(String::from_utf8_lossy(&setup_remote_only.stdout)
-        .contains(&fs::read_to_string("scripts/Caddyfile.host").unwrap()));
-    let commands_remote_only = fs::read_to_string(&command_log).unwrap();
-    assert!(
-        !commands_remote_only.contains("daemon service install"),
-        "must not install service without --service"
+    assert_eq!(
+        script_function("setup-devvm.sh", "service_restart_args", &[], ""),
+        ["--user", "restart", "devvm-daemon.service"]
     );
 }
 
@@ -885,7 +807,7 @@ fn test_devvm_project_name_truncation() {
     let output = Command::new("bash")
         .args([
             "-c",
-            "source \"$1\" name >/dev/null; printf '%s' \"$PROJECT_HOST\"",
+            "source \"$1\"; dir=\"$(realpath \"$PWD\")\"; project_host \"$(project_name \"$dir\")\" \"$(project_hash \"$dir\")\"",
             "test",
         ])
         .arg(&devvm_bin)
@@ -893,7 +815,10 @@ fn test_devvm_project_name_truncation() {
         .output()
         .expect("Failed to compute devvm project host");
     assert!(output.status.success());
-    let host = String::from_utf8(output.stdout).unwrap();
+    let host = String::from_utf8(output.stdout)
+        .unwrap()
+        .trim_end()
+        .to_string();
     assert_eq!(host.len(), 8);
     assert_eq!(
         host,

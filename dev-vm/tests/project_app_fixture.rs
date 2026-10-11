@@ -1,12 +1,22 @@
-//! Real RC2 browser fixture over the existing isolated DevVM platform seam.
+//! Real staged DSH processes and an isolated daemon/Caddy browser carrier.
 //! Start explicitly with DEVVM_BROWSER_FIXTURE_ROOT and --ignored --nocapture.
 mod common;
 
-use common::{create_mock_devvm, CaddyGuard};
-use devvm_daemon::{create_router, AppState, DaemonConfig, DshRuntimeManager, SyncManager};
+use common::CaddyGuard;
+use devvm_daemon::models::{compute_project_host, ProjectView};
+use devvm_daemon::runner::ProcessCommandRunner;
+use devvm_daemon::{create_router, AppState, DaemonConfig};
 use serde_json::{json, Value};
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, time::Duration};
+use std::{
+    fs,
+    os::unix::process::CommandExt,
+    path::{Path, PathBuf},
+    process::{Child, Command},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::net::TcpListener;
+use uuid::Uuid;
 
 fn reserve_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -14,6 +24,141 @@ fn reserve_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+struct DshChild {
+    child: Option<Child>,
+    stage: PathBuf,
+    path: PathBuf,
+    id: Uuid,
+    port: u16,
+    origins: String,
+    remote: bool,
+    log: PathBuf,
+}
+
+impl DshChild {
+    fn start(stage: &Path, path: &Path, id: Uuid, port: u16, origins: &str, remote: bool) -> Self {
+        let log = path.join("dsh-startup.log");
+        let mut owner = Self {
+            child: None,
+            stage: stage.to_owned(),
+            path: path.to_owned(),
+            id,
+            port,
+            origins: origins.to_owned(),
+            remote,
+            log,
+        };
+        owner.launch();
+        owner
+    }
+
+    fn launch(&mut self) {
+        let mut command = Command::new("node");
+        command
+            .current_dir(&self.path)
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", self.path.join(".os-home"))
+            .env("DSH_HOME", self.path.join(".dsh-home"))
+            .env(
+                "TMPDIR",
+                std::env::current_dir().unwrap().join(".agents/tmp"),
+            )
+            .env("XDG_CONFIG_HOME", self.path.join(".os-home/.config"))
+            .env("XDG_CACHE_HOME", self.path.join(".os-home/.cache"))
+            .env("DEVVM_EMBED_PROJECT_ID", self.id.to_string())
+            .env("DEVVM_CONTROL_ORIGINS", &self.origins)
+            .env(
+                "DEVVM_CONTROL_DOMAIN",
+                if self.remote { "devvm.test" } else { "" },
+            )
+            .arg(self.stage.join("cli/lib/bin.js"))
+            .arg("embedded-browser");
+        if !self
+            .path
+            .join(".dsh-home/profiles/embedded-browser/package.json")
+            .exists()
+        {
+            command.args(["--from-default-profile", "web"]);
+        }
+        command
+            .arg("--patch")
+            .arg(self.stage.join("browser.overlay.yml"))
+            .args([
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &self.port.to_string(),
+                "--no-open",
+            ])
+            .process_group(0);
+        let output = fs::File::create(&self.log).unwrap();
+        command.stdout(output.try_clone().unwrap()).stderr(output);
+        self.child = Some(command.spawn().unwrap());
+    }
+
+    async fn launch_token(&mut self) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        loop {
+            let text = fs::read_to_string(&self.log).unwrap();
+            if let Some(line) = text
+                .lines()
+                .find(|line| line.contains("dsh web:") && line.contains("token="))
+            {
+                let url = line
+                    .split_whitespace()
+                    .find(|word| word.contains("token="))
+                    .unwrap();
+                return reqwest::Url::parse(url)
+                    .unwrap()
+                    .query_pairs()
+                    .find(|(key, _)| key == "token")
+                    .unwrap()
+                    .1
+                    .into_owned();
+            }
+            assert!(
+                self.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+                "DSH exited; see {}",
+                self.log.display()
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "DSH did not start; see {}",
+                self.log.display()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGTERM);
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while child.try_wait().unwrap().is_none() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            child.wait().unwrap();
+        }
+    }
+}
+
+impl Drop for DshChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            child.wait().unwrap();
+        }
+    }
 }
 
 #[tokio::test]
@@ -28,40 +173,23 @@ async fn serve_project_app_fixture() {
     let stage = root.parent().unwrap().join("stage");
     let remote = std::env::var("DEVVM_BROWSER_REMOTE").as_deref() == Ok("1");
     assert!(stage.join("cli/lib/bin.js").is_file());
-    let bin_dir = root.join("bin");
     let logs = root.join("logs");
-    fs::create_dir_all(&bin_dir).unwrap();
     fs::create_dir_all(&logs).unwrap();
-    let devvm = bin_dir.join("devvm");
-    create_mock_devvm(&devvm, &logs);
-    let launcher = bin_dir.join("mock_guest_bin/dsh");
-    let launcher_text = format!(
-        r#"#!/usr/bin/env bash
-set -eu
-port=$(cat "$PWD/.browser-port")
-profile_args=(embedded-browser)
-if [[ ! -f "$PWD/.dsh-home/profiles/embedded-browser/package.json" ]]; then
-  profile_args+=(--from-default-profile web)
-fi
-exec env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$PWD/.os-home" \
-  DSH_HOME="$PWD/.dsh-home" TMPDIR="{}/.agents/tmp" \
-  XDG_CONFIG_HOME="$PWD/.os-home/.config" XDG_CACHE_HOME="$PWD/.os-home/.cache" \
-  DEVVM_EMBED_PROJECT_ID="${{DEVVM_EMBED_PROJECT_ID:?}}" \
-  DEVVM_CONTROL_ORIGINS="${{DEVVM_CONTROL_ORIGINS:?}}" \
-  DEVVM_CONTROL_DOMAIN="${{DEVVM_CONTROL_DOMAIN:-}}" \
-  node "{}/cli/lib/bin.js" "${{profile_args[@]}}" \
-  --patch "{}/browser.overlay.yml" --host 127.0.0.1 --port "$port" --no-open
-"#,
-        std::env::current_dir().unwrap().display(),
-        stage.display(),
-        stage.display()
-    );
-    fs::write(&launcher, launcher_text).unwrap();
-    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
-
+    let devvm = root.join("unavailable-devvm");
+    assert!(!devvm.exists());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let ingress = reserve_port();
+    let https_port = std::net::TcpListener::bind("127.0.0.2:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let remote_origins: Vec<String> = ["devvm", "devvm-risak", "devvm--home", "devvm-3080"]
+        .iter()
+        .map(|label| format!("https://{label}.devvm.test"))
+        .collect();
+    let control_url = format!("http://control.devvm.localhost:{port}");
     let home = root.join("projects");
     fs::create_dir_all(&home).unwrap();
     let config = DaemonConfig {
@@ -75,35 +203,49 @@ exec env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$PWD/.os-home" \
         ingress_port: ingress,
         remote_domain: remote.then(|| "devvm.test".into()),
     };
-    let router = create_router(AppState {
-        config,
-        dsh_runtime_manager: DshRuntimeManager::new(),
-        sync_manager: SyncManager::new(),
-    });
+    let router = create_router(AppState::new(config, Arc::new(ProcessCommandRunner)));
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-        .unwrap();
     let api = format!("http://127.0.0.1:{port}");
+    let daemon_instance = Uuid::new_v4();
+    let mut children = Vec::new();
     let mut records = Vec::new();
     let mut routes = Vec::new();
     for name in ["Project A", "Project B"] {
         let path = home.join(name.replace(' ', "-"));
         fs::create_dir_all(path.join(".os-home")).unwrap();
         let dsh_port = reserve_port();
-        fs::write(path.join(".browser-port"), dsh_port.to_string()).unwrap();
-        let response = client
-            .post(format!("{api}/api/projects/register"))
-            .json(&json!({"path":path}))
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap();
-        let project: Value = response.json().await.unwrap();
-        let id = project["id"].as_str().unwrap();
-        let host = project["project_host"].as_str().unwrap();
+        let id = devvm_daemon::registry::register_project(
+            &root.join("registry.json"),
+            path.to_str().unwrap(),
+        )
+        .unwrap()
+        .id;
+        let host = compute_project_host(&path);
+        let mut origins = vec![control_url.clone()];
+        if remote {
+            origins.extend(remote_origins.clone());
+        }
+        let mut child = DshChild::start(
+            &stage,
+            &path,
+            id,
+            dsh_port,
+            &serde_json::to_string(&origins).unwrap(),
+            remote,
+        );
+        let token = child.launch_token().await;
+        let local_url = format!("http://3080.{host}.devvm.localhost:{ingress}/?token={token}");
+        let tailnet_url = remote.then(|| format!("https://{host}-3080.devvm.test/?token={token}"));
+        let view = json!({
+            "id":id,"path":path,"name":path.file_name().unwrap().to_str().unwrap(),"project_host":host,
+            "vm_status":"running","dsh_status":"running","sync_status":"not_configured",
+            "links":{"local_dsh_url":local_url,"tailnet_dsh_url":tailnet_url,
+                "local_port_template":format!("http://{{port}}.{host}.devvm.localhost:{ingress}"),
+                "tailnet_port_template":remote.then(|| format!("https://{host}-{{port}}.devvm.test"))},
+            "daemon_instance_id":daemon_instance,"operation":null,"last_operation":null
+        });
+        let view: ProjectView = serde_json::from_value(view).unwrap();
+        children.push(child);
         routes.push(format!(
             r#"@project_{dsh_port} host 3080.{host}.devvm.localhost settings.{host}.devvm.test
 reverse_proxy @project_{dsh_port} 127.0.0.1:{dsh_port} {{
@@ -111,14 +253,17 @@ reverse_proxy @project_{dsh_port} 127.0.0.1:{dsh_port} {{
   header_up Origin ^http://(3080\.{host}\.devvm\.localhost|settings\.{host}\.devvm\.test)(:[0-9]+)?$ http://localhost:{dsh_port}
 }}"#
         ));
-        records.push(json!({"id":id,"name":name,"host":host,"dshPort":dsh_port,"path":path}));
+        records.push(json!({"id":id,"name":name,"host":host,"dshPort":dsh_port,"path":path,"token":token,"view":view}));
     }
     let caddy_config = root.join("Caddyfile");
     let auto_https = if remote { "disable_redirects" } else { "off" };
     let mut caddy_text = format!("{{\n admin off\n auto_https {auto_https}\n skip_install_trust\n}}\nhttp://:{ingress} {{\n route {{\n{}\n respond 400\n }}\n}}\n", routes.join("\n"));
     if remote {
         let remote_routes = include_str!("../scripts/Caddyfile.host")
-            .replace("{$REMOTE_DOMAIN:risak.dev}", "devvm.test")
+            .replace(
+                "{$REMOTE_DOMAIN:risak.dev}",
+                &format!("devvm.test:{https_port}"),
+            )
             .replace("{$REMOTE_DOMAIN_REGEXP:risak\\.dev}", "devvm\\.test")
             .replace("{$REMOTE_IP:100.67.154.69}", "127.0.0.2")
             .replace(
@@ -150,27 +295,73 @@ reverse_proxy @project_{dsh_port} 127.0.0.1:{dsh_port} {{
     fs::write(
         root.join("ready.json"),
         serde_json::to_vec_pretty(&json!({
-            "controlUrl":format!("http://control.devvm.localhost:{port}"),
-            "apiUrl":api,"ingressPort":ingress,"projects":records,
-            "remoteControlUrls": remote.then(|| vec!["https://devvm.devvm.test", "https://devvm-risak.devvm.test", "https://devvm--home.devvm.test", "https://devvm-3080.devvm.test"])
+            "controlUrl":control_url,
+            "apiUrl":api,"ingressPort":ingress,"remoteTransportPort":https_port,"projects":records,
+            "remoteControlUrls": remote.then_some(remote_origins)
         }))
         .unwrap(),
     )
     .unwrap();
-    println!("Real daemon and isolated Caddy ready; no Project Runtime is started automatically.");
+    println!("Real daemon, isolated Caddy and staged Project DSH processes ready.");
+    let mut last_request = String::new();
     let mut interval = tokio::time::interval(Duration::from_millis(200));
     while !root.join("stop").exists() && tokio::time::Instant::now() < deadline {
         interval.tick().await;
-    }
-    for record in &records {
-        let id = record["id"].as_str().unwrap();
-        client
-            .post(format!("{api}/api/projects/{id}/dsh/stop"))
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
+        let request_file = root.join("process-request.json");
+        if request_file.exists() {
+            let request: Value = serde_json::from_slice(&fs::read(&request_file).unwrap()).unwrap();
+            let request_id = request["request_id"].as_str().unwrap();
+            Uuid::parse_str(request_id).unwrap();
+            if request_id == last_request {
+                continue;
+            }
+            last_request = request_id.to_owned();
+            let index = records
+                .iter()
+                .position(|record| record["id"] == request["id"])
+                .unwrap();
+            let action = request["action"].as_str().unwrap();
+            assert!(["stop", "start", "restart"].contains(&action));
+            if action != "start" {
+                children[index].stop().await;
+            }
+            if action != "stop" {
+                assert!(children[index].child.is_none());
+                children[index].launch();
+                let token = children[index].launch_token().await;
+                records[index]["token"] = json!(token);
+                for key in ["local_dsh_url", "tailnet_dsh_url"] {
+                    if let Some(url) = records[index]["view"]["links"][key].as_str() {
+                        let mut url = reqwest::Url::parse(url).unwrap();
+                        url.query_pairs_mut().clear().append_pair("token", &token);
+                        records[index]["view"]["links"][key] = json!(url.as_str());
+                    }
+                }
+            }
+            records[index]["view"]["dsh_status"] = json!(if action == "stop" {
+                "stopped"
+            } else {
+                "running"
+            });
+            let mut ready: Value =
+                serde_json::from_slice(&fs::read(root.join("ready.json")).unwrap()).unwrap();
+            ready["projects"] = json!(records);
+            fs::write(
+                root.join("ready.next.json"),
+                serde_json::to_vec_pretty(&ready).unwrap(),
+            )
             .unwrap();
+            fs::rename(root.join("ready.next.json"), root.join("ready.json")).unwrap();
+            fs::write(
+                root.join(format!("process-result-{request_id}.json")),
+                serde_json::to_vec(&ready).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+    for child in &mut children {
+        child.stop().await;
     }
     server.abort();
+    let _ = server.await;
 }

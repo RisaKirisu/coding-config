@@ -4,12 +4,14 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
+use devvm_daemon::{CommandFuture, CommandRunner, CommandSpec};
 use serde_json::json;
-use std::fs::File;
-use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::io;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
-use std::process::Child;
+use std::process::{Child, ExitStatus, Output};
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// Flattens the `entries` of `GET /api/projects/{id}/logs` into `[source] message` lines,
 /// for substring assertions over the merged Project Log.
@@ -29,180 +31,65 @@ pub fn log_entries_text(logs: &serde_json::Value) -> String {
         .join("\n")
 }
 
-/// Creates a mock `ssh` executable that succeeds unless the Sync Store looks unreachable.
-/// Placed beside the mock `devvm` binary, which is where `SystemSyncRunner` looks for ssh.
-pub fn create_mock_ssh(bin_path: &Path) {
-    let script = r#"#!/usr/bin/env bash
-if [[ -f ".mock_ssh_fail" ]] || [[ "$*" == *"127.0.0.1:1"* ]] || [[ "$*" == *"-p 1 "* ]]; then
-    echo "Mock SSH: connection refused" >&2
-    exit 255
-fi
-exit 0
-"#;
-    let mut file = File::create(bin_path).unwrap();
-    file.write_all(script.as_bytes()).unwrap();
-    let mut perms = file.metadata().unwrap().permissions();
-    perms.set_mode(0o755);
-    file.set_permissions(perms).unwrap();
+mockall::mock! {
+    /// Mock of the daemon's command boundary: tests state each `devvm`/`ssh` command they
+    /// expect and the documented output it returns.
+    pub Runner {}
+    impl CommandRunner for Runner {
+        fn run(&self, command: CommandSpec, cancel: CancellationToken) -> CommandFuture;
+    }
 }
 
-fn write_executable(path: &Path, script: &str) {
-    let mut file = File::create(path).unwrap();
-    file.write_all(script.as_bytes()).unwrap();
-    let mut perms = file.metadata().unwrap().permissions();
-    perms.set_mode(0o755);
-    file.set_permissions(perms).unwrap();
+/// The program name tests configure as `DaemonConfig::devvm_bin`.
+pub const DEVVM: &str = "devvm";
+
+/// A completed command's captured output with exit `code`.
+pub fn exited(code: i32, stdout: &str, stderr: &str) -> io::Result<Output> {
+    Ok(Output {
+        status: ExitStatus::from_raw(code << 8),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: stderr.as_bytes().to_vec(),
+    })
 }
 
-/// Creates a mock executable bash script for `devvm` CLI that simulates VM lifecycle and
-/// evaluates guest command snippets with the absolute guest paths remapped into the test's
-/// own directories, so `/tmp/devvm-daemon-dsh.pid` on the host is never touched.
-///
-/// `log_dir` is the daemon's Project log directory, which the guest sees as
-/// `/devvm-root/.project-logs`.
-pub fn create_mock_devvm(bin_path: &Path, log_dir: &Path) {
-    let guest_bin = bin_path.parent().unwrap().join("mock_guest_bin");
-    std::fs::create_dir_all(&guest_bin).unwrap();
-    // Stands in for `dsh web`: announces its URL, records the start, then blocks until killed.
-    write_executable(
-        &guest_bin.join("dsh"),
-        r#"#!/usr/bin/env bash
-if [[ "${1:-}" == "web" ]]; then
-    shift
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --no-open) shift ;;
-            *) echo "dsh web: unknown option $1" >&2; exit 1 ;;
-        esac
-    done
-    printf 'start\n' >> "$MOCK_DSH_START_COUNTER"
-    count=$(wc -l < "$MOCK_DSH_START_COUNTER")
-    token="mock-token-redacted-${count}-base64url-auth-token00"
-    echo "dsh web: http://127.0.0.1:3080/?token=${token}"
-    exec sleep 300
-fi
-exit 0
-"#,
-    );
-    write_executable(
-        &guest_bin.join("devvm-sync-startup"),
-        r#"#!/usr/bin/env bash
-echo "devvm-sync-startup: startup reconciliation done"
-exit 0
-"#,
-    );
-
-    let script = r#"#!/usr/bin/env bash
-cmd="${1:-status}"
-shift || true
-
-case "$cmd" in
-    status)
-        if [[ -f ".vm_status_fail" ]]; then
-            echo "Mock DevVM: status probe failed hard" >&2
-            exit 3
-        fi
-        if [[ -f ".vm_running" ]]; then
-            echo "Machine 'test-project': running"
-            exit 0
-        else
-            echo "stopped"
-            exit 1
-        fi
-        ;;
-    memory)
-        if [[ -f ".vm_running" ]]; then
-            echo '{"host_bytes": 1610612736, "guest_bytes": 1073741824, "limit_bytes": 8589934592}'
-            exit 0
-        else
-            exit 1
-        fi
-        ;;
-    start)
-        if [[ -f ".vm_start_slow" ]]; then
-            sleep 0.4
-        fi
-        touch ".vm_running"
-        echo "Mock DevVM: started"
-        exit 0
-        ;;
-    stop)
-        rm -f ".vm_running"
-        echo "Mock DevVM: stopped"
-        exit 0
-        ;;
-    rm|delete)
-        rm -f ".vm_running"
-        echo "Mock DevVM: removed"
-        exit 0
-        ;;
-    exec)
-        if [[ "${1:-}" == "--" ]]; then
-            shift
-        fi
-
-        VM_DSH="$PWD/.mock_dsh"
-        mkdir -p "$VM_DSH"
-        VM_RUN="$PWD/.mock_run"
-        mkdir -p "$VM_RUN"
-
-        echo "$@" >> "$PWD/.mock_exec_invocations" 2>/dev/null || true
-
-        if [[ "$1" == "/bin/sh" || "$1" == "/bin/bash" ]] && [[ "$2" == "-c" ]]; then
-            cmd_body="$3"
-            if [[ -f ".dsh_start_fail" && "$cmd_body" == *"exec dsh web"* ]]; then
-                echo "Mock DevVM: dsh could not be started" >&2
-                exit 7
-            fi
-            # Rewrite the guest workspace before inserting workspace-contained test paths.
-            # Otherwise a later replacement rewrites the TMPDIR/log paths a second time.
-            mapped_cmd="${cmd_body//\/root\/workspace/$PWD}"
-            mapped_cmd="${mapped_cmd//\/tmp\/devvm-daemon-dsh.pid/$PWD/.mock_dsh.pid}"
-            mapped_cmd="${mapped_cmd//\/tmp\/devvm-daemon-dsh.token/$PWD/.mock_dsh.token}"
-            mapped_cmd="${mapped_cmd//\/devvm-root\/.project-logs/__LOG_DIR__}"
-            mapped_cmd="${mapped_cmd//\/run\/devvm/$VM_RUN}"
-            mapped_cmd="${mapped_cmd//\/root\/.dsh/$VM_DSH}"
-            PATH="__GUEST_BIN__:$PATH" \
-                MOCK_DSH_START_COUNTER="$PWD/.mock_dsh_starts" \
-                bash -c "$mapped_cmd"
-            exit $?
-        fi
-
-        if [[ "$1" == "rsync" ]]; then
-            echo "Mock DevVM: the daemon must not invoke rsync" >&2
-            exit 1
-        fi
-
-        echo "Mock DevVM exec: $@"
-        exit 0
-        ;;
-    *)
-        echo "Unknown command: $cmd" >&2
-        exit 1
-        ;;
-esac
-"#
-    .replace("__LOG_DIR__", &log_dir.display().to_string())
-    .replace("__GUEST_BIN__", &guest_bin.display().to_string());
-
-    write_executable(bin_path, &script);
+/// A command future that resolves immediately with `result`.
+pub fn ready(result: io::Result<Output>) -> CommandFuture {
+    Box::pin(async move { result })
 }
 
-/// Number of times the mock `dsh web` actually started for a Project.
-pub fn mock_dsh_start_count(project_dir: &Path) -> usize {
-    std::fs::read_to_string(project_dir.join(".mock_dsh_starts"))
-        .map(|content| content.lines().count())
-        .unwrap_or(0)
+/// `devvm status` output for a machine in `state`.
+pub fn devvm_status_output(state: &str) -> io::Result<Output> {
+    exited(0, &format!("Machine 'dev-project-00000000': {state}\n"), "")
 }
 
-/// The isolated stand-in for the guest's `/tmp/devvm-daemon-dsh.pid`.
-pub fn mock_dsh_pid_file(project_dir: &Path) -> std::path::PathBuf {
-    project_dir.join(".mock_dsh.pid")
+/// Whether `command` is `devvm <args>` run from `project_dir`.
+pub fn is_devvm(command: &CommandSpec, project_dir: &Path, args: &[&str]) -> bool {
+    command.program == Path::new(DEVVM)
+        && command.args == args
+        && command.current_dir.as_deref() == Some(project_dir)
 }
 
-/// The isolated stand-in for the guest's `/tmp/devvm-daemon-dsh.token`.
-pub fn mock_dsh_token_file(project_dir: &Path) -> std::path::PathBuf {
-    project_dir.join(".mock_dsh.token")
+/// Whether `command` is `devvm exec /bin/bash -c <snippet>` from `project_dir` with a
+/// snippet containing `marker`.
+pub fn is_guest_exec(command: &CommandSpec, project_dir: &Path, marker: &str) -> bool {
+    command.program == Path::new(DEVVM)
+        && command.current_dir.as_deref() == Some(project_dir)
+        && command.args.len() == 4
+        && command.args[..3] == ["exec", "/bin/bash", "-c"]
+        && command.args[3].contains(marker)
+}
+
+/// Markers that identify the daemon's DSH guest snippets.
+pub const DSH_LAUNCH: &str = "exec dsh web --no-open";
+pub const DSH_STATUS: &str = "[ -s /tmp/devvm-daemon-dsh.token ] || exit 2";
+pub const DSH_STOP: &str = "did not stop";
+
+/// Checks every expectation once the server and its tasks have released the mock.
+pub fn verify(runner: Arc<MockRunner>) {
+    match Arc::try_unwrap(runner) {
+        Ok(mut runner) => runner.checkpoint(),
+        Err(_) => panic!("the command runner is still referenced; stop the server first"),
+    }
 }
 
 /// RAII Guard ensuring spawned child processes (like Caddy) are killed and reaped upon drop.

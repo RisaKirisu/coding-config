@@ -143,7 +143,7 @@ impl Operations {
         F: FnOnce(CancellationToken) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
-        let started = self.start(config, project, stopping, label, None, false, work)?;
+        let started = self.start(config, project, stopping, label, None, work)?;
         let request_guard = started.operation.cancel.clone().drop_guard();
         let result = started
             .task
@@ -167,20 +167,14 @@ impl Operations {
         F: FnOnce(CancellationToken) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
-        let started = self.start(
-            config,
-            project,
-            stopping,
-            label,
-            Some(request_id),
-            true,
-            work,
-        )?;
+        let started = self.start(config, project, stopping, label, Some(request_id), work)?;
         Ok(started.receipt)
     }
 
     /// A stop reserves its successor before cancelling active work; every caller
     /// shares this map and waits for the predecessor's complete process cleanup.
+    /// Submitted operations carry a `request_id`; no request observes their result,
+    /// so their failures are logged here.
     fn start<F, Fut>(
         &self,
         config: &DaemonConfig,
@@ -188,7 +182,6 @@ impl Operations {
         stopping: bool,
         label: &'static str,
         request_id: Option<Uuid>,
-        detached: bool,
         work: F,
     ) -> Result<StartedOperation, LifecycleError>
     where
@@ -290,7 +283,7 @@ impl Operations {
                 view.error = result.as_ref().err().map(ToString::to_string);
                 view.clone()
             };
-            if detached {
+            if request_id.is_some() {
                 if let Err(LifecycleError::Failed(error)) = &result {
                     tracing::error!(project = %project, operation = %finished.id, "{error}");
                     append_log_logged(&log_dir, project, "daemon:error", error);

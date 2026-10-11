@@ -1,9 +1,11 @@
 use clap::{Parser, Subcommand};
 use devvm_daemon::{
     create_router, default_home_dir, determine_bind_address, provision_sync_setup, AppState,
-    DaemonConfig, DshRuntimeManager, Platform, ServiceManager, SyncConfig, SyncManager,
+    CommandRunner, DaemonConfig, Devvm, Platform, ProcessCommandRunner, ServiceManager, SyncConfig,
+    SyncManager,
 };
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
@@ -271,7 +273,9 @@ async fn run_sync_setup(args: SyncSetupArgs) -> Result<(), Box<dyn std::error::E
         daemon_url: None,
     };
 
-    let sync_manager = SyncManager::new();
+    let runner: Arc<dyn CommandRunner> = Arc::new(ProcessCommandRunner);
+    let devvm = Devvm::new(DaemonConfig::new().devvm_bin, runner.clone());
+    let sync_manager = SyncManager::new(runner, devvm);
     if !args.no_verify {
         println!(
             "Verifying SSH connectivity with Sync Store at {}@{}:{}...",
@@ -321,15 +325,10 @@ async fn run_daemon(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(domain) = &config.remote_domain {
         devvm_daemon::validate_domain(domain)?;
     }
-    let dsh_runtime_manager = DshRuntimeManager::new();
-    let sync_manager = SyncManager::with_devvm_bin(config.devvm_bin.clone());
-    let state = AppState {
-        config: config.clone(),
-        dsh_runtime_manager,
-        sync_manager,
-    };
-
-    let app = create_router(state);
+    let app = create_router(AppState::new(
+        config.clone(),
+        Arc::new(ProcessCommandRunner),
+    ));
 
     let addr = determine_bind_address(args.host.as_deref(), config.port)?;
     tracing::info!("Starting DevVM Control Daemon on http://{}", addr);

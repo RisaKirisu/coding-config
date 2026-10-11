@@ -1,3 +1,4 @@
+const {routeProjects} = require('./project_app_daemon_routes.cjs');
 // Real selection and recovery regression against an owned native fixture.
 const modulePath = process.env.PLAYWRIGHT_MODULE || 'playwright';
 const {chromium} = require(modulePath);
@@ -18,6 +19,7 @@ const sanitize = text => String(text).replace(/([?&]token=)[^\s&"']+/g, '$1<REDA
   const browser = await chromium.launch({channel: 'chrome'});
   const context = await browser.newContext({viewport: {width: 1280, height: 900}});
   const page = await context.newPage();
+  await routeProjects(page, fixture);
   const messages = [];
   const failures = [];
   await page.exposeFunction('recordSessionMessage', record => messages.push(record));
@@ -87,10 +89,11 @@ const sanitize = text => String(text).replace(/([?&]token=)[^\s&"']+/g, '$1<REDA
     assert.equal(await child.evaluate(() => window.__sessionWarningDocument), documentId);
     console.log('PASS: genuinely missing target warns without creating that Session or replacing the document.');
 
-    await page.route('**/api/projects', route => route.abort());
+    const unavailableProjects = route => route.abort();
+    await page.route('**/api/projects', unavailableProjects);
     await page.locator('#refresh-projects').click();
     await expect(page.locator('#notice-text')).toHaveText('Could not refresh Project status. Control Daemon unavailable.');
-    await page.unroute('**/api/projects');
+    await page.unroute('**/api/projects', unavailableProjects);
     const other = 'session-' + crypto.randomUUID();
     await call('session/create', {request: {sessionId: other, workspaceId: workspace.workspaceId}});
     await page.evaluate(({project, session}) => {location.hash = `#/projects/${project}/sessions/${session}`; window.dispatchEvent(new PopStateEvent('popstate'));}, {project: project.id, session: other});
@@ -132,6 +135,7 @@ const sanitize = text => String(text).replace(/([?&]token=)[^\s&"']+/g, '$1<REDA
 
     const startupContext = await browser.newContext({viewport: {width: 1280, height: 900}});
     const startup = await startupContext.newPage();
+    await routeProjects(startup, fixture);
     const startupSelections = [];
     await startup.exposeFunction('recordStartupSelection', sessionId => startupSelections.push(sessionId));
     await startup.addInitScript(() => window.addEventListener('message', event => {
