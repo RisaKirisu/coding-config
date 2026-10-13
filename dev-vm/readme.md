@@ -120,7 +120,7 @@ You can also use the standalone `devvm` CLI directly from any project directory:
 | `devvm start` | Start the microVM |
 | `devvm stop` | Stop the microVM |
 | `devvm status` | Read microVM status |
-| `devvm exec -- pwd` | Run a guest command; the Project is mounted at `/root/workspace` |
+| `devvm exec -- pwd` | Run a guest command in the running microVM; the Project is mounted at `/root/workspace` |
 | `devvm rm` | Delete the microVM |
 | `devvm name` | Print the machine name |
 

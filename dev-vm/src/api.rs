@@ -204,8 +204,7 @@ async fn build_project_view(state: &AppState, record: &ProjectRecord) -> Project
     let is_configured = load_sync_config(&state.config.sync_config_path)
         .map(|c| c.is_some())
         .unwrap_or(false);
-    // `devvm exec` auto-creates and starts a DevVM, so the runner must never be called
-    // for a Project whose DevVM is not already running.
+    // Sync Status lives inside the DevVM, so it is read only while the DevVM is running.
     let sync_status = if is_configured && vm_status == crate::models::VmStatus::Running {
         state.sync_manager.read_status(&record.path).await
     } else {

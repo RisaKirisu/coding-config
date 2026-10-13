@@ -305,8 +305,6 @@ main() {
             if [[ "${1:-}" == "--" ]]; then
                 shift
             fi
-            create
-            start
             run_smolvm smolvm_exec_args stream "$@"
             ;;
 

@@ -232,7 +232,7 @@
   config:
     provider: proxy-cli-claude
     model: claude-opus-5-5
-    reasoningEffort: high
+    reasoningEffort: medium
 - id: ui-settings-general
   config:
     welcomeNoticeVersion: 2026-09-28.1

@@ -136,8 +136,8 @@ impl DshRuntimeManager {
         project_path: &Path,
         vm_status: VmStatus,
     ) -> DshStatus {
-        // `devvm exec` would create and start a DevVM, so never probe a stopped or
-        // unobservable VM. A failed VM probe is not evidence that DSH is stopped.
+        // A stopped DevVM has no DSH Runtime, so only a running VM is probed. A failed VM
+        // probe is not evidence that DSH is stopped.
         match vm_status {
             VmStatus::Stopped => return DshStatus::Stopped,
             VmStatus::Running => {}
@@ -305,7 +305,7 @@ impl DshRuntimeManager {
         project_path: &Path,
         cancel: &CancellationToken,
     ) -> Result<(), String> {
-        // A stopped DevVM has no DSH Runtime, and `devvm exec` would start the DevVM to look.
+        // A stopped DevVM has no DSH Runtime to stop.
         match self.devvm.status(project_path, cancel).await {
             VmStatus::Stopped => {
                 let _ = self.remove_token(config, project_id);
