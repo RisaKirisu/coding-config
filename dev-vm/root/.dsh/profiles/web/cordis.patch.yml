@@ -9,7 +9,7 @@
         baseURL: https://api.krill-code.net/codex/v1
         models:
           - id: gpt-6-astra
-            contextWindow: 300000
+            contextWindow: 500000
             input:
               - text
               - image
@@ -25,6 +25,7 @@
               chatTemplateKwargs: {}
               chatTemplateArgs: {}
           - id: gpt-6.1-sol
+            contextWindow: 500000
             name: gpt-6.1-sol
             input:
               - text
@@ -70,22 +71,6 @@
               chatTemplateKwargs: {}
               chatTemplateArgs: {}
           - id: gpt-6-astra
-            contextWindow: 400000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              off: low
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-            compat:
-              chatTemplateKwargs: {}
-              chatTemplateArgs: {}
-          - id: gpt-6.1-sol
-            name: gpt-6.1-sol
             contextWindow: 500000
             input:
               - text
@@ -100,7 +85,24 @@
             compat:
               chatTemplateKwargs: {}
               chatTemplateArgs: {}
+          - id: gpt-6.1-sol
+            contextWindow: 500000
+            name: gpt-6.1-sol
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              off: low
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+            compat:
+              chatTemplateKwargs: {}
+              chatTemplateArgs: {}
           - id: gpt-6-luna
+            contextWindow: 500000
             name: gpt-6-luna
             input:
               - text
@@ -116,6 +118,7 @@
               chatTemplateKwargs: {}
               chatTemplateArgs: {}
           - id: gpt-6-sol
+            contextWindow: 500000
             name: gpt-6-sol
             input:
               - text
@@ -154,7 +157,7 @@
         models:
           - id: claude-haiku-5-5
             name: Claude Haiku 5.5
-            contextWindow: 1000000
+            contextWindow: 500000
             maxTokens: 128000
             input:
               - text
@@ -171,7 +174,7 @@
               chatTemplateArgs: {}
           - id: claude-opus-5-5
             name: Claude Opus 5.5
-            contextWindow: 1000000
+            contextWindow: 500000
             maxTokens: 128000
             input:
               - text
@@ -188,7 +191,7 @@
               chatTemplateArgs: {}
           - id: claude-sonnet-5-5
             name: Claude Sonnet 5.5
-            contextWindow: 1000000
+            contextWindow: 500000
             maxTokens: 128000
             input:
               - text
@@ -232,7 +235,7 @@
   config:
     provider: proxy-cli-claude
     model: claude-opus-5-5
-    reasoningEffort: medium
+    reasoningEffort: high
 - id: ui-settings-general
   config:
     welcomeNoticeVersion: 2026-09-28.1
@@ -251,7 +254,7 @@
     preference: system
 - id: subagent-manager
   config:
-    provider: proxy-cli
+    provider: krill-codex
     model: gpt-6.1-sol
     reasoningEffort: medium
 - id: build-loop

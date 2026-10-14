@@ -1,0 +1,200 @@
+   Compiling devvm-daemon v0.1.0 (/root/workspace/dev-vm)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 14s
+     Running unittests src/lib.rs (target/debug/deps/devvm_daemon-6b1833201c7e4943)
+
+running 46 tests
+test config::tests::bind_address_defaults_to_loopback_and_rejects_invalid_input ... ok
+test logs::tests::test_parse_daemon_line_formats ... ok
+test config::tests::test_daemon_config_new_defaults_remote_domain_to_none ... ok
+test logs::tests::test_parse_prefixed_line_levels ... ok
+test logs::tests::test_append_log_writes_iso_timestamped_daemon_log ... ok
+test logs::tests::test_format_iso8601_millis_matches_known_epochs ... ok
+test models::tests::test_format_bytes ... ok
+test logs::tests::test_parse_file_keeps_unparseable_line_with_previous_timestamp ... ok
+test logs::tests::test_read_recent_logs_merges_files_in_time_order ... ok
+test logs::tests::test_parse_caddy_line_compacts_requests ... ok
+test logs::tests::test_log_tail_starts_at_a_complete_entry ... ok
+test logs::tests::test_log_append_and_read ... ok
+test logs::tests::test_log_read_merges_guest_written_logs ... ok
+test models::tests::test_compute_project_host ... ok
+test models::tests::test_format_memory_display ... ok
+test browser::tests::test_browser_home_jail ... ok
+test logs::tests::test_log_read_ingress_only_when_no_daemon_log ... ok
+test models::tests::test_long_project_name_uses_path_hash ... ok
+test runtime::tests::test_start_command_clears_stale_state_only_after_the_live_check_and_before_launch ... ok
+test runtime::tests::test_start_command_launches_dsh_with_no_open ... ok
+test runtime::tests::test_start_command_parses_the_token_at_its_line_end_then_stops ... ok
+test runtime::tests::test_start_command_records_the_pid_of_dsh_itself ... ok
+test runner::tests::parse_vm_memory_reads_devvm_memory_json ... ok
+test runtime::tests::test_start_command_replaces_the_previous_token_atomically ... ok
+test registry::tests::test_register_and_unregister ... ok
+test runtime::tests::test_start_command_runs_startup_script_before_dsh_web ... ok
+test runner::tests::parse_vm_status_maps_every_devvm_state ... ok
+test runtime::tests::test_start_command_substitutes_the_project_id_into_the_log_dir ... ok
+test runtime::tests::test_start_command_captures_token_into_runtime_files ... ok
+test runtime::tests::test_launch_command_provisions_configured_control_domain ... ok
+test runtime::tests::test_stop_command_removes_pid_and_token_state ... ok
+test service::tests::test_systemd_unit_multiword_and_special_char_args ... ok
+test service::tests::test_launchd_plist_xml_escaping ... ok
+test sync::tests::test_parse_status_file ... ok
+test sync::tests::test_remote_commands_quote_the_sync_root ... ok
+test urls::tests::control_subdomains_match_only_valid_labels_in_the_configured_domain ... ok
+test service::tests::test_launchd_plist_generation ... ok
+test urls::tests::urls_preserve_routing_identity_and_validate_inputs ... ok
+test sync::tests::test_shell_quote ... ok
+test service::tests::test_systemd_unit_generation ... ok
+test sync::tests::test_sync_error_display ... ok
+test sync::tests::test_sync_config_serde_and_persistence ... ok
+test sync::tests::test_provision_sync_setup_host_and_guest_paths ... ok
+test service::tests::test_service_manager_macos_lifecycle ... ok
+test runtime::tests::test_status_command_waits_for_token_from_live_runtime ... ok
+test service::tests::test_service_manager_linux_lifecycle ... ok
+
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+     Running unittests src/main.rs (target/debug/deps/devvm_daemon-d3cc63cca9521a5a)
+
+running 9 tests
+test tests::test_run_service_command_install_with_remote_domain ... ok
+test tests::test_cli_default_serve_args ... ok
+test tests::test_cli_service_uninstall_subcommand ... ok
+test tests::test_cli_service_status_subcommand ... ok
+test tests::test_cli_serve_subcommand_with_remote_domain ... ok
+test tests::test_cli_sync_setup_subcommand ... ok
+test tests::test_cli_service_install_subcommand ... ok
+test tests::test_cli_serve_subcommand ... ok
+test tests::test_cli_serve_subcommand_with_host ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/api_test.rs (target/debug/deps/api_test-f1ba1cc20558feda)
+
+running 26 tests
+test test_non_existent_project_operations ... ok
+test test_project_browser_jail ... ok
+test test_ongoing_ingress_log_capture_persists_after_vm_deletion ... ok
+test test_dsh_start_failure_reports_the_command_stderr ... ok
+test test_embedded_ui_served ... ok
+test test_open_port_endpoint ... ok
+test test_disconnect_during_vm_boot_does_not_leak_dsh_operation ... ok
+test test_browser_error_cases ... ok
+test test_dsh_restart_stops_before_launching_and_refreshes_links ... ok
+test test_dsh_link_is_omitted_when_token_is_missing ... ok
+test test_no_generic_command_execution_endpoint ... ok
+test test_dsh_status_is_read_from_the_devvm_and_survives_a_daemon_restart ... ok
+test test_local_only_mode_omits_remote_links ... ok
+test test_legacy_stop_preempts_submitted_start_and_preserves_both_results ... ok
+test test_control_app_names_follow_subdomain ... ok
+test test_ingress_and_lifecycle_logs_survive_vm_deletion ... ok
+test test_registration_validation_and_custom_uuid ... ok
+test test_remote_url_dns_label_limit_handling ... ok
+test test_project_logs_never_return_the_dsh_token_file ... ok
+test test_project_registration_and_id_lifecycle ... ok
+test test_project_logs_merge_three_sources_in_time_order ... ok
+test test_second_launch_preserves_the_running_dsh_token ... ok
+test test_submitted_failure_is_observable_and_logged_once_after_unregister ... ok
+test test_vm_lifecycle_operations ... ok
+test test_submitted_operation_survives_lost_http_acknowledgement ... ok
+test test_two_clients_coordinate_vm_start_and_stop ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests/caddy_ingress_test.rs (target/debug/deps/caddy_ingress_test-8e172b805b1991fd)
+
+running 1 test
+test test_caddy_loopback_facade_and_routing ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+
+     Running tests/frp_config_test.rs (target/debug/deps/frp_config_test-0120bd643496e9bc)
+
+running 2 tests
+test test_frpc_config_structure_and_domains ... ok
+test test_frpc_verify_execution ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/install_test.rs (target/debug/deps/install_test-839581694cc6ce57)
+
+running 22 tests
+test test_launchd_plist_special_characters_escaping ... ok
+test test_launchd_plist_xml_content_generation ... ok
+test test_headless_profile_lockfile_does_not_contain_duplicate_web_fetch ... ok
+test test_service_installation_with_custom_host_and_default_host ... ok
+test test_systemd_unit_special_characters_quoting ... ok
+test test_systemd_unit_content_generation ... ok
+test test_service_manager_macos_fixture ... ok
+test test_web_profile_installs_local_plugins_as_packages ... ok
+test test_profiles_do_not_declare_duplicate_web_fetch ... ok
+test test_web_profile_third_party_plugin_pins ... ok
+test test_web_profile_lockfile_packages_local_plugins ... ok
+test test_scripts_can_be_sourced_without_actions ... ok
+test test_service_manager_linux_fixture ... ok
+test test_devvm_project_name_truncation ... ok
+test test_script_syntax_and_dry_run ... ok
+test test_devvm_ingress_and_guest_initialization_arguments ... ok
+test test_devvm_smolvm_command_arguments ... ok
+test test_setup_service_arguments_and_start_choice ... ok
+test test_setup_version_decisions_and_downloads ... ok
+test test_devvm_project_identity ... ok
+test test_devvm_memory_json ... ok
+test test_devvm_machine_state_decisions ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+
+     Running tests/lifecycle_test.rs (target/debug/deps/lifecycle_test-3d699a1666520e6f)
+
+running 5 tests
+test http_disconnect_drops_the_pending_handler ... ok
+test http_disconnect_interrupts_real_command_and_releases_ownership ... ok
+test completed_failed_and_precancelled_commands_leave_no_operation ... ok
+test cancellation_waits_for_real_process_tree_before_releasing_project ... ok
+test stop_reserves_project_and_waits_for_launch_cleanup ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/live_acceptance_test.rs (target/debug/deps/live_acceptance_test-913d25ae5148cd52)
+
+running 1 test
+test test_live_complete_version_one_system ... ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/observability_test.rs (target/debug/deps/observability_test-cf7f34eb1721b8a9)
+
+running 5 tests
+test test_failing_status_command_logs_stderr ... ok
+test test_handler_only_error_is_logged_once_at_error_level ... ok
+test test_project_scoped_error_reaches_project_log ... ok
+test test_request_produces_tower_http_trace_line ... ok
+test test_non_executable_devvm_logs_permission_denied ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/project_app_fixture.rs (target/debug/deps/project_app_fixture-3fd8462a11c07baf)
+
+running 1 test
+test serve_project_app_fixture ... ignored, owns real staged DSH children for the Playwright interaction suite
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/remote_routing_test.rs (target/debug/deps/remote_routing_test-99405010b32f331e)
+
+running 1 test
+test test_remote_http_proxy_chain_and_dsh_auth ... FAILED
+
+failures:
+
+---- test_remote_http_proxy_chain_and_dsh_auth stdout ----
+
+thread 'test_remote_http_proxy_chain_and_dsh_auth' (11008) panicked at tests/remote_routing_test.rs:89:10:
+Failed to start frps: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    test_remote_http_proxy_chain_and_dsh_auth
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--test remote_routing_test`

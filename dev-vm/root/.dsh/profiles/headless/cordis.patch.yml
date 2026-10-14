@@ -8,7 +8,7 @@
         baseURL: https://api.krill-code.net/codex/v1
         models:
           - id: gpt-6-astra
-            contextWindow: 300000
+            contextWindow: 500000
             input:
               - text
               - image
@@ -24,6 +24,7 @@
               chatTemplateKwargs: {}
               chatTemplateArgs: {}
           - id: gpt-6.1-sol
+            contextWindow: 500000
             name: gpt-6.1-sol
             input:
               - text
@@ -176,7 +177,7 @@
               chatTemplateKwargs: {}
               chatTemplateArgs: {}
           - id: gpt-6-astra
-            contextWindow: 300000
+            contextWindow: 500000
             input:
               - text
               - image
@@ -191,6 +192,7 @@
               chatTemplateKwargs: {}
               chatTemplateArgs: {}
           - id: gpt-6.1-sol
+            contextWindow: 500000
             name: gpt-6.1-sol
             input:
               - text
@@ -206,6 +208,7 @@
               chatTemplateKwargs: {}
               chatTemplateArgs: {}
           - id: gpt-6-luna
+            contextWindow: 500000
             name: gpt-6-luna
             input:
               - text
