@@ -2196,18 +2196,23 @@ window.__ModuleLoader__.load({
             transportHttp: "HTTP",
             fieldCommand: "命令",
             fieldArgs: "参数（每行一个）",
-            fieldEnv: "环境变量（每行 键=值；已配置的键留空保持不变）",
+            fieldEnv: "环境变量",
             fieldCwd: "工作目录（留空使用默认）",
             fieldUrl: "服务器地址",
-            fieldHeaders: "请求头（每行 键=值；已配置的键留空保持不变）",
+            fieldHeaders: "请求头",
             fieldTimeout: "单次调用超时",
             fieldFailOnStartup: "启动失败时报错",
             fieldReconnect: "自动重连",
             fieldInitialDelay: "首次重连延迟",
             fieldMaxDelay: "最大重连延迟",
             fieldMaxAttempts: "最大重连次数",
-            configuredKeys: "已配置的密钥：",
-            deleteSecret: "删除",
+            keyPlaceholder: "键",
+            valuePlaceholder: "值",
+            secret: "Secret",
+            secretStored: "已存储（留空保持不变）",
+            addRow: "+ 添加一行",
+            removeRow: "删除此行",
+            secretHint: "勾选 Secret 的值存入 DSH 凭据存储，配置文件中只保存引用。",
             stateActive: "运行中",
             stateLoading: "加载中",
             statePending: "等待中",
@@ -2259,18 +2264,23 @@ window.__ModuleLoader__.load({
             transportHttp: "HTTP",
             fieldCommand: "command",
             fieldArgs: "args (one per line)",
-            fieldEnv: "env (KEY=VALUE per line; leave configured keys blank to keep them)",
+            fieldEnv: "env",
             fieldCwd: "cwd (blank for default)",
             fieldUrl: "url",
-            fieldHeaders: "headers (KEY=VALUE per line; leave configured keys blank to keep them)",
+            fieldHeaders: "headers",
             fieldTimeout: "toolCallTimeoutMs",
             fieldFailOnStartup: "Fail on startup error",
             fieldReconnect: "Auto reconnect",
             fieldInitialDelay: "initialDelayMs",
             fieldMaxDelay: "maxDelayMs",
             fieldMaxAttempts: "maxAttempts",
-            configuredKeys: "Configured secrets:",
-            deleteSecret: "Delete",
+            keyPlaceholder: "Key",
+            valuePlaceholder: "Value",
+            secret: "Secret",
+            secretStored: "Stored (leave blank to keep)",
+            addRow: "+ Add row",
+            removeRow: "Remove row",
+            secretHint: "Secret values are stored in the DSH credential store; the config file keeps only a reference.",
             stateActive: "Running",
             stateLoading: "Loading",
             statePending: "Pending",
@@ -2285,7 +2295,7 @@ window.__ModuleLoader__.load({
             checkUpdateHint: "). Run dsh-panel update in a terminal to install it"
         };
         const cssMcpEffects = "@keyframes skvFadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}@keyframes skvFadeOnly{from{opacity:0}to{opacity:1}}.MCP_card{transition:border-color .18s cubic-bezier(.22,.61,.36,1),box-shadow .18s ease}.MCP_card:hover{border-color:var(--dsw-alias-border-l1);box-shadow:var(--dsw-shadow-lv1)}.MCP_dot{transition:background-color .2s ease}.MCP_input,.MCP_textarea{transition:border-color .15s ease,box-shadow .15s ease}.MCP_transportBtn{transition:background-color .15s ease,border-color .15s ease,color .15s ease}.MCP_actionBtn,.MCP_dangerBtn,.MCP_iconBtn,.MCP_add,.MCP_advancedToggle{transition:background-color .15s ease,border-color .15s ease,transform .1s ease}.MCP_actionBtn:active:not(:disabled),.MCP_dangerBtn:active:not(:disabled),.MCP_iconBtn:active,.MCP_add:active{transform:scale(.96)}.MCP_actionBtn:focus-visible,.MCP_dangerBtn:focus-visible,.MCP_iconBtn:focus-visible,.MCP_add:focus-visible,.MCP_transportBtn:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}.MCP_cards{animation:skvFadeOnly .2s ease}.MCP_result{animation:skvFadeIn .18s ease}@media (prefers-reduced-motion: reduce){.MCP_section *{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}}";
-        const cssMcp = ".MCP_section{position:relative;width:100%;max-width:760px;color:var(--dsw-alias-label-primary);display:flex;flex-direction:column;gap:14px}.MCP_head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.MCP_head h3{font-size:14px;font-weight:600;line-height:20px;margin:0}.MCP_sub{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;margin:0}.MCP_toolbar{display:flex;align-items:center;gap:8px}.MCP_add{font:inherit;color:var(--dsw-alias-state-business-primary);cursor:pointer;background:0 0;border:1px dashed var(--dsw-alias-border-l1);border-radius:8px;padding:7px 16px;font-size:13px;line-height:20px;display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box}.MCP_add:hover{background:var(--dsw-alias-interactive-bg-hover)}.MCP_cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.MCP_card{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3);border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:8px;min-width:0}.MCP_cardTop{display:flex;align-items:center;gap:8px;min-width:0}.MCP_name{font-size:13px;font-weight:600;line-height:20px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.MCP_badges{display:inline-flex;align-items:center;gap:6px;flex:none}.MCP_badge{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);border-radius:5px;padding:1px 6px;font-size:11px;line-height:16px}.MCP_meta{display:flex;align-items:center;gap:8px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}.MCP_dot{width:7px;height:7px;border-radius:999px;background:var(--dsw-alias-label-tertiary);flex:none}.MCP_dot[data-on=true]{background:var(--dsw-alias-state-success-primary)}.MCP_dot[data-err=true]{background:var(--dsw-alias-state-error-primary)}.MCP_actions{display:flex;align-items:center;gap:8px;border-top:1px solid var(--dsw-alias-border-l2);padding-top:8px;flex-wrap:wrap}.MCP_spacer{flex:1}.MCP_form{display:grid;grid-template-columns:1fr 1fr;gap:10px}.MCP_field{display:flex;flex-direction:column;gap:5px}.MCP_field[data-wide=true]{grid-column:1 / -1}.MCP_label{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}.MCP_input{box-sizing:border-box;width:100%;height:32px;font:inherit;font-size:13px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:0 8px}.MCP_input:focus-visible,.MCP_textarea:focus-visible{border-color:var(--dsw-alias-state-business-primary);box-shadow:0 0 0 2px color-mix(in srgb, var(--dsw-alias-state-business-primary) 18%, transparent);outline:none}.MCP_textarea{box-sizing:border-box;width:100%;min-height:64px;font:inherit;font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:6px 8px;resize:vertical}.MCP_transportRow{display:flex;gap:8px}.MCP_transportBtn{font:inherit;font-size:13px;line-height:20px;color:var(--dsw-alias-label-secondary);cursor:pointer;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:999px;padding:4px 14px}.MCP_transportBtn[data-active=true]{color:var(--dsw-alias-state-business-primary);border-color:var(--dsw-alias-state-business-primary);background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 12%, transparent)}.MCP_secretKeys{display:flex;flex-wrap:wrap;gap:6px}.MCP_key{display:inline-flex;align-items:center;gap:6px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:999px;padding:2px 8px;font-size:11px;line-height:16px}.MCP_key button{font:inherit;color:var(--dsw-alias-state-error-primary);cursor:pointer;background:0 0;border:none;padding:0}.MCP_checkRow{display:flex;align-items:center;gap:8px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}.MCP_result{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:8px 10px;font-size:12px;line-height:18px;max-height:160px;overflow:auto}.MCP_actionBtn{font:inherit;color:var(--dsw-alias-label-primary);cursor:pointer;background:0 0;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;padding:0 12px;font-size:12px;line-height:26px;height:28px;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;box-sizing:border-box}.MCP_actionBtn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover-solid)}.MCP_actionBtn:disabled{cursor:default;opacity:.6}.MCP_dangerBtn{font:inherit;color:var(--dsw-alias-state-error-primary);cursor:pointer;background:0 0;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;padding:0 12px;font-size:12px;line-height:26px;height:28px;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;box-sizing:border-box}.MCP_dangerBtn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover-solid)}.MCP_iconBtn{width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:0;flex:none}.MCP_iconBtn:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.MCP_advancedToggle{font:inherit;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:1px dashed var(--dsw-alias-border-l1);border-radius:8px;padding:6px 12px;font-size:13px;line-height:20px}.MCP_advancedToggle:hover{background:var(--dsw-alias-interactive-bg-hover)}.MCP_result[data-ok=true]{border-color:color-mix(in srgb, var(--dsw-alias-state-success-primary) 40%, transparent);background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 8%, transparent)}.MCP_result[data-ok=false]{border-color:color-mix(in srgb, var(--dsw-alias-state-error-primary) 40%, transparent);background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 8%, transparent)}.MCP_hint{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary);margin:0}.MCP_hint[data-error=true]{color:var(--dsw-alias-state-error-primary)}" + cssMcpEffects;
+        const cssMcp = ".MCP_section{position:relative;width:100%;max-width:760px;color:var(--dsw-alias-label-primary);display:flex;flex-direction:column;gap:14px}.MCP_head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.MCP_head h3{font-size:14px;font-weight:600;line-height:20px;margin:0}.MCP_sub{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;margin:0}.MCP_toolbar{display:flex;align-items:center;gap:8px}.MCP_add{font:inherit;color:var(--dsw-alias-state-business-primary);cursor:pointer;background:0 0;border:1px dashed var(--dsw-alias-border-l1);border-radius:8px;padding:7px 16px;font-size:13px;line-height:20px;display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box}.MCP_add:hover{background:var(--dsw-alias-interactive-bg-hover)}.MCP_cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.MCP_card{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3);border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:8px;min-width:0}.MCP_cardTop{display:flex;align-items:center;gap:8px;min-width:0}.MCP_name{font-size:13px;font-weight:600;line-height:20px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.MCP_badges{display:inline-flex;align-items:center;gap:6px;flex:none}.MCP_badge{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);border-radius:5px;padding:1px 6px;font-size:11px;line-height:16px}.MCP_meta{display:flex;align-items:center;gap:8px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}.MCP_dot{width:7px;height:7px;border-radius:999px;background:var(--dsw-alias-label-tertiary);flex:none}.MCP_dot[data-on=true]{background:var(--dsw-alias-state-success-primary)}.MCP_dot[data-err=true]{background:var(--dsw-alias-state-error-primary)}.MCP_actions{display:flex;align-items:center;gap:8px;border-top:1px solid var(--dsw-alias-border-l2);padding-top:8px;flex-wrap:wrap}.MCP_spacer{flex:1}.MCP_form{display:grid;grid-template-columns:1fr 1fr;gap:10px}.MCP_field{display:flex;flex-direction:column;gap:5px}.MCP_field[data-wide=true]{grid-column:1 / -1}.MCP_label{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);margin:0}.MCP_input{box-sizing:border-box;width:100%;height:32px;font:inherit;font-size:13px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:0 8px}.MCP_input:focus-visible,.MCP_textarea:focus-visible{border-color:var(--dsw-alias-state-business-primary);box-shadow:0 0 0 2px color-mix(in srgb, var(--dsw-alias-state-business-primary) 18%, transparent);outline:none}.MCP_textarea{box-sizing:border-box;width:100%;min-height:64px;font:inherit;font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:6px 8px;resize:vertical}.MCP_transportRow{display:flex;gap:8px}.MCP_transportBtn{font:inherit;font-size:13px;line-height:20px;color:var(--dsw-alias-label-secondary);cursor:pointer;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:999px;padding:4px 14px}.MCP_transportBtn[data-active=true]{color:var(--dsw-alias-state-business-primary);border-color:var(--dsw-alias-state-business-primary);background:color-mix(in srgb, var(--dsw-alias-state-business-primary) 12%, transparent)}.MCP_kvList{display:flex;flex-direction:column;gap:6px}.MCP_kvRow{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr) auto auto;gap:6px;align-items:center}.MCP_kvAdd{align-self:flex-start;font:inherit;font-size:12px;line-height:18px;color:var(--dsw-alias-state-business-primary);cursor:pointer;background:0 0;border:1px dashed var(--dsw-alias-border-l1);border-radius:8px;padding:4px 10px}.MCP_kvAdd:hover{background:var(--dsw-alias-interactive-bg-hover)}.MCP_checkRow{display:flex;align-items:center;gap:8px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}.MCP_result{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:8px 10px;font-size:12px;line-height:18px;max-height:160px;overflow:auto}.MCP_actionBtn{font:inherit;color:var(--dsw-alias-label-primary);cursor:pointer;background:0 0;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;padding:0 12px;font-size:12px;line-height:26px;height:28px;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;box-sizing:border-box}.MCP_actionBtn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover-solid)}.MCP_actionBtn:disabled{cursor:default;opacity:.6}.MCP_dangerBtn{font:inherit;color:var(--dsw-alias-state-error-primary);cursor:pointer;background:0 0;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;padding:0 12px;font-size:12px;line-height:26px;height:28px;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;box-sizing:border-box}.MCP_dangerBtn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover-solid)}.MCP_iconBtn{width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:0;flex:none}.MCP_iconBtn:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}.MCP_advancedToggle{font:inherit;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:1px dashed var(--dsw-alias-border-l1);border-radius:8px;padding:6px 12px;font-size:13px;line-height:20px}.MCP_advancedToggle:hover{background:var(--dsw-alias-interactive-bg-hover)}.MCP_result[data-ok=true]{border-color:color-mix(in srgb, var(--dsw-alias-state-success-primary) 40%, transparent);background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 8%, transparent)}.MCP_result[data-ok=false]{border-color:color-mix(in srgb, var(--dsw-alias-state-error-primary) 40%, transparent);background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 8%, transparent)}.MCP_hint{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary);margin:0}.MCP_hint[data-error=true]{color:var(--dsw-alias-state-error-primary)}" + cssMcpEffects;
         const mcpTagId = "dsh-skill-mcp-panel/McpSection.module.css";
         if (typeof document !== "undefined") {
             let mcpTag = document.querySelector("style[data-plugin-css=" + JSON.stringify(mcpTagId) + "]");
@@ -2320,8 +2330,9 @@ window.__ModuleLoader__.load({
             textarea: "MCP_textarea",
             transportRow: "MCP_transportRow",
             transportBtn: "MCP_transportBtn",
-            secretKeys: "MCP_secretKeys",
-            key: "MCP_key",
+            kvList: "MCP_kvList",
+            kvRow: "MCP_kvRow",
+            kvAdd: "MCP_kvAdd",
             checkRow: "MCP_checkRow",
             result: "MCP_result",
             actionBtn: "MCP_actionBtn",
@@ -2343,17 +2354,15 @@ window.__ModuleLoader__.load({
         function mcpParseLines(text) {
             return String(text ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
         }
-        function mcpParsePairs(text) {
-            const out = {};
-            for (const line of mcpParseLines(text)) {
-                const index = line.indexOf("=");
-                if (index <= 0)
-                    continue;
-                const key = line.slice(0, index).trim();
-                if (key !== "")
-                    out[key] = line.slice(index + 1).trim();
-            }
-            return out;
+        /** 表单行 → 输入行；空键行忽略。isStored 只在表单内使用。 */
+        function mcpKeyValueInput(rows) {
+            return rows
+                .filter((row) => row.key.trim() !== "")
+                .map((row) => ({ key: row.key.trim(), value: row.value, secret: row.secret }));
+        }
+        /** view 行 → 表单行；已存储的 secret 行 value 为空，isStored 标记“留空保持不变”。 */
+        function mcpKeyValueForm(rows) {
+            return Array.isArray(rows) ? rows.map((row) => ({ key: row.key, value: row.value ?? "", secret: !!row.secret, isStored: !!row.secret })) : [];
         }
         function mcpNumber(value, fallback) {
             const n = parseInt(String(value ?? ""), 10);
@@ -2365,10 +2374,10 @@ window.__ModuleLoader__.load({
                 transport: "stdio",
                 command: "",
                 argsText: "",
-                envText: "",
+                envRows: [],
                 cwd: "",
                 url: "",
-                headersText: "",
+                headersRows: [],
                 timeout: "60000",
                 failOnStartup: false,
                 reconnectEnabled: true,
@@ -2383,8 +2392,10 @@ window.__ModuleLoader__.load({
             form.transport = server.transport === "streamable-http" ? "streamable-http" : "stdio";
             form.command = server.command ?? "";
             form.argsText = Array.isArray(server.args) ? server.args.join("\n") : "";
+            form.envRows = mcpKeyValueForm(server.env);
             form.cwd = server.cwd ?? "";
             form.url = server.url ?? "";
+            form.headersRows = mcpKeyValueForm(server.headers);
             form.timeout = String(server.toolCallTimeoutMs ?? 60000);
             form.failOnStartup = !!server.failOnStartupError;
             form.reconnectEnabled = server.reconnect?.enabled !== false;
@@ -2393,7 +2404,7 @@ window.__ModuleLoader__.load({
             form.maxAttempts = String(server.reconnect?.maxAttempts ?? 10);
             return form;
         }
-        function buildMcpInput(form, deletedEnv, deletedHeaders) {
+        function buildMcpInput(form) {
             const reconnect = {
                 enabled: !!form.reconnectEnabled,
                 initialDelayMs: mcpNumber(form.initialDelay, 500),
@@ -2407,33 +2418,24 @@ window.__ModuleLoader__.load({
                 reconnect
             };
             if (form.transport === "streamable-http") {
-                const headers = mcpParsePairs(form.headersText);
-                for (const key of deletedHeaders)
-                    headers[key] = null;
-                return { ...common, transport: "streamable-http", url: String(form.url ?? "").trim(), headers };
+                return { ...common, transport: "streamable-http", url: String(form.url ?? "").trim(), headers: mcpKeyValueInput(form.headersRows) };
             }
-            const env = mcpParsePairs(form.envText);
-            for (const key of deletedEnv)
-                env[key] = null;
+            const env = mcpKeyValueInput(form.envRows);
             return { ...common, transport: "stdio", command: String(form.command ?? "").trim(), args: mcpParseLines(form.argsText), env, cwd: String(form.cwd ?? "").trim() };
         }
         function McpFormDialog({ t, initial, onSave, onCancel, busy, error }) {
             const editing = initial !== null && initial !== undefined;
             const [form, setForm] = react.useState(() => editing ? formFromServer(initial) : defaultMcpForm());
-            const [deletedEnv, setDeletedEnv] = react.useState(() => new Set());
-            const [deletedHeaders, setDeletedHeaders] = react.useState(() => new Set());
             const [advancedOpen, setAdvancedOpen] = react.useState(false);
             const set = (patch) => setForm((prev) => ({ ...prev, ...patch }));
             // 名称规则最终由宿主边界校验，撞上只会得到一句泛化错误；
             // 这里提前拦截并把规则写在字段下面，别让用户对着天书猜。
             const trimmedName = String(form.serverName ?? "").trim();
             const nameIssue = trimmedName === "" ? t("nameRequired") : MCP_NAME_RE.test(trimmedName) ? null : t("nameHint");
-            const envKeys = editing && Array.isArray(initial.envKeys) ? initial.envKeys.filter((key) => !deletedEnv.has(key)) : [];
-            const headerKeys = editing && Array.isArray(initial.headerKeys) ? initial.headerKeys.filter((key) => !deletedHeaders.has(key)) : [];
             const submit = () => {
                 if (nameIssue !== null)
                     return;
-                onSave(buildMcpInput(form, deletedEnv, deletedHeaders), editing ? initial.serverName : undefined);
+                onSave(buildMcpInput(form), editing ? initial.serverName : undefined);
             };
             const label = (text) => (0, react_jsx_runtime.jsx)("span", { className: m.label, children: text });
             const field = (text, node, wide, hint = null) => (0, react_jsx_runtime.jsxs)("label", {
@@ -2458,29 +2460,66 @@ window.__ModuleLoader__.load({
                 placeholder,
                 onChange: (event) => onChange(event.target.value)
             });
-            const secretEditor = (keys, deleted, setDeleted, text, setText, placeholder) => (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, {
-                children: [
-                    keys.length > 0 ? (0, react_jsx_runtime.jsx)("div", {
-                        className: m.secretKeys,
-                        children: keys.map((key) => (0, react_jsx_runtime.jsxs)("span", {
-                            className: m.key,
+            // 多个输入框与复选框不能嵌在同一个 <label> 里，所以这组字段用 <div>。
+            const groupField = (text, node, hint) => (0, react_jsx_runtime.jsxs)("div", {
+                className: m.field,
+                "data-wide": "true",
+                children: [label(text), node, (0, react_jsx_runtime.jsx)("span", { className: m.hint, children: hint })]
+            });
+            const keyValueEditor = (rows, setRows) => {
+                const updateRow = (index, patch) => setRows(rows.map((row, i) => (i === index ? { ...row, ...patch } : row)));
+                return (0, react_jsx_runtime.jsxs)("div", {
+                    className: m.kvList,
+                    children: [
+                        ...rows.map((row, index) => (0, react_jsx_runtime.jsxs)("div", {
+                            className: m.kvRow,
                             children: [
-                                key,
+                                (0, react_jsx_runtime.jsx)("input", {
+                                    className: m.input,
+                                    value: row.key,
+                                    placeholder: t("keyPlaceholder"),
+                                    "aria-label": t("keyPlaceholder"),
+                                    onChange: (event) => updateRow(index, { key: event.target.value })
+                                }),
+                                (0, react_jsx_runtime.jsx)("input", {
+                                    className: m.input,
+                                    type: row.secret ? "password" : "text",
+                                    autoComplete: "off",
+                                    value: row.value,
+                                    placeholder: row.secret && row.isStored ? t("secretStored") : t("valuePlaceholder"),
+                                    "aria-label": t("valuePlaceholder"),
+                                    onChange: (event) => updateRow(index, { value: event.target.value })
+                                }),
+                                (0, react_jsx_runtime.jsxs)("label", {
+                                    className: m.checkRow,
+                                    children: [
+                                        (0, react_jsx_runtime.jsx)("input", {
+                                            type: "checkbox",
+                                            checked: row.secret,
+                                            onChange: (event) => updateRow(index, { secret: event.target.checked, isStored: event.target.checked && row.isStored })
+                                        }),
+                                        t("secret")
+                                    ]
+                                }),
                                 (0, react_jsx_runtime.jsx)("button", {
                                     type: "button",
-                                    onClick: () => {
-                                        const next = new Set(deleted);
-                                        next.add(key);
-                                        setDeleted(next);
-                                    },
-                                    children: t("deleteSecret")
+                                    className: m.iconBtn,
+                                    "aria-label": t("removeRow"),
+                                    title: t("removeRow"),
+                                    onClick: () => setRows(rows.filter((_, i) => i !== index)),
+                                    children: "×"
                                 })
                             ]
-                        }, key))
-                    }) : null,
-                    textArea(text, setText, placeholder)
-                ]
-            });
+                        }, index)),
+                        (0, react_jsx_runtime.jsx)("button", {
+                            type: "button",
+                            className: m.kvAdd,
+                            onClick: () => setRows([...rows, { key: "", value: "", secret: false, isStored: false }]),
+                            children: t("addRow")
+                        })
+                    ]
+                });
+            };
             const fields = [
                 field(t("fieldServerName"), textInput(form.serverName, (value) => set({ serverName: value }), "MCP Server"), false, nameIssue === null ? { text: t("nameHint"), error: false } : { text: nameIssue, error: true }),
                 field(t("fieldTransport"), (0, react_jsx_runtime.jsxs)("div", {
@@ -2506,12 +2545,12 @@ window.__ModuleLoader__.load({
             if (form.transport === "stdio") {
                 fields.push(field(t("fieldCommand"), textInput(form.command, (value) => set({ command: value }), ""), true));
                 fields.push(field(t("fieldArgs"), textArea(form.argsText, (value) => set({ argsText: value }), ""), true));
-                fields.push(field(t("fieldEnv"), secretEditor(envKeys, deletedEnv, setDeletedEnv, form.envText, (value) => set({ envText: value }), ""), true));
+                fields.push(groupField(t("fieldEnv"), keyValueEditor(form.envRows, (rows) => set({ envRows: rows })), t("secretHint")));
                 fields.push(field(t("fieldCwd"), textInput(form.cwd, (value) => set({ cwd: value }), ""), false));
             }
             else {
                 fields.push(field(t("fieldUrl"), textInput(form.url, (value) => set({ url: value }), ""), true));
-                fields.push(field(t("fieldHeaders"), secretEditor(headerKeys, deletedHeaders, setDeletedHeaders, form.headersText, (value) => set({ headersText: value }), ""), true));
+                fields.push(groupField(t("fieldHeaders"), keyValueEditor(form.headersRows, (rows) => set({ headersRows: rows })), t("secretHint")));
             }
             fields.push((0, react_jsx_runtime.jsx)("div", {
                 className: m.field,

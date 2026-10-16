@@ -234,8 +234,8 @@
 - id: agent-default-model
   config:
     provider: proxy-cli-claude
-    model: claude-opus-5-5
-    reasoningEffort: high
+    model: claude-sonnet-5-5
+    reasoningEffort: medium
 - id: ui-settings-general
   config:
     welcomeNoticeVersion: 2026-09-28.1
@@ -296,7 +296,7 @@
             messageContains: stream disconnected before completion
             treatAs: TRANSPORT
     - id: panel-mcp-context7
-      name: "@deepseek-ai/dsh-mcp-client"
+      name: dsh-skill-mcp-panel/mcp-client
       config:
         serverName: context7
         toolCallTimeoutMs: 60000
@@ -308,7 +308,31 @@
           maxAttempts: 10
         transport: streamable-http
         url: https://mcp.context7.com/mcp
-        headers:
-          Authorization: ctx7sk-ce3cc02b-102b-4af7-8a02-73ed91de488a
-
+        headers: {}
+        secretHeaders:
+          Authorization: MCP_636F6E7465787437_417574686F72697A6174696F6E
+    - id: panel-mcp-exa
+      name: dsh-skill-mcp-panel/mcp-client
+      config:
+        serverName: exa
+        toolCallTimeoutMs: 60000
+        failOnStartupError: false
+        reconnect:
+          enabled: true
+          initialDelayMs: 500
+          maxDelayMs: 30000
+          maxAttempts: 10
+        transport: streamable-http
+        url: https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa
+        headers: {}
+        secretHeaders:
+          x-api-key: MCP_657861_782D6170692D6B6579
 # <<< dsh-skill-mcp-panel:mcp:end
+
+# Web search and fetch come from the Exa MCP server only.
+- id: tool-web
+  disabled: true
+
+# Hide list_mcp_resources, list_mcp_resource_templates, and read_mcp_resource.
+- id: mcp-resources
+  disabled: true

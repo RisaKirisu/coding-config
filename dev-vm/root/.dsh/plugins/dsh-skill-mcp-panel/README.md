@@ -115,7 +115,7 @@ DSH 插件，在 Web 主页左侧栏「插件」下方提供「技能」与「MC
 - 主页侧边栏「技能」下方新增「MCP」面板，管理 profile `cordis.patch.yml` 中的 MCP 服务器受管块；
 - 支持 **Stdio**（本地命令）与 **HTTP**（streamable-http）两种调用方式；
 - 支持新增、编辑、启停、删除、测试连接；保存后由 DSH HMR 热加载，无需重启网关；
-- `env` / `headers` 密钥在 RPC 与页面中脱敏，编辑时缺省 key 保留旧值；
+- `env` / `headers` 以「键 / 值 / Secret」行编辑；勾选 Secret 的值存入 DSH 凭据存储（`~/.dsh/.credentials.yaml`），patch 中只保存引用，RPC 不返回其值，编辑时留空保持已存储的值；
 - `cordis.patch.yml` 面板块外的用户内容逐字节保留。
 
 ### 主页面板与返回会话（v2.1.0）

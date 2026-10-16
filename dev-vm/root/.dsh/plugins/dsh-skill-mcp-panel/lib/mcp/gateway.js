@@ -2,10 +2,11 @@
  * dsh-skill-mcp-panel —— MCP 宿主服务（mcpManager）。
  */
 import { TypertRemoteService } from "@deepseek-ai/dsh-typert-protocol";
+import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
 import { MCP_PLUGIN_NAME, extractManagedRows, listMcpPatchRows, readPatchFile, writeManagedRows } from "../patch-editor.js";
-import { applyServerEdit, describeSchemaError, inputFromPatchRow, patchRowToView, serverNameFromRowId } from "./model.js";
+import { credentialRefForSecret, describeSchemaError, inputFromPatchRow, keyValueRowsOf, patchRowToView, secretRefsFromPatchRow, serverNameFromRowId, toPatchRow } from "./model.js";
 import { mcpRemovePayloadSchema, mcpSavePayloadSchema, mcpSetEnabledPayloadSchema, mcpTestPayloadSchema } from "./wire.js";
 import { fiberPhaseOf, getLoaderEntry, mcpToolCount, waitForLoaderState } from "./status.js";
 import { probeMcpServer } from "./probe.js";
@@ -110,8 +111,52 @@ export class McpManagerGateway extends TypertRemoteService {
     findRowByServerName(rows, serverName) {
         return rows.find((row) => serverNameFromRowId(row.id) === serverName || (row.config?.serverName === serverName && isManagedRow(row)));
     }
-    configInputFromRow(row) {
-        return inputFromPatchRow(row);
+    /** patch 行 → 完整输入，secret 行的值从凭据存储解析。 */
+    async configInputFromRow(row) {
+        const input = inputFromPatchRow(row);
+        const secretRefs = secretRefsFromPatchRow(row);
+        for (const item of keyValueRowsOf(input)) {
+            if (!item.secret)
+                continue;
+            const stored = await this.C.credentials.resolve(credentialRef(secretRefs[item.key]));
+            item.value = stored?.value ?? "";
+        }
+        return input;
+    }
+    /**
+     * 把输入中的 secret 值写入凭据存储。value 为空的 secret 行沿用旧行已存储的值；
+     * 改名时把旧引用的值复制到新引用。
+     */
+    async storeSecrets(input, previous) {
+        const previousRefs = previous === undefined ? {} : secretRefsFromPatchRow(previous);
+        for (const item of keyValueRowsOf(input)) {
+            if (!item.secret)
+                continue;
+            const ref = credentialRef(credentialRefForSecret(input.serverName, item.key));
+            if (item.value !== "") {
+                await this.C.credentials.set(ref, item.value);
+                continue;
+            }
+            const previousRef = previousRefs[item.key];
+            if (previousRef === undefined)
+                throw new Error('secret "' + item.key + '" 需要填写值');
+            if (previousRef === ref)
+                continue;
+            const stored = await this.C.credentials.resolve(credentialRef(previousRef));
+            if (stored === undefined)
+                throw new Error('secret "' + item.key + '" 的已存储值不存在，请重新填写');
+            await this.C.credentials.set(ref, stored.value);
+        }
+    }
+    /** 删除旧行引用、但新行不再引用的凭据。 */
+    async removeUnusedSecrets(previous, next) {
+        if (previous === undefined)
+            return;
+        const nextRefs = new Set(next === undefined ? [] : Object.values(secretRefsFromPatchRow(next)));
+        for (const ref of Object.values(secretRefsFromPatchRow(previous))) {
+            if (!nextRefs.has(ref))
+                await this.C.credentials.unset(credentialRef(ref));
+        }
     }
     async save(rawPayload) {
         const payload = parseWirePayload(mcpSavePayloadSchema, rawPayload, "MCP 配置无效");
@@ -134,7 +179,8 @@ export class McpManagerGateway extends TypertRemoteService {
             throw new Error('要编辑的 MCP 行不存在："' + previousName + '"');
         }
         const enabled = previous !== undefined ? previous.disabled !== true : payload.enabled;
-        const nextRow = applyServerEdit(previous, input, enabled);
+        await this.storeSecrets(input, previous);
+        const nextRow = toPatchRow(input, enabled);
         const nextRows = managed.filter((row) => serverNameFromRowId(row.id) !== previousName && row.config?.serverName !== previousName);
         nextRows.push(nextRow);
         nextRows.sort((a, b) => String(a.config?.serverName ?? "").localeCompare(String(b.config?.serverName ?? "")));
@@ -142,6 +188,7 @@ export class McpManagerGateway extends TypertRemoteService {
         const reconciled = enabled
             ? await waitForLoaderState(this.C, nextRow.id, (entry) => entry !== undefined && entry.disabled !== true)
             : await waitForLoaderState(this.C, nextRow.id, (entry) => entry !== undefined && entry.disabled === true);
+        await this.removeUnusedSecrets(previous, nextRow);
         const entry = getLoaderEntry(this.C, nextRow.id);
         const server = this.decorate(nextRow, true, entry, enabled);
         if (server === undefined)
@@ -158,6 +205,7 @@ export class McpManagerGateway extends TypertRemoteService {
         const nextRows = managed.filter((candidate) => candidate !== row);
         await writeManagedRows(this.patchPath(), nextRows);
         const reconciled = await waitForLoaderState(this.C, row.id, (entry) => entry === undefined);
+        await this.removeUnusedSecrets(row, undefined);
         return { ok: true, reconciled };
     }
     async setEnabled(rawPayload) {
@@ -184,7 +232,7 @@ export class McpManagerGateway extends TypertRemoteService {
             const row = [...managed, ...external].find((candidate) => candidate.config?.serverName === payload.serverName || serverNameFromRowId(candidate.id) === payload.serverName);
             if (row === undefined)
                 throw new Error('MCP 行 "' + String(payload.serverName) + '" 不存在');
-            return probeMcpServer(this.configInputFromRow(row));
+            return probeMcpServer(await this.configInputFromRow(row));
         }
         return probeMcpServer(payload);
     }

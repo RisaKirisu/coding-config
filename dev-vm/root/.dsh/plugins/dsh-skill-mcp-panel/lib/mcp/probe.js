@@ -7,14 +7,10 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { scrubbedParentEnv } from "@deepseek-ai/dsh-subprocess";
-import { mcpServerInputSchema } from "./model.js";
+import { keyValueRowsOf, mcpServerInputSchema } from "./model.js";
 const PROBE_TIMEOUT_MS = 15000;
-function stringMap(value) {
-    const out = {};
-    for (const [key, item] of Object.entries(value ?? {}))
-        if (typeof item === "string")
-            out[key] = item;
-    return out;
+function keyValueMap(rows) {
+    return Object.fromEntries(rows.map((row) => [row.key, row.value]));
 }
 function createTransport(input) {
     if (input.transport === "stdio") {
@@ -23,13 +19,13 @@ function createTransport(input) {
             args: input.args,
             env: {
                 ...scrubbedParentEnv(),
-                ...stringMap(input.env)
+                ...keyValueMap(input.env)
             },
             cwd: input.cwd === "" ? undefined : input.cwd
         });
     }
     return new StreamableHTTPClientTransport(new URL(input.url), {
-        requestInit: { headers: stringMap(input.headers) }
+        requestInit: { headers: keyValueMap(input.headers) }
     });
 }
 export async function probeMcpServer(raw, timeoutMs = PROBE_TIMEOUT_MS) {
@@ -40,6 +36,9 @@ export async function probeMcpServer(raw, timeoutMs = PROBE_TIMEOUT_MS) {
     catch (error) {
         return { ok: false, tools: [], error: "配置无效：" + (error instanceof Error ? error.message : String(error)) };
     }
+    const unresolvedSecret = keyValueRowsOf(input).find((row) => row.secret && row.value === "");
+    if (unresolvedSecret !== undefined)
+        return { ok: false, tools: [], error: 'secret "' + unresolvedSecret.key + '" 没有可用的值' };
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const client = new Client({ name: "dsh-skill-mcp-panel", version: "2.0.0" });

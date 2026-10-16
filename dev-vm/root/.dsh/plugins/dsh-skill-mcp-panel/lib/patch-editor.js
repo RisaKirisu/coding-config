@@ -10,6 +10,9 @@ import { parseDocument, stringify } from "yaml";
 export const PANEL_MCP_BLOCK_BEGIN = "# >>> dsh-skill-mcp-panel:mcp:begin";
 export const PANEL_MCP_BLOCK_END = "# <<< dsh-skill-mcp-panel:mcp:end";
 export const MCP_PLUGIN_NAME = "@deepseek-ai/dsh-mcp-client";
+/** 面板受管行使用的入口：先从凭据存储解析 secret，再启动 MCP_PLUGIN_NAME。 */
+export const PANEL_MCP_CLIENT_NAME = "dsh-skill-mcp-panel/mcp-client";
+export const MCP_ROW_NAMES = new Set([MCP_PLUGIN_NAME, PANEL_MCP_CLIENT_NAME]);
 export const MANAGED_ROW_ID_PREFIX = "panel-mcp-";
 const delay = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 /** 读取 patch 文件；缺失/读失败统一带路径报错。 */
@@ -95,7 +98,7 @@ export function listMcpPatchRows(raw) {
     const parsed = doc.toJS();
     if (!Array.isArray(parsed))
         return [];
-    return flattenPatchRows(parsed).filter((row) => row.name === MCP_PLUGIN_NAME);
+    return flattenPatchRows(parsed).filter((row) => MCP_ROW_NAMES.has(row.name));
 }
 /** 生成受管块文本（无行时为空字符串）。 */
 export function generateManagedBlock(rows) {

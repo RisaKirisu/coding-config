@@ -2,7 +2,7 @@
 
 # dsh-skill-mcp-panel
 
-DevVM vendors upstream 2.1.3 as `2.1.3-devvm.1` for exact DSH `0.2.0-rc.2`. This fork adds bearer authentication backed by DSH credential references. Apply `patches/deepseek-harness-mcp-credential-ref.patch` to the exact native MCP package before use. Tokens are stored in the credential store; blank token edits retain them, renaming moves the reference, and deletion or selecting no authentication removes the owned reference. Native connections and panel probes resolve the current token on every request and reject missing credentials and redirects. `npm test` runs keyless local MCP/credential tests; `DSH_TEST_BROWSER=<isolated-playwright-session> npm run test:browser` checks session lookup through the real Web UI.
+DevVM vendors upstream 2.1.3 as `2.1.3-devvm.1` for exact DSH `0.2.0-rc.2`. This fork edits MCP `env` and `headers` as key/value rows with a **Secret** checkbox. Secret values are stored in the DSH credential store (`~/.dsh/.credentials.yaml`) under `MCP_<hex serverName>_<hex key>`; the patch row keeps only `secretEnv` / `secretHeaders` references and is loaded through this package's `dsh-skill-mcp-panel/mcp-client` entry, which resolves the references, starts the stock `@deepseek-ai/dsh-mcp-client`, and restarts when a referenced credential changes. A blank secret value keeps the stored one; renaming moves it, and removing the row or the server deletes it. `npm test` runs local MCP/credential tests against the installed dsh runtime; `DSH_TEST_BROWSER=<isolated-playwright-session> npm run test:browser` checks session lookup through the real Web UI.
 
 **Manage DSH skills and MCP servers right from the DSH web sidebar, plus the unified `dsh-panel` CLI**
 
@@ -120,7 +120,7 @@ A DSH plugin that adds two management panels — **Skills** and **MCP** — to t
 - A new MCP panel sits below Skills in the home sidebar and manages the MCP server managed block in the profile's `cordis.patch.yml`;
 - Supports **Stdio** (local command) and **HTTP** (streamable-http) transports;
 - Add, edit, enable/disable, delete and test connections; saving is hot-reloaded by DSH HMR — no gateway restart;
-- `env` / `headers` secrets are redacted in RPC and in the UI, and editing keeps the old value when a key is omitted;
+- `env` / `headers` are edited as key/value rows; rows marked **Secret** are stored in the DSH credential store, never returned over RPC, and keep their stored value when left blank;
 - User content outside the managed block in `cordis.patch.yml` is preserved byte for byte.
 
 ### Home-sidebar panels and back-to-session (v2.1.0)

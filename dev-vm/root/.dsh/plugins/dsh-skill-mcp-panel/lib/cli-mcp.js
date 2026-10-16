@@ -13,10 +13,27 @@ import { createInterface } from "node:readline";
 import { join, resolve } from "node:path";
 import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
 import { extractManagedRows, listMcpPatchRows, readPatchFile, writeManagedRows } from "./patch-editor.js";
-import { SERVER_NAME_RE, inputFromPatchRow, mcpServerInputSchema, patchRowToView, rowIdForServerName, serverNameFromRowId, toOfficialConfig } from "./mcp/model.js";
+import { parse as parseYaml } from "yaml";
+import { SERVER_NAME_RE, inputFromPatchRow, keyValueRowsOf, mcpServerInputSchema, patchRowToView, secretRefsFromPatchRow, serverNameFromRowId, toPatchRow } from "./mcp/model.js";
 import { probeMcpServer } from "./mcp/probe.js";
 import { runSkillCli } from "./cli-skill.js";
 import { ProfileError, knownProfileList, requireProfile } from "./profiles.js";
+/**
+ * CLI 不在 DSH 宿主内运行，没有凭据服务：按 DSH 的顺序先读进程环境变量，
+ * 再读 ~/.dsh/.credentials.yaml 的 refs。
+ */
+async function inputWithStoredSecrets(row) {
+    const input = inputFromPatchRow(row);
+    const secretRefs = secretRefsFromPatchRow(row);
+    if (Object.keys(secretRefs).length === 0)
+        return input;
+    const credentials = parseYaml(await readFile(join(resolveDshHome(), ".credentials.yaml"), "utf8")) ?? {};
+    for (const item of keyValueRowsOf(input)) {
+        if (item.secret)
+            item.value = process.env[secretRefs[item.key]] || credentials.refs?.[secretRefs[item.key]] || "";
+    }
+    return input;
+}
 function profilePatchPath(profile) {
     return join(resolveDshHome(), "profiles", profile, "cordis.patch.yml");
 }
@@ -47,7 +64,7 @@ function usage() {
         "                                      名字打错会被拒绝，绝不会新建 profile",
         "",
         "说明: MCP 配置写入指定 profile 的 cordis.patch.yml 受管块；网关在线时自动热加载。",
-        "密钥参数可通过 --env/--header 重复传入；已配置密钥在编辑表单中留空保持不变。"
+        "--env/--header 可重复传入，值以明文写入 patch；需要存入凭据存储的 secret 值请在 Web 面板中勾选「Secret」填写。"
     ].join("\n"));
 }
 async function confirm(question) {
@@ -61,7 +78,7 @@ async function confirm(question) {
     return answer === "y" || answer === "yes";
 }
 function parsePairs(values) {
-    const out = {};
+    const out = [];
     for (const value of values) {
         const index = value.indexOf("=");
         if (index <= 0)
@@ -69,7 +86,7 @@ function parsePairs(values) {
         const key = value.slice(0, index).trim();
         if (key === "")
             throw new Error("KEY=VALUE 的 key 不能为空：" + value);
-        out[key] = value.slice(index + 1);
+        out.push({ key, value: value.slice(index + 1), secret: false });
     }
     return out;
 }
@@ -222,7 +239,7 @@ export async function runMcpCli(args) {
             if (rowServerName(row) === input.serverName)
                 throw new Error('serverName "' + input.serverName + '" 已存在');
         }
-        const row = { id: rowIdForServerName(input.serverName), name: "@deepseek-ai/dsh-mcp-client", config: toOfficialConfig(input) };
+        const row = toPatchRow(input);
         await writeManagedRows(profilePatchPath(profile.name), [...managed, row].sort((a, b) => String(a.config?.serverName ?? "").localeCompare(String(b.config?.serverName ?? ""))));
         console.log('已添加 MCP 服务器 "' + input.serverName + '"（' + input.transport + "，网关在线时自动热加载）");
         return 0;
@@ -284,7 +301,7 @@ export async function runMcpCli(args) {
         const row = [...managed, ...external].find((candidate) => rowServerName(candidate) === name);
         if (row === undefined)
             throw new Error('MCP 服务器 "' + name + '" 不存在');
-        const result = await probeMcpServer(inputFromPatchRow(row));
+        const result = await probeMcpServer(await inputWithStoredSecrets(row));
         if (!result.ok) {
             console.error("连接失败：" + (result.error ?? "未知错误"));
             return 1;

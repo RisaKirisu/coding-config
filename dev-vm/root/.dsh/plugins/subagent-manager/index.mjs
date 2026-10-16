@@ -217,5 +217,6 @@ export function apply(ctx, config) {
   }, { global: true })
 
   ctx.effect(() => registerRoutes(ctx, config), 'subagent-manager: web routes')
-  registerWaitTool(ctx)
+  // Temporarily disabled: subagent_wait tool and its prompt section.
+  // registerWaitTool(ctx)
 }

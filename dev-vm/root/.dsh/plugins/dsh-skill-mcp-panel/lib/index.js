@@ -28,7 +28,7 @@ import { NestedSkillProvider, NESTED_SKILL_RANK } from "./provider.js";
  * 变化，因此以上所有操作都无需重启。
  */
 export const name = "dsh-skill-mcp-panel";
-export const inject = ["typert", "tools", "loader", "skills", "sessions", "agents"];
+export const inject = ["typert", "tools", "loader", "skills", "sessions", "agents", "credentials"];
 // ── wire 模式（zod v4）───────────────────────────────────────────────────
 const sessionIdSchema = z.string().optional();
 const scopeSchema = z.object({

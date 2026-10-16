@@ -22,6 +22,7 @@
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
+    "./mcp-client": "./lib/mcp/credential-client.js",
     "./package.json": "./package.json"
   },
   "dsh": {
@@ -54,6 +55,8 @@
     "@deepseek-ai/dsh-home-paths": "0.2.0-rc.2",
     "@deepseek-ai/dsh-typert-protocol": "0.2.0-rc.2",
     "@deepseek-ai/dsh-subprocess": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-credentials": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-mcp-client": "0.2.0-rc.2",
     "@deepseek-ai/cordis": "~4.0.4"
   },
   "peerDependenciesMeta": {
@@ -65,7 +68,7 @@
     "dsh-panel": "lib/cli.js"
   },
   "scripts": {
-    "test": "node --test test-context7-registration.mjs",
+    "test": "node --import ./test-dsh-runtime-hooks.mjs --test test-secret-key-values.mjs",
     "test:browser": "node --test test-session-lookup.mjs"
   },
   "files": [

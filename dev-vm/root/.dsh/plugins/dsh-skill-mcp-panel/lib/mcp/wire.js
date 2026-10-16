@@ -21,6 +21,12 @@ const reconnectViewSchema = z.object({
     maxDelayMs: z.number(),
     maxAttempts: z.number()
 });
+/** secret 行不带 value。 */
+const keyValueViewRowSchema = z.object({
+    key: z.string(),
+    value: z.string().optional(),
+    secret: z.boolean()
+});
 export const mcpServerViewSchema = z.object({
     serverName: z.string(),
     transport: z.enum(["stdio", "streamable-http", "unknown"]),
@@ -28,10 +34,10 @@ export const mcpServerViewSchema = z.object({
     entryId: z.string().optional(),
     command: z.string().optional(),
     args: z.array(z.string()).optional(),
-    envKeys: z.array(z.string()),
+    env: z.array(keyValueViewRowSchema),
     cwd: z.string().optional(),
     url: z.string().optional(),
-    headerKeys: z.array(z.string()),
+    headers: z.array(keyValueViewRowSchema),
     toolCallTimeoutMs: z.number(),
     failOnStartupError: z.boolean(),
     reconnect: reconnectViewSchema,
